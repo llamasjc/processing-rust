@@ -290,6 +290,16 @@ updatePixels	FUNCTION1
 smooth	FUNCTION1
 no_smooth	FUNCTION1
 
+create_graphics	FUNCTION1
+begin_graphics	FUNCTION1
+end_graphics	FUNCTION1
+graphics_image	FUNCTION1
+graphics_image_sized	FUNCTION1
+graphics_width	FUNCTION1
+graphics_height	FUNCTION1
+clear	FUNCTION1
+createGraphics	FUNCTION1
+
 # ── Lifecycle functions ────────────────────────────────────────────────────────
 setup	FUNCTION2
 draw	FUNCTION2

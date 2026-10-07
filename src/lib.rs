@@ -413,8 +413,41 @@ mod render {
     #[inline]
     fn blend_mode() -> u8 { BLEND_MODE.load(Ordering::Relaxed) }
 
+    // Drawing into a createGraphics() layer: its pixels carry alpha in the top
+    // byte (0 = nothing drawn there yet), so the layer can be put over
+    // anything later. The main canvas is always opaque and ignores that byte.
+    static ALPHA_TARGET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    #[inline]
+    fn alpha_target() -> bool { ALPHA_TARGET.load(Ordering::Relaxed) }
+    /// A fully opaque pixel for the current target.
+    #[inline]
+    fn solid(col: Color) -> u32 { col.to_u32() | if alpha_target() { 0xFF00_0000 } else { 0 } }
+
     #[inline]
     fn blend(dst: u32, col: Color) -> u32 {
+        if alpha_target() {
+            let a = col.a.clamp(0.0, 1.0);
+            let da = (dst >> 24) as f32 / 255.0;
+            let oa = a + da * (1.0 - a);
+            if !(oa > 0.0) { return 0; }
+            let mixed = if da <= 0.0 {
+                col.to_u32()                      // nothing underneath: just the color
+            } else if blend_mode() != 0 {
+                blend_opaque(dst, col)            // modes combine with the color underneath
+            } else {
+                let ch = |shift: u32, s: f32| -> f32 {
+                    let d = ((dst >> shift) & 0xFF) as f32 / 255.0;
+                    (s * a + d * da * (1.0 - a)) / oa
+                };
+                Color::from_rgb(ch(16, col.r), ch(8, col.g), ch(0, col.b)).to_u32()
+            };
+            return (mixed & 0x00FF_FFFF) | (((oa * 255.0).round() as u32).min(255) << 24);
+        }
+        blend_opaque(dst, col)
+    }
+
+    #[inline]
+    fn blend_opaque(dst: u32, col: Color) -> u32 {
         let a = col.a.clamp(0.0, 1.0);
         let dr = ((dst >> 16) & 0xFF) as f32 / 255.0;
         let dg = ((dst >> 8) & 0xFF) as f32 / 255.0;
@@ -446,7 +479,7 @@ mod render {
         if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 { return; }
         if !(col.a > 0.0) { return; }             // also skips a NaN alpha
         if let Some(p) = buf.get_mut(y as usize * w + x as usize) {
-            *p = if col.a >= 1.0 && blend_mode() == 0 { col.to_u32() } else { blend(*p, col) };
+            *p = if col.a >= 1.0 && blend_mode() == 0 { solid(col) } else { blend(*p, col) };
         }
     }
 
@@ -458,7 +491,7 @@ mod render {
         if x0 > x1 { return; }
         let row = y as usize * w;
         if let Some(run) = buf.get_mut(row + x0 as usize..=row + x1 as usize) {
-            if col.a >= 1.0 && blend_mode() == 0 { run.fill(col.to_u32()); }
+            if col.a >= 1.0 && blend_mode() == 0 { run.fill(solid(col)); }
             else { for p in run { *p = blend(*p, col); } }
         }
     }
@@ -936,24 +969,27 @@ mod render {
     /// over. Stacks left unbalanced by the last frame are dropped here so a
     /// missing pop can't grow them forever.
     pub fn begin_draw() {
+        end_all_graphics();
         MATRIX_STACK.with(|s| { let mut st = s.borrow_mut(); st.clear(); st.push(identity()); });
         STYLE_STACK.with(|s| {
             let mut st = s.borrow_mut();
             if st.len() > 1 { let top = st.pop().unwrap(); st.clear(); st.push(top); }
         });
     }
-    pub fn end_draw()   {}
+    /// End of setup(), draw() or an event: a layer left open by a missing
+    /// endDraw() must not stay the drawing target.
+    pub fn end_draw()   { end_all_graphics(); }
     pub fn present()    {}
 
     pub fn background_gray(v: f32) {
         let col = Color::from_gray(v);
-        let p = col.to_u32();
+        let p = solid(col);
         let mut buf = pixel_buf().lock();
         buf.fill(p);
     }
     pub fn background_rgb(r: f32, g: f32, b: f32) {
         let col = Color::from_rgb(r, g, b);
-        let p = col.to_u32();
+        let p = solid(col);
         let mut buf = pixel_buf().lock();
         buf.fill(p);
     }
@@ -967,7 +1003,7 @@ mod render {
         for p in buf.iter_mut() { *p = blend(*p, col); }
     }
     pub fn background_color(c: Color) {
-        let p = c.to_u32();
+        let p = solid(c);
         let mut buf = pixel_buf().lock();
         buf.fill(p);
     }
@@ -1407,7 +1443,8 @@ mod render {
     /// Writes pixels back, as many as fit. Alpha is ignored: the canvas is opaque.
     pub fn write_pixels(px: &[u32]) {
         let mut buf = pixel_buf().lock();
-        for (d, s) in buf.iter_mut().zip(px.iter()) { *d = s & 0x00FF_FFFF; }
+        let keep = if alpha_target() { 0xFFFF_FFFF } else { 0x00FF_FFFF };
+        for (d, s) in buf.iter_mut().zip(px.iter()) { *d = s & keep; }
     }
 
     /// set(x, y, color): one pixel, no transform, no blending.
@@ -1415,7 +1452,7 @@ mod render {
         let (cw, ch) = canvas_dims();
         if x < 0 || y < 0 || x >= cw as i32 || y >= ch as i32 { return; }
         let mut buf = pixel_buf().lock();
-        if let Some(p) = buf.get_mut(y as usize * cw + x as usize) { *p = col.to_u32(); }
+        if let Some(p) = buf.get_mut(y as usize * cw + x as usize) { *p = solid(col); }
     }
 
     // ── Images ────────────────────────────────────────────────────────────
@@ -1465,7 +1502,13 @@ mod render {
     pub fn draw_image(id: u64, x: f32, y: f32, w: f32, h: f32) {
         let imgs = images().lock();
         let img = match imgs.get((id as usize).wrapping_sub(1)) { Some(i) => i, None => return };
-        if img.w == 0 || img.h == 0 { return; }
+        blit(img.w, img.h, &|i| img.px[i], x, y, w, h);
+    }
+
+    /// Paints a source picture of iw x ih pixels into (x, y, w, h), with the
+    /// current tint. `sample(i)` is source pixel i, row by row.
+    fn blit(iw: usize, ih: usize, sample: &dyn Fn(usize) -> Color, x: f32, y: f32, w: f32, h: f32) {
+        if iw == 0 || ih == 0 { return; }
         let (x0, y0) = tfm(x, y);
         let (x1, y1) = tfm(x + w, y + h);
         if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) { return; }
@@ -1475,22 +1518,113 @@ mod render {
         let tint = TINT.with(|t| t.get());
         let (cw, ch) = canvas_dims();
         let mut buf = pixel_buf().lock();
-        // only the part of the image that is on the canvas
+        // only the part of the picture that is on the canvas
         let (py0, py1) = (ly.floor().max(0.0) as i32, hy.ceil().min(ch as f32) as i32);
         let (px0, px1) = (lx.floor().max(0.0) as i32, hx.ceil().min(cw as f32) as i32);
         for py in py0..py1 {
             let v = (py as f32 + 0.5 - ly) / (hy - ly);
             if !(0.0..1.0).contains(&v) { continue; }
-            let sy = ((v * img.h as f32) as usize).min(img.h - 1);
+            let sy = ((v * ih as f32) as usize).min(ih - 1);
             for px in px0..px1 {
                 let u = (px as f32 + 0.5 - lx) / (hx - lx);
                 if !(0.0..1.0).contains(&u) { continue; }
-                let sx = ((u * img.w as f32) as usize).min(img.w - 1);
-                let mut c = img.px[sy * img.w + sx];
+                let sx = ((u * iw as f32) as usize).min(iw - 1);
+                let mut c = sample(sy * iw + sx);
                 if let Some(t) = tint { c = Color::from_rgba(c.r * t.r, c.g * t.g, c.b * t.b, c.a * t.a); }
                 if c.a > 0.0 { put(&mut buf, cw, ch, px, py, c); }
             }
         }
+    }
+
+    // ── createGraphics(): off-screen layers ───────────────────────────────
+    //
+    // A layer has its own pixels (with alpha) and its own style. Between
+    // begin_graphics() and end_graphics() it simply takes the canvas's place:
+    // the pixel buffers and the size are swapped, so every drawing function
+    // works on a layer without knowing about it.
+
+    struct Layer { w: u32, h: u32, px: Vec<u32>, style: Style, active: bool }
+    fn layers() -> &'static parking_lot::Mutex<Vec<Layer>> {
+        static L: std::sync::OnceLock<parking_lot::Mutex<Vec<Layer>>> = std::sync::OnceLock::new();
+        L.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+    }
+    /// What was the target before a layer took over.
+    struct Saved { layer: usize, w: u32, h: u32, styles: Vec<Style>, matrices: Vec<Mat>, alpha: bool }
+    thread_local! {
+        static TARGETS: std::cell::RefCell<Vec<Saved>> = std::cell::RefCell::new(Vec::new());
+    }
+    const MAX_LAYER_PIXELS: usize = 64 * 1024 * 1024;   // all layers together: 256 MB
+
+    /// A new transparent layer. Returns a 1-based id, or 0 if it can't be made.
+    pub fn create_graphics(w: u32, h: u32) -> u64 {
+        let (w, h) = (w.clamp(1, super::MAX_CANVAS), h.clamp(1, super::MAX_CANVAS));
+        let mut all = layers().lock();
+        let used: usize = all.iter().map(|l| l.px.len()).sum();
+        if used + (w as usize * h as usize) > MAX_LAYER_PIXELS {
+            eprintln!("createGraphics: too many layers (make them once in setup(), not every frame)");
+            return 0;
+        }
+        all.push(Layer { w, h, px: vec![0u32; w as usize * h as usize], style: Style::default(), active: false });
+        all.len() as u64
+    }
+    pub fn graphics_size(id: u64) -> (u32, u32) {
+        layers().lock().get((id as usize).wrapping_sub(1)).map(|l| (l.w, l.h)).unwrap_or((0, 0))
+    }
+    /// From here on, drawing goes to the layer. Returns false for a bad id or
+    /// a layer that is already being drawn to.
+    pub fn begin_graphics(id: u64) -> bool {
+        let idx = (id as usize).wrapping_sub(1);
+        let mut all = layers().lock();
+        let Some(layer) = all.get_mut(idx) else { return false };
+        if layer.active { return false; }
+        layer.active = true;
+        let (cw, ch) = (CANVAS_W.load(Ordering::Relaxed), CANVAS_H.load(Ordering::Relaxed));
+        std::mem::swap(&mut *pixel_buf().lock(), &mut layer.px);
+        CANVAS_W.store(layer.w, Ordering::Relaxed);
+        CANVAS_H.store(layer.h, Ordering::Relaxed);
+        let styles = STYLE_STACK.with(|s| std::mem::replace(&mut *s.borrow_mut(), vec![layer.style.clone()]));
+        let matrices = MATRIX_STACK.with(|s| std::mem::replace(&mut *s.borrow_mut(), vec![identity()]));
+        let alpha = ALPHA_TARGET.swap(true, Ordering::Relaxed);
+        TARGETS.with(|t| t.borrow_mut().push(Saved { layer: idx, w: cw, h: ch, styles, matrices, alpha }));
+        true
+    }
+    /// Back to whatever was the target before the last begin_graphics().
+    pub fn end_graphics() {
+        let Some(saved) = TARGETS.with(|t| t.borrow_mut().pop()) else { return };
+        let mut all = layers().lock();
+        if let Some(layer) = all.get_mut(saved.layer) {
+            std::mem::swap(&mut *pixel_buf().lock(), &mut layer.px);
+            layer.active = false;
+            // the layer remembers its fill, stroke... for its next beginDraw()
+            layer.style = STYLE_STACK.with(|s| s.borrow().first().cloned().unwrap_or_default());
+        }
+        CANVAS_W.store(saved.w, Ordering::Relaxed);
+        CANVAS_H.store(saved.h, Ordering::Relaxed);
+        STYLE_STACK.with(|s| *s.borrow_mut() = saved.styles);
+        MATRIX_STACK.with(|s| *s.borrow_mut() = saved.matrices);
+        ALPHA_TARGET.store(saved.alpha, Ordering::Relaxed);
+    }
+    fn end_all_graphics() {
+        while TARGETS.with(|t| !t.borrow().is_empty()) { end_graphics(); }
+    }
+
+    /// clear(): a layer becomes fully transparent again; the canvas goes black.
+    pub fn clear() {
+        pixel_buf().lock().fill(0);
+    }
+
+    /// Draws a layer like an image. A layer can't be drawn while it is itself
+    /// the target.
+    pub fn draw_graphics(id: u64, x: f32, y: f32, w: f32, h: f32) {
+        let all = layers().lock();
+        let Some(layer) = all.get((id as usize).wrapping_sub(1)) else { return };
+        if layer.active { return; }
+        let px = &layer.px;
+        blit(layer.w as usize, layer.h as usize, &|i| {
+            let p = px[i];
+            Color::from_rgba(((p >> 16) & 0xFF) as f32 / 255.0, ((p >> 8) & 0xFF) as f32 / 255.0,
+                             (p & 0xFF) as f32 / 255.0, (p >> 24) as f32 / 255.0)
+        }, x, y, w, h);
     }
 }
 
@@ -2469,6 +2603,33 @@ pub fn image_sized(id: u64, x: f32, y: f32, w: f32, h: f32) {
 }
 pub fn image_width(id: u64)  -> f32 { render::image_size(id).0 }
 pub fn image_height(id: u64) -> f32 { render::image_size(id).1 }
+/// createGraphics(w, h): an off-screen layer, transparent to start with.
+/// Returns its id (0 if it could not be made).
+pub fn create_graphics(w: u32, h: u32) -> u64 { render::create_graphics(w, h) }
+/// pg.beginDraw(): from here on, every drawing call goes to the layer.
+pub fn begin_graphics(id: u64) -> bool { render::begin_graphics(id) }
+/// pg.endDraw(): back to the canvas (or the layer that was the target before).
+pub fn end_graphics() { render::end_graphics(); }
+pub fn graphics_width(id: u64)  -> f32 { render::graphics_size(id).0 as f32 }
+pub fn graphics_height(id: u64) -> f32 { render::graphics_size(id).1 as f32 }
+/// image(pg, x, y): draws the layer at its own size. Follows imageMode() and tint().
+pub fn graphics_image(id: u64, x: f32, y: f32) {
+    let (w, h) = render::graphics_size(id);
+    let (w, h) = (w as f32, h as f32);
+    let (x, y) = if IMAGE_MODE.load(Ordering::Relaxed) == CENTER { (x - w / 2.0, y - h / 2.0) } else { (x, y) };
+    render::draw_graphics(id, x, y, w, h);
+}
+pub fn graphics_image_sized(id: u64, x: f32, y: f32, w: f32, h: f32) {
+    let (x, y, w, h) = corner_box(IMAGE_MODE.load(Ordering::Relaxed), x, y, w, h);
+    render::draw_graphics(id, x, y, w, h);
+}
+/// clear(): makes a layer fully transparent again (on the canvas: black).
+pub fn clear() { render::clear(); }
+/// Size of what is being drawn on right now: the canvas, or the layer between
+/// begin_graphics() and end_graphics().
+pub fn target_size() -> (u32, u32) { (CANVAS_W.load(Ordering::Relaxed), CANVAS_H.load(Ordering::Relaxed)) }
+#[inline] pub fn createGraphics(w: u32, h: u32) -> u64 { create_graphics(w, h) }
+
 pub fn tint(gray: f32)                            { render::set_tint(Some(Color::from_gray(gray / 255.0))); }
 pub fn tint_rgba(r: f32, g: f32, b: f32, a: f32)  { render::set_tint(Some(Color::from_rgba(r/255.0, g/255.0, b/255.0, a/255.0))); }
 pub fn tint_rgb(r: f32, g: f32, b: f32)           { tint_rgba(r, g, b, 255.0); }
@@ -2627,6 +2788,8 @@ impl<S: 'static> App<S> {
                     Event::KeyReleased   => { sync_globals(ctx); if let Some(f) = self.key_released_fn   { f(&mut self.state); } }
                     Event::KeyTyped      => { sync_globals(ctx); if let Some(f) = self.key_typed_fn      { f(&mut self.state); } }
                 }
+                // whatever just ran, the canvas is the target again
+                render::end_draw();
             });
         }
 

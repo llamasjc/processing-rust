@@ -28,6 +28,7 @@ final class OverloadRewriter {
     Map.entry("rect",        Map.of(5, "rect_rounded")),
     Map.entry("arc",         Map.of(7, "arc_mode")),
     Map.entry("image",       Map.of(5, "image_sized")),
+    Map.entry("graphics_image", Map.of(5, "graphics_image_sized")),
     Map.entry("scale",       Map.of(2, "scale_xy")),
     Map.entry("translate",   Map.of(3, "translate_3d")),
     Map.entry("random",      Map.of(2, "random_range")),
@@ -38,6 +39,10 @@ final class OverloadRewriter {
 
   /** Float functions whose last argument is a constant (PIE, CHORD...), not a number to convert. */
   private static final Set<String> LAST_ARG_AS_IS = Set.of("arc_mode");
+
+  /** Float functions whose first argument is an image or layer, not a number to convert. */
+  private static final Set<String> FIRST_ARG_AS_IS =
+    Set.of("image", "image_sized", "graphics_image", "graphics_image_sized");
 
   /** Engine functions whose numeric parameters are all f32. */
   private static final Set<String> FLOAT_ARGS = Set.of(
@@ -50,7 +55,8 @@ final class OverloadRewriter {
     "random", "random_range", "noise", "noise2",
     "vertex", "bezier_vertex", "quadratic_vertex", "curve_vertex",
     "arc_mode", "bezier", "curve", "shear_x", "shear_y", "apply_matrix",
-    "tint", "tint_ga", "tint_rgb", "tint_rgba", "noise3"
+    "tint", "tint_ga", "tint_rgb", "tint_rgba", "noise3",
+    "image", "image_sized", "graphics_image", "graphics_image_sized"
   );
 
   private OverloadRewriter() {}
@@ -81,7 +87,8 @@ final class OverloadRewriter {
             List<String> fixed = new ArrayList<>();
             for (int ai = 0; ai < args.size(); ai++) {
               String r = rewrite(args.get(ai));
-              boolean asIs = LAST_ARG_AS_IS.contains(target) && ai == args.size() - 1;
+              boolean asIs = (LAST_ARG_AS_IS.contains(target) && ai == args.size() - 1)
+                || (FIRST_ARG_AS_IS.contains(target) && ai == 0);
               if (FLOAT_ARGS.contains(target) && !"size".equals(target) && !asIs) r = floatLiteral(r);
               fixed.add(r);
             }
