@@ -31,11 +31,16 @@ fn pixel_buf() -> &'static parking_lot::Mutex<Vec<u32>> {
     })
 }
 
+/// Largest canvas side. Keeps w * h well inside memory and stops a typo like
+/// size(4000000, 3) from taking the machine down.
+pub const MAX_CANVAS: u32 = 8192;
+
 fn resize_canvas(w: u32, h: u32) {
+    let (w, h) = (w.clamp(1, MAX_CANVAS), h.clamp(1, MAX_CANVAS));
     CANVAS_W.store(w, Ordering::Relaxed);
     CANVAS_H.store(h, Ordering::Relaxed);
     let mut buf = pixel_buf().lock();
-    buf.resize((w * h) as usize, 0xFF_20_20_20u32);
+    buf.resize(w as usize * h as usize, 0xFF_20_20_20u32);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,12 +86,6 @@ mod core {
         }
     }
 
-    // Pseudo-noise (sin hash). Good enough for most sketches.
-    pub fn noise1(x: f32) -> f32 { ((x * 127.1).sin() * 43758.5453).fract().abs() }
-    pub fn noise2(x: f32, y: f32) -> f32 {
-        ((x * 127.1 + y * 311.7).sin() * 43758.5453).fract().abs()
-    }
-
     // Simple xorshift RNG
     use std::sync::{Mutex, OnceLock};
     static RNG: OnceLock<Mutex<u64>> = OnceLock::new();
@@ -109,15 +108,78 @@ mod core {
     fn next(s: &mut u64) -> u64 { *s ^= *s<<13; *s ^= *s>>7; *s ^= *s<<17; *s }
 
     pub fn random_seed(seed: u64) { *rng().lock().unwrap() = mix(seed); }
-    static NOISE_OFFSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    pub fn noise_seed(seed: u64) {
-        NOISE_OFFSET.store((seed % 10_007) as u32, std::sync::atomic::Ordering::Relaxed);
+    // ── Noise ─────────────────────────────────────────────────────────────
+    // Value noise the way Processing does it: a table of random values,
+    // cosine-eased between lattice points, summed over a few octaves. Smooth
+    // (nearby inputs give nearby outputs), always in 0..1, different every
+    // run unless noise_seed() is called.
+    const PERLIN_YWRAPB: u32 = 4;
+    const PERLIN_YWRAP: i64 = 1 << PERLIN_YWRAPB;
+    const PERLIN_ZWRAPB: u32 = 8;
+    const PERLIN_ZWRAP: i64 = 1 << PERLIN_ZWRAPB;
+    const PERLIN_SIZE: i64 = 4095;
+
+    struct Noise { table: Vec<f32>, octaves: u32, falloff: f32 }
+    impl Noise {
+        fn seeded(seed: u64) -> Vec<f32> {
+            let mut s = mix(seed);
+            (0..=PERLIN_SIZE).map(|_| (next(&mut s) >> 40) as f32 / (1u64 << 24) as f32).collect()
+        }
     }
-    fn noise_off() -> f32 { NOISE_OFFSET.load(std::sync::atomic::Ordering::Relaxed) as f32 * 17.31 }
+    fn noise_state() -> &'static Mutex<Noise> {
+        static N: OnceLock<Mutex<Noise>> = OnceLock::new();
+        N.get_or_init(|| {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64).unwrap_or(54321);
+            Mutex::new(Noise { table: Noise::seeded(t ^ 0x5EED), octaves: 4, falloff: 0.5 })
+        })
+    }
+    fn noise_lock() -> std::sync::MutexGuard<'static, Noise> {
+        noise_state().lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub fn noise_seed(seed: u64) { noise_lock().table = Noise::seeded(seed); }
+    pub fn noise_detail(octaves: u32, falloff: f32) {
+        let mut n = noise_lock();
+        if octaves > 0 { n.octaves = octaves.min(16); }
+        if falloff > 0.0 { n.falloff = falloff.min(1.0); }
+    }
+    pub fn noise1(x: f32) -> f32 { noise3(x, 0.0, 0.0) }
+    pub fn noise2(x: f32, y: f32) -> f32 { noise3(x, y, 0.0) }
     pub fn noise3(x: f32, y: f32, z: f32) -> f32 {
-        let o = noise_off();
-        noise2(x + z * 57.13 + o, y + z * 31.71 - o)
+        if !(x.is_finite() && y.is_finite() && z.is_finite()) { return 0.0; }
+        let n = noise_lock();
+        let split = |v: f32| { let v = (v as f64).abs(); let i = v.floor(); (i as i64, (v - i) as f32) };
+        let ((mut xi, mut xf), (mut yi, mut yf), (mut zi, mut zf)) = (split(x), split(y), split(z));
+        let fsc = |t: f32| 0.5 * (1.0 - (t * std::f32::consts::PI).cos());
+        let at = |i: i64| n.table[(i & PERLIN_SIZE) as usize];
+        let (mut r, mut ampl) = (0.0f32, 0.5f32);
+        for _ in 0..n.octaves {
+            let mut of = xi.wrapping_add(yi.wrapping_shl(PERLIN_YWRAPB)).wrapping_add(zi.wrapping_shl(PERLIN_ZWRAPB));
+            let (rxf, ryf) = (fsc(xf), fsc(yf));
+            let mut n1 = at(of);
+            n1 += rxf * (at(of.wrapping_add(1)) - n1);
+            let mut n2 = at(of.wrapping_add(PERLIN_YWRAP));
+            n2 += rxf * (at(of.wrapping_add(PERLIN_YWRAP + 1)) - n2);
+            n1 += ryf * (n2 - n1);
+            of = of.wrapping_add(PERLIN_ZWRAP);
+            n2 = at(of);
+            n2 += rxf * (at(of.wrapping_add(1)) - n2);
+            let mut n3 = at(of.wrapping_add(PERLIN_YWRAP));
+            n3 += rxf * (at(of.wrapping_add(PERLIN_YWRAP + 1)) - n3);
+            n2 += ryf * (n3 - n2);
+            n1 += fsc(zf) * (n2 - n1);
+            r += n1 * ampl;
+            ampl *= n.falloff;
+            xi = xi.wrapping_shl(1); xf *= 2.0;
+            yi = yi.wrapping_shl(1); yf *= 2.0;
+            zi = zi.wrapping_shl(1); zf *= 2.0;
+            if xf >= 1.0 { xi = xi.wrapping_add(1); xf -= 1.0; }
+            if yf >= 1.0 { yi = yi.wrapping_add(1); yf -= 1.0; }
+            if zf >= 1.0 { zi = zi.wrapping_add(1); zf -= 1.0; }
+        }
+        r.clamp(0.0, 1.0)
     }
+
     pub fn random_f32(low: f32, high: f32) -> f32 {
         let mut s = rng().lock().unwrap();
         // top 24 bits -> [0, 1): exact in f32 and never rounds up to 1.0
@@ -186,71 +248,34 @@ mod render {
             let mut s = shape_state().lock();
             if !s.active { return; }
             s.active = false;
+            s.curve.clear();
             (s.kind, std::mem::take(&mut s.pts))
         };
         let (has_fill, has_stroke) = with_style(|s| (s.fill.is_some(), s.stroke.is_some()));
-        let tri = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
-            if has_fill { shape_fill_tri(a, b, c); }
-            if has_stroke { draw_line(a.0, a.1, b.0, b.1); draw_line(b.0, b.1, c.0, c.1); draw_line(c.0, c.1, a.0, a.1); }
-        };
+        let poly = |p: &[(f32, f32)], close: bool| shape_polygon(p, close, has_fill, has_stroke);
         match kind {
             1 => for p in &pts { draw_point(p.0, p.1); },                       // POINTS
             2 => if has_stroke { for w in pts.chunks_exact(2) { draw_line(w[0].0, w[0].1, w[1].0, w[1].1); } }, // LINES
-            3 => for w in pts.chunks_exact(3) { tri(w[0], w[1], w[2]); },        // TRIANGLES
-            4 => for i in 2..pts.len() { tri(pts[i-2], pts[i-1], pts[i]); },     // TRIANGLE_STRIP
-            5 => for i in 2..pts.len() { tri(pts[0], pts[i-1], pts[i]); },       // TRIANGLE_FAN
-            6 => for q in pts.chunks_exact(4) { shape_polygon(q, true, has_fill, has_stroke); }, // QUADS
+            3 => for w in pts.chunks_exact(3) { poly(w, true); },                // TRIANGLES
+            4 => for i in 2..pts.len() { poly(&[pts[i-2], pts[i-1], pts[i]], true); },   // TRIANGLE_STRIP
+            5 => for i in 2..pts.len() { poly(&[pts[0], pts[i-1], pts[i]], true); },     // TRIANGLE_FAN
+            6 => for q in pts.chunks_exact(4) { poly(q, true); },                // QUADS
             7 => for i in (3..pts.len()).step_by(2) {                            // QUAD_STRIP
-                     let q = [pts[i-3], pts[i-2], pts[i], pts[i-1]];
-                     shape_polygon(&q, true, has_fill, has_stroke);
+                     poly(&[pts[i-3], pts[i-2], pts[i], pts[i-1]], true);
                  },
-            _ => shape_polygon(&pts, close, has_fill, has_stroke),              // polygon
+            _ => poly(&pts, close),                                              // polygon
         }
     }
-    fn shape_fill_tri(a: (f32, f32), b: (f32, f32), c: (f32, f32)) {
-        let (cw, ch) = canvas_dims();
-        let fill = with_style(|s| s.fill);
-        if let Some(fc) = fill {
-            let (ax, ay) = tfm(a.0, a.1);
-            let (bx, by) = tfm(b.0, b.1);
-            let (cx, cy) = tfm(c.0, c.1);
-            let mut buf = pixel_buf().lock();
-            fill_tri(&mut buf, cw, ch, ax, ay, bx, by, cx, cy, fc);
-        }
-    }
-    /// Fill any simple polygon (concave too) by ear clipping, then stroke its outline.
+    /// Fill a polygon of any shape (see fill_poly), then stroke its outline.
     fn shape_polygon(pts: &[(f32, f32)], close: bool, has_fill: bool, has_stroke: bool) {
         let n = pts.len();
         if has_fill && n >= 3 {
-            let area: f32 = (0..n).map(|i| { let (a, b) = (pts[i], pts[(i+1)%n]); a.0*b.1 - b.0*a.1 }).sum();
-            let ccw = area > 0.0;
-            let cross = |o: (f32,f32), a: (f32,f32), b: (f32,f32)| (a.0-o.0)*(b.1-o.1) - (a.1-o.1)*(b.0-o.0);
-            let mut idx: Vec<usize> = (0..n).collect();
-            let mut guard = 0;
-            while idx.len() > 3 && guard < n * n {
-                guard += 1;
-                let m = idx.len();
-                let mut clipped = false;
-                for k in 0..m {
-                    let (ia, ib, ic) = (idx[(k+m-1)%m], idx[k], idx[(k+1)%m]);
-                    let (a, b, c) = (pts[ia], pts[ib], pts[ic]);
-                    let c1 = cross(a, b, c);
-                    if (c1 > 0.0) != ccw || c1 == 0.0 { continue; }
-                    let inside = idx.iter().any(|&j| {
-                        if j == ia || j == ib || j == ic { return false; }
-                        let p = pts[j];
-                        let (d1, d2, d3) = (cross(a, b, p), cross(b, c, p), cross(c, a, p));
-                        if ccw { d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0 } else { d1 <= 0.0 && d2 <= 0.0 && d3 <= 0.0 }
-                    });
-                    if inside { continue; }
-                    shape_fill_tri(a, b, c);
-                    idx.remove(k);
-                    clipped = true;
-                    break;
-                }
-                if !clipped { break; } // self-intersecting; fan the rest below
+            if let Some(fc) = with_style(|s| s.fill) {
+                let (cw, ch) = canvas_dims();
+                let screen: Vec<(f32, f32)> = pts.iter().map(|p| tfm(p.0, p.1)).collect();
+                let mut buf = pixel_buf().lock();
+                fill_poly(&mut buf, cw, ch, &screen, fc);
             }
-            for i in 2..idx.len() { shape_fill_tri(pts[idx[0]], pts[idx[i-1]], pts[idx[i]]); }
         }
         if has_stroke && n >= 2 {
             for i in 1..n { draw_line(pts[i-1].0, pts[i-1].1, pts[i].0, pts[i].1); }
@@ -315,83 +340,198 @@ mod render {
     }
 
     // ── Pixel operations ───────────────────────────────────────────────────────
+    //
+    // Everything that touches the pixel buffer goes through put, hspan, bline
+    // or fill_poly, and all four clip to the canvas first. Coordinates can be
+    // anything a sketch produces (off-screen by a billion pixels, infinite,
+    // NaN): the cost of a call is bounded by the canvas, never by its arguments.
+
+    /// Beyond this, positions are clamped. Far outside any canvas, and small
+    /// enough that f32 arithmetic on them stays finite.
+    const FAR: f32 = 1.0e9;
+
+    #[inline]
+    fn blend(dst: u32, col: Color) -> u32 {
+        let a = col.a;
+        let dr = ((dst >> 16) & 0xFF) as f32 / 255.0;
+        let dg = ((dst >> 8) & 0xFF) as f32 / 255.0;
+        let db = (dst & 0xFF) as f32 / 255.0;
+        Color::from_rgb(dr + (col.r - dr) * a, dg + (col.g - dg) * a, db + (col.b - db) * a).to_u32()
+    }
 
     fn put(buf: &mut Vec<u32>, w: usize, h: usize, x: i32, y: i32, col: Color) {
         if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 { return; }
-        let idx = y as usize * w + x as usize;
-        if col.a >= 1.0 {
-            buf[idx] = col.to_u32();
-        } else {
-            let a = col.a;
-            let dst = buf[idx];
-            let dr = ((dst >> 16) & 0xFF) as f32 / 255.0;
-            let dg = ((dst >> 8) & 0xFF) as f32 / 255.0;
-            let db = (dst & 0xFF) as f32 / 255.0;
-            let blended = Color::from_rgb(
-                dr + (col.r - dr) * a,
-                dg + (col.g - dg) * a,
-                db + (col.b - db) * a,
-            );
-            buf[idx] = blended.to_u32();
+        if !(col.a > 0.0) { return; }             // also skips a NaN alpha
+        if let Some(p) = buf.get_mut(y as usize * w + x as usize) {
+            *p = if col.a >= 1.0 { col.to_u32() } else { blend(*p, col) };
         }
     }
 
-    // Bresenham line
+    /// Pixels x0..=x1 of row y, clipped.
+    fn hspan(buf: &mut Vec<u32>, w: usize, h: usize, y: i32, x0: i32, x1: i32, col: Color) {
+        if y < 0 || y >= h as i32 || w == 0 { return; }
+        if !(col.a > 0.0) { return; }
+        let (x0, x1) = (x0.max(0), x1.min(w as i32 - 1));
+        if x0 > x1 { return; }
+        let row = y as usize * w;
+        if let Some(run) = buf.get_mut(row + x0 as usize..=row + x1 as usize) {
+            if col.a >= 1.0 { run.fill(col.to_u32()); }
+            else { for p in run { *p = blend(*p, col); } }
+        }
+    }
+
+    /// One-pixel line. Clipped to the canvas before stepping (Liang-Barsky),
+    /// so a line to a point a billion pixels away costs no more than one
+    /// across the window.
     fn bline(buf: &mut Vec<u32>, w: usize, h: usize,
-             x0: i32, y0: i32, x1: i32, y1: i32, col: Color) {
-        let dx = (x1-x0).abs(); let dy = (y1-y0).abs();
-        let sx = if x0 < x1 { 1i32 } else { -1 };
-        let sy = if y0 < y1 { 1i32 } else { -1 };
-        let mut err = dx - dy;
-        let (mut x, mut y) = (x0, y0);
-        loop {
+             x0: f32, y0: f32, x1: f32, y1: f32, col: Color) {
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) { return; }
+        if w == 0 || h == 0 { return; }
+        let (x0, y0, x1, y1) = (x0 as f64, y0 as f64, x1 as f64, y1 as f64);
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        for (p, q) in [(-dx, x0 + 1.0), (dx, w as f64 - x0), (-dy, y0 + 1.0), (dy, h as f64 - y0)] {
+            if p == 0.0 {
+                if q < 0.0 { return; }
+            } else {
+                let r = q / p;
+                if p < 0.0 { if r > t1 { return; } if r > t0 { t0 = r; } }
+                else       { if r < t0 { return; } if r < t1 { t1 = r; } }
+            }
+        }
+        let (ax, ay) = ((x0 + t0 * dx) as i32, (y0 + t0 * dy) as i32);
+        let (bx, by) = ((x0 + t1 * dx) as i32, (y0 + t1 * dy) as i32);
+
+        // Bresenham between two points that are now on (or right next to) the canvas
+        let ddx = (bx - ax).abs(); let ddy = (by - ay).abs();
+        let sx = if ax < bx { 1i32 } else { -1 };
+        let sy = if ay < by { 1i32 } else { -1 };
+        let mut err = ddx - ddy;
+        let (mut x, mut y) = (ax, ay);
+        for _ in 0..=(ddx + ddy) {
             put(buf, w, h, x, y, col);
-            if x == x1 && y == y1 { break; }
+            if x == bx && y == by { break; }
             let e2 = 2 * err;
-            if e2 > -dy { err -= dy; x += sx; }
-            if e2 <  dx { err += dx; y += sy; }
+            if e2 > -ddy { err -= ddy; x += sx; }
+            if e2 <  ddx { err += ddx; y += sy; }
         }
     }
 
-    // Filled triangle (flat scan-line)
-    fn fill_tri(buf: &mut Vec<u32>, w: usize, h: usize,
-                x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, col: Color) {
-        let (mut ax, mut ay) = (x0 as i32, y0 as i32);
-        let (mut bx, mut by) = (x1 as i32, y1 as i32);
-        let (mut cx, mut cy) = (x2 as i32, y2 as i32);
-        // sort by y
-        if ay > by { std::mem::swap(&mut ax, &mut bx); std::mem::swap(&mut ay, &mut by); }
-        if ay > cy { std::mem::swap(&mut ax, &mut cx); std::mem::swap(&mut ay, &mut cy); }
-        if by > cy { std::mem::swap(&mut bx, &mut cx); std::mem::swap(&mut by, &mut cy); }
-        let total_h = cy - ay;
-        if total_h == 0 { return; }
-        for i in 0..total_h {
-            let second_half = i >= by - ay || by == ay;
-            let seg_h = if second_half { cy - by } else { by - ay };
-            if seg_h == 0 { continue; }
-            let alpha = i as f32 / total_h as f32;
-            let beta  = if second_half {
-                (i - (by - ay)) as f32 / seg_h as f32
-            } else {
-                i as f32 / seg_h as f32
-            };
-            let mut lx = ax as f32 + (cx - ax) as f32 * alpha;
-            let mut rx = if second_half {
-                bx as f32 + (cx - bx) as f32 * beta
-            } else {
-                ax as f32 + (bx - ax) as f32 * beta
-            };
-            if lx > rx { std::mem::swap(&mut lx, &mut rx); }
-            let py = ay + i;
-            for px in (lx as i32)..=(rx as i32) {
-                put(buf, w, h, px, py, col);
+    /// Fill a polygon given in screen coordinates. Any shape: convex, concave
+    /// or self-crossing (non-zero winding, like Processing). A pixel is filled
+    /// when its centre is inside, and is written exactly once, so shapes that
+    /// share an edge don't overlap and translucent fills have no seams.
+    fn fill_poly(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], col: Color) {
+        if pts.len() < 3 || w == 0 || h == 0 { return; }
+        if !(col.a > 0.0) { return; }
+        if pts.iter().any(|p| p.0.is_nan() || p.1.is_nan()) { return; }
+        let pts: Vec<(f32, f32)> = pts.iter().map(|p| (p.0.clamp(-FAR, FAR), p.1.clamp(-FAR, FAR))).collect();
+        let n = pts.len();
+
+        let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
+        for p in &pts { ymin = ymin.min(p.1); ymax = ymax.max(p.1); }
+        // rows whose centre (row + 0.5) lies in [ymin, ymax)
+        let row0 = (ymin - 0.5).ceil().max(0.0) as i64;
+        let row1 = (ymax - 0.5).ceil().min(h as f32) as i64;
+
+        let mut xs: Vec<(f32, i32)> = Vec::with_capacity(8);
+        for row in row0..row1 {
+            let yc = row as f32 + 0.5;
+            xs.clear();
+            for i in 0..n {
+                let (a, b) = (pts[i], pts[(i + 1) % n]);
+                let up   = a.1 <= yc && b.1 > yc;
+                let down = b.1 <= yc && a.1 > yc;
+                if up || down {
+                    let t = (yc - a.1) / (b.1 - a.1);
+                    xs.push((a.0 + t * (b.0 - a.0), if up { 1 } else { -1 }));
+                }
+            }
+            if xs.len() < 2 { continue; }
+            xs.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut winding = 0;
+            for k in 0..xs.len() - 1 {
+                winding += xs[k].1;
+                if winding == 0 { continue; }
+                // pixels whose centre (px + 0.5) lies in [xs[k], xs[k+1])
+                let x0 = (xs[k].0 - 0.5).ceil().max(0.0);
+                let x1 = ((xs[k + 1].0 - 0.5).ceil() - 1.0).min(w as f32 - 1.0);
+                if x0 <= x1 { hspan(buf, w, h, row as i32, x0 as i32, x1 as i32, col); }
             }
         }
     }
 
+    /// A straight stroke from a to b, `weight` pixels wide.
+    fn seg(buf: &mut Vec<u32>, w: usize, h: usize,
+           a: (f32, f32), b: (f32, f32), weight: f32, col: Color) {
+        if !(weight > 1.5) { return bline(buf, w, h, a.0, a.1, b.0, b.1, col); }
+        let weight = weight.min(4096.0);
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if !len.is_finite() || len < 1.0e-6 { return; }
+        let (nx, ny) = (-dy / len * weight * 0.5, dx / len * weight * 0.5);
+        fill_poly(buf, w, h, &[
+            (a.0 - nx, a.1 - ny), (a.0 + nx, a.1 + ny),
+            (b.0 + nx, b.1 + ny), (b.0 - nx, b.1 - ny),
+        ], col);
+    }
+
+    /// Stroke the outline of a few-cornered shape (rect, triangle, quad).
+    /// Thick edges are run half a weight past each corner so the corners come
+    /// out square instead of notched.
+    fn outline(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], weight: f32, col: Color) {
+        let n = pts.len();
+        for i in 0..n {
+            let (mut a, mut b) = (pts[i], pts[(i + 1) % n]);
+            if weight > 1.5 {
+                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                let len = (dx * dx + dy * dy).sqrt();
+                if len.is_finite() && len > 1.0e-6 {
+                    let e = weight.min(4096.0) * 0.5 / len;
+                    a = (a.0 - dx * e, a.1 - dy * e);
+                    b = (b.0 + dx * e, b.1 + dy * e);
+                }
+            }
+            seg(buf, w, h, a, b, weight, col);
+        }
+    }
+
+    /// How many pixels one unit along each axis covers under the current
+    /// matrix (used to pick how finely to cut curves into segments).
+    fn matrix_scale() -> f32 {
+        let m = current_matrix();
+        let sx = (m[0] * m[0] + m[1] * m[1]).sqrt();
+        let sy = (m[2] * m[2] + m[3] * m[3]).sqrt();
+        let s = sx.max(sy);
+        if s.is_finite() { s } else { 1.0 }
+    }
+
+    /// Points along an ellipse arc from angle a0 to a1, through the current
+    /// matrix, so rotate() and scale() apply to ellipses too.
+    fn arc_points(cx: f32, cy: f32, rx: f32, ry: f32, a0: f32, a1: f32, include_end: bool) -> Vec<(f32, f32)> {
+        let span = (a1 - a0).abs();
+        let rpx = rx.abs().max(ry.abs()) * matrix_scale();
+        let n = if rpx.is_finite() { ((rpx * span / 2.0).ceil() as usize).clamp(8, 1024) } else { 8 };
+        let last = if include_end { n } else { n - 1 };
+        (0..=last).map(|i| {
+            let t = a0 + (a1 - a0) * (i as f32 / n as f32);
+            tfm(cx + t.cos() * rx, cy + t.sin() * ry)
+        }).collect()
+    }
+
     // ── Public drawing API ─────────────────────────────────────────────────────
 
-    pub fn begin_draw() {}
+    /// Start of a frame. Processing resets the transform every frame, so a
+    /// translate() in draw() doesn't pile up; style (fill, stroke, ...) carries
+    /// over. Stacks left unbalanced by the last frame are dropped here so a
+    /// missing pop can't grow them forever.
+    pub fn begin_draw() {
+        MATRIX_STACK.with(|s| { let mut st = s.borrow_mut(); st.clear(); st.push(identity()); });
+        STYLE_STACK.with(|s| {
+            let mut st = s.borrow_mut();
+            if st.len() > 1 { let top = st.pop().unwrap(); st.clear(); st.push(top); }
+        });
+    }
     pub fn end_draw()   {}
     pub fn present()    {}
 
@@ -407,7 +547,15 @@ mod render {
         let mut buf = pixel_buf().lock();
         buf.fill(p);
     }
-    pub fn background_rgba(r: f32, g: f32, b: f32, _a: f32) { background_rgb(r, g, b); }
+    /// A translucent background blends over what is already there (the usual
+    /// way to leave trails).
+    pub fn background_rgba(r: f32, g: f32, b: f32, a: f32) {
+        if a >= 1.0 || a.is_nan() { return background_rgb(r, g, b); }
+        if a <= 0.0 { return; }
+        let col = Color::from_rgba(r, g, b, a);
+        let mut buf = pixel_buf().lock();
+        for p in buf.iter_mut() { *p = blend(*p, col); }
+    }
     pub fn background_color(c: Color) {
         let p = c.to_u32();
         let mut buf = pixel_buf().lock();
@@ -425,7 +573,10 @@ mod render {
     pub fn set_stroke_rgba(r: f32, g: f32, b: f32, a: f32) { with_style_mut(|s| s.stroke = Some(Color::from_rgba(r,g,b,a))); }
     pub fn set_stroke_none()                          { with_style_mut(|s| s.stroke = None); }
     pub fn set_stroke_color(c: Color)                 { with_style_mut(|s| s.stroke = Some(c)); }
-    pub fn set_stroke_weight(w: f32)                  { with_style_mut(|s| s.stroke_weight = w); }
+    pub fn set_stroke_weight(w: f32) {
+        // NaN and negatives fall back to a hairline
+        with_style_mut(|s| s.stroke_weight = if w > 0.0 { w.min(4096.0) } else { 1.0 });
+    }
 
     fn canvas_dims() -> (usize, usize) {
         (CANVAS_W.load(Ordering::Relaxed) as usize, CANVAS_H.load(Ordering::Relaxed) as usize)
@@ -437,37 +588,14 @@ mod render {
     }
 
     pub fn draw_ellipse(cx: f32, cy: f32, w: f32, h: f32) {
+        if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()) { return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
-        let (tcx, tcy) = tfm(cx, cy);
-        let rx = w * 0.5; let ry = h * 0.5;
-        let steps = ((rx.max(ry) * std::f32::consts::TAU) as usize).max(32);
-        if let Some(fc) = fill {
-            // rasterise as filled polygon via scan-line over bounding box
-            let y0 = (tcy - ry) as i32; let y1 = (tcy + ry) as i32;
-            let mut buf = pixel_buf().lock();
-            for py in y0..=y1 {
-                let dy = (py as f32 - tcy) / ry;
-                if dy.abs() > 1.0 { continue; }
-                let dx = (1.0 - dy*dy).sqrt() * rx;
-                for px in ((tcx - dx) as i32)..=((tcx + dx) as i32) {
-                    put(&mut buf, cw, ch, px, py, fc);
-                }
-            }
-            drop(buf);
-        }
+        let pts = arc_points(cx, cy, w * 0.5, h * 0.5, 0.0, std::f32::consts::TAU, false);
+        let mut buf = pixel_buf().lock();
+        if let Some(fc) = fill { fill_poly(&mut buf, cw, ch, &pts, fc); }
         if let Some(sc) = stroke {
-            let mut buf = pixel_buf().lock();
-            let thick = sw.max(1.0) as i32;
-            for i in 0..steps {
-                let t0 = i as f32 / steps as f32 * std::f32::consts::TAU;
-                let t1 = (i+1) as f32 / steps as f32 * std::f32::consts::TAU;
-                let (ax, ay) = (tcx + t0.cos() * rx, tcy + t0.sin() * ry);
-                let (bx, by) = (tcx + t1.cos() * rx, tcy + t1.sin() * ry);
-                for _ in 0..thick {
-                    bline(&mut buf, cw, ch, ax as i32, ay as i32, bx as i32, by as i32, sc);
-                }
-            }
+            for i in 0..pts.len() { seg(&mut buf, cw, ch, pts[i], pts[(i + 1) % pts.len()], sw, sc); }
         }
     }
 
@@ -476,156 +604,55 @@ mod render {
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         // Transform all four corners so rotation/scale in the matrix stack work correctly.
         let c = [tfm(x, y), tfm(x+w, y), tfm(x+w, y+h), tfm(x, y+h)];
-        if let Some(fc) = fill {
-            let mut buf = pixel_buf().lock();
-            fill_tri(&mut buf, cw, ch, c[0].0, c[0].1, c[1].0, c[1].1, c[2].0, c[2].1, fc);
-            fill_tri(&mut buf, cw, ch, c[0].0, c[0].1, c[2].0, c[2].1, c[3].0, c[3].1, fc);
-        }
-        if let Some(sc) = stroke {
-            let mut buf = pixel_buf().lock();
-            let thick = sw.max(1.0) as i32;
-            let pts = [c[0], c[1], c[2], c[3], c[0]];
-            for i in 0..4 {
-                let (ax,ay) = (pts[i].0 as i32, pts[i].1 as i32);
-                let (bx,by) = (pts[i+1].0 as i32, pts[i+1].1 as i32);
-                for _ in 0..thick { bline(&mut buf, cw, ch, ax, ay, bx, by, sc); }
-            }
-        }
+        let mut buf = pixel_buf().lock();
+        if let Some(fc) = fill { fill_poly(&mut buf, cw, ch, &c, fc); }
+        if let Some(sc) = stroke { outline(&mut buf, cw, ch, &c, sw, sc); }
     }
 
     pub fn draw_rect_rounded(x: f32, y: f32, w: f32, h: f32, r: f32) {
+        if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) { return; }
+        // a negative size means the rect extends the other way
+        let (x, w) = if w < 0.0 { (x + w, -w) } else { (x, w) };
+        let (y, h) = if h < 0.0 { (y + h, -h) } else { (y, h) };
         // Clamp radius so it fits inside the rectangle.
-        let r = r.min(w * 0.5).min(h * 0.5).max(0.0);
-        if r < 1.0 { return draw_rect(x, y, w, h); }
+        let r = r.min(w * 0.5).min(h * 0.5);
+        if !(r >= 1.0) { return draw_rect(x, y, w, h); }
 
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
-
-        // Fill: scan-line over the bounding box, include pixel if inside rounded rect.
-        if let Some(fc) = fill {
-            let (tx0, ty0) = tfm(x, y);
-            let (tx1, ty1) = tfm(x + w, y + h);
-            // Only handles axis-aligned case; transform may have rotation but corners
-            // are the only rounded part — approximate by transforming the 4 circle centres.
-            let corners = [
-                tfm(x + r, y + r),       // top-left
-                tfm(x + w - r, y + r),   // top-right
-                tfm(x + w - r, y + h - r), // bottom-right
-                tfm(x + r, y + h - r),   // bottom-left
-            ];
-            let (sx, sy) = (tx0.min(tx1) as i32, ty0.min(ty1) as i32);
-            let (ex, ey) = (tx0.max(tx1) as i32, ty0.max(ty1) as i32);
-            let mut buf = pixel_buf().lock();
-            for py in sy..=ey {
-                for px in sx..=ex {
-                    let pfx = px as f32 + 0.5;
-                    let pfy = py as f32 + 0.5;
-                    // In-corner regions: check circle; elsewhere always include.
-                    let in_shape = [
-                        (pfx < corners[0].0 && pfy < corners[0].1, corners[0]),
-                        (pfx > corners[1].0 && pfy < corners[1].1, corners[1]),
-                        (pfx > corners[2].0 && pfy > corners[2].1, corners[2]),
-                        (pfx < corners[3].0 && pfy > corners[3].1, corners[3]),
-                    ].iter().all(|(is_corner, c)| {
-                        !is_corner || {
-                            let ddx = pfx - c.0; let ddy = pfy - c.1;
-                            ddx*ddx + ddy*ddy <= r*r
-                        }
-                    });
-                    if in_shape { put(&mut buf, cw, ch, px, py, fc); }
-                }
-            }
+        use std::f32::consts::{PI, FRAC_PI_2};
+        // one quarter circle per corner, joined into a single outline
+        let mut pts = Vec::new();
+        for (ccx, ccy, a0) in [
+            (x + r,     y + r,     PI),              // top-left
+            (x + w - r, y + r,     PI + FRAC_PI_2),  // top-right
+            (x + w - r, y + h - r, 0.0),             // bottom-right
+            (x + r,     y + h - r, FRAC_PI_2),       // bottom-left
+        ] {
+            pts.extend(arc_points(ccx, ccy, r, r, a0, a0 + FRAC_PI_2, true));
         }
-
-        // Stroke: arc at each corner + straight segments between them.
+        let mut buf = pixel_buf().lock();
+        if let Some(fc) = fill { fill_poly(&mut buf, cw, ch, &pts, fc); }
         if let Some(sc) = stroke {
-            let thick = sw.max(1.0) as i32;
-            let arc_steps = (r * 8.0) as usize + 8;
-            let (c0, c1, c2, c3) = (
-                tfm(x + r,     y + r),
-                tfm(x + w - r, y + r),
-                tfm(x + w - r, y + h - r),
-                tfm(x + r,     y + h - r),
-            );
-            let mut buf = pixel_buf().lock();
-            // Four corner arcs
-            let arcs = [
-                (c0, std::f32::consts::PI, 1.5 * std::f32::consts::PI),
-                (c1, 1.5 * std::f32::consts::PI, 2.0 * std::f32::consts::PI),
-                (c2, 0.0_f32, 0.5 * std::f32::consts::PI),
-                (c3, 0.5 * std::f32::consts::PI, std::f32::consts::PI),
-            ];
-            for (c, a0, a1) in arcs {
-                for i in 0..arc_steps {
-                    let t0 = a0 + i as f32 / arc_steps as f32 * (a1 - a0);
-                    let t1 = a0 + (i+1) as f32 / arc_steps as f32 * (a1 - a0);
-                    let (ax, ay) = (c.0 + t0.cos() * r, c.1 + t0.sin() * r);
-                    let (bx, by) = (c.0 + t1.cos() * r, c.1 + t1.sin() * r);
-                    for _ in 0..thick {
-                        bline(&mut buf, cw, ch, ax as i32, ay as i32, bx as i32, by as i32, sc);
-                    }
-                }
-            }
-            // Four straight edges between the arc endpoints
-            let edges = [
-                ((c0.0, c0.1 - r), (c1.0, c1.1 - r)),  // top
-                ((c1.0 + r, c1.1), (c2.0 + r, c2.1)),  // right
-                ((c3.0, c3.1 + r), (c2.0, c2.1 + r)),  // bottom
-                ((c0.0 - r, c0.1), (c3.0 - r, c3.1)),  // left
-            ];
-            for ((ax, ay), (bx, by)) in edges {
-                for _ in 0..thick {
-                    bline(&mut buf, cw, ch, ax as i32, ay as i32, bx as i32, by as i32, sc);
-                }
-            }
+            for i in 0..pts.len() { seg(&mut buf, cw, ch, pts[i], pts[(i + 1) % pts.len()], sw, sc); }
         }
     }
 
     pub fn draw_triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
-        let (tx1,ty1) = tfm(x1,y1);
-        let (tx2,ty2) = tfm(x2,y2);
-        let (tx3,ty3) = tfm(x3,y3);
-        if let Some(fc) = fill {
-            let mut buf = pixel_buf().lock();
-            fill_tri(&mut buf, cw, ch, tx1, ty1, tx2, ty2, tx3, ty3, fc);
-        }
-        if let Some(sc) = stroke {
-            let mut buf = pixel_buf().lock();
-            let thick = sw.max(1.0) as i32;
-            let pts = [(tx1,ty1),(tx2,ty2),(tx3,ty3),(tx1,ty1)];
-            for i in 0..3 {
-                let (ax,ay) = (pts[i].0 as i32, pts[i].1 as i32);
-                let (bx,by) = (pts[i+1].0 as i32, pts[i+1].1 as i32);
-                for _ in 0..thick {
-                    bline(&mut buf, cw, ch, ax, ay, bx, by, sc);
-                }
-            }
-        }
+        let c = [tfm(x1, y1), tfm(x2, y2), tfm(x3, y3)];
+        let mut buf = pixel_buf().lock();
+        if let Some(fc) = fill { fill_poly(&mut buf, cw, ch, &c, fc); }
+        if let Some(sc) = stroke { outline(&mut buf, cw, ch, &c, sw, sc); }
     }
 
     pub fn draw_line(x1: f32, y1: f32, x2: f32, y2: f32) {
         let (cw, ch) = canvas_dims();
         let (sc, sw) = with_style(|s| (s.stroke, s.stroke_weight));
         if let Some(c) = sc {
-            let (tx1,ty1) = tfm(x1,y1);
-            let (tx2,ty2) = tfm(x2,y2);
             let mut buf = pixel_buf().lock();
-            if sw <= 1.5 {
-                bline(&mut buf, cw, ch, tx1 as i32, ty1 as i32, tx2 as i32, ty2 as i32, c);
-            } else {
-                // Thick line: fill a quad perpendicular to the line direction.
-                let dx = tx2 - tx1;
-                let dy = ty2 - ty1;
-                let len = (dx*dx + dy*dy).sqrt().max(0.001);
-                let nx = -dy / len * sw * 0.5;
-                let ny =  dx / len * sw * 0.5;
-                fill_tri(&mut buf, cw, ch,
-                    tx1-nx, ty1-ny, tx1+nx, ty1+ny, tx2+nx, ty2+ny, c);
-                fill_tri(&mut buf, cw, ch,
-                    tx1-nx, ty1-ny, tx2+nx, ty2+ny, tx2-nx, ty2-ny, c);
-            }
+            seg(&mut buf, cw, ch, tfm(x1, y1), tfm(x2, y2), sw, c);
         }
     }
 
@@ -633,22 +660,20 @@ mod render {
         let (cw, ch) = canvas_dims();
         let (sc, sw) = with_style(|s| (s.stroke, s.stroke_weight));
         if let Some(c) = sc {
-            let (tx,ty) = tfm(x,y);
+            let (tx, ty) = tfm(x, y);
+            if !(tx.is_finite() && ty.is_finite()) { return; }
             let mut buf = pixel_buf().lock();
-            if sw <= 1.5 {
-                put(&mut buf, cw, ch, tx as i32, ty as i32, c);
+            if !(sw > 1.5) {
+                put(&mut buf, cw, ch, tx.clamp(-FAR, FAR) as i32, ty.clamp(-FAR, FAR) as i32, c);
             } else {
-                // Draw a filled circle of radius sw/2 centred on the point.
+                // a dot sw pixels across
                 let r = sw * 0.5;
-                let y0 = (ty - r) as i32; let y1 = (ty + r) as i32;
-                for py in y0..=y1 {
-                    let dy = py as f32 - ty;
-                    if dy.abs() > r { continue; }
-                    let dx = (r*r - dy*dy).sqrt();
-                    for px in ((tx - dx) as i32)..=((tx + dx) as i32) {
-                        put(&mut buf, cw, ch, px, py, c);
-                    }
-                }
+                let n = ((r * 3.0) as usize).clamp(8, 64);
+                let pts: Vec<(f32, f32)> = (0..n).map(|i| {
+                    let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                    (tx + t.cos() * r, ty + t.sin() * r)
+                }).collect();
+                fill_poly(&mut buf, cw, ch, &pts, c);
             }
         }
     }
@@ -657,68 +682,40 @@ mod render {
                      x3: f32, y3: f32, x4: f32, y4: f32) {
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
-        let (tx1,ty1) = tfm(x1,y1);
-        let (tx2,ty2) = tfm(x2,y2);
-        let (tx3,ty3) = tfm(x3,y3);
-        let (tx4,ty4) = tfm(x4,y4);
-        if let Some(fc) = fill {
-            let mut buf = pixel_buf().lock();
-            fill_tri(&mut buf, cw, ch, tx1, ty1, tx2, ty2, tx3, ty3, fc);
-            fill_tri(&mut buf, cw, ch, tx1, ty1, tx3, ty3, tx4, ty4, fc);
-        }
-        if let Some(sc) = stroke {
-            let mut buf = pixel_buf().lock();
-            let thick = sw.max(1.0) as i32;
-            let pts = [(tx1,ty1),(tx2,ty2),(tx3,ty3),(tx4,ty4),(tx1,ty1)];
-            for i in 0..4 {
-                let (ax,ay) = (pts[i].0 as i32, pts[i].1 as i32);
-                let (bx,by) = (pts[i+1].0 as i32, pts[i+1].1 as i32);
-                for _ in 0..thick { bline(&mut buf, cw, ch, ax, ay, bx, by, sc); }
-            }
-        }
+        let c = [tfm(x1, y1), tfm(x2, y2), tfm(x3, y3), tfm(x4, y4)];
+        let mut buf = pixel_buf().lock();
+        if let Some(fc) = fill { fill_poly(&mut buf, cw, ch, &c, fc); }
+        if let Some(sc) = stroke { outline(&mut buf, cw, ch, &c, sw, sc); }
     }
 
     pub fn draw_arc(cx: f32, cy: f32, w: f32, h: f32, start: f32, stop: f32) {
+        if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()
+             && start.is_finite() && stop.is_finite()) { return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
-        let (tcx, tcy) = tfm(cx, cy);
-        let rx = w * 0.5; let ry = h * 0.5;
-        let angle_span = (stop - start).abs();
-        let steps = ((rx.max(ry) * angle_span) as usize).max(16);
+        // more than a full turn is a full turn
+        let tau = std::f32::consts::TAU;
+        let stop = start + (stop - start).clamp(-tau, tau);
+        if stop == start { return; }
+        let arc = arc_points(cx, cy, w * 0.5, h * 0.5, start, stop, true);
+        let centre = tfm(cx, cy);
+        let mut buf = pixel_buf().lock();
 
-        // Fill: pie slices via triangles from the centre.
+        // Fill: a pie slice.
         if let Some(fc) = fill {
-            let mut buf = pixel_buf().lock();
-            for i in 0..steps {
-                let t0 = start + i as f32 / steps as f32 * (stop - start);
-                let t1 = start + (i+1) as f32 / steps as f32 * (stop - start);
-                let (ax, ay) = (tcx + t0.cos() * rx, tcy + t0.sin() * ry);
-                let (bx, by) = (tcx + t1.cos() * rx, tcy + t1.sin() * ry);
-                fill_tri(&mut buf, cw, ch, tcx, tcy, ax, ay, bx, by, fc);
-            }
+            let mut pie = Vec::with_capacity(arc.len() + 1);
+            pie.push(centre);
+            pie.extend_from_slice(&arc);
+            fill_poly(&mut buf, cw, ch, &pie, fc);
         }
 
         // Stroke: arc outline + two radial lines closing the pie.
         if let Some(sc) = stroke {
-            let thick = sw.max(1.0) as i32;
-            let mut buf = pixel_buf().lock();
-            for i in 0..steps {
-                let t0 = start + i as f32 / steps as f32 * (stop - start);
-                let t1 = start + (i+1) as f32 / steps as f32 * (stop - start);
-                let (ax, ay) = (tcx + t0.cos() * rx, tcy + t0.sin() * ry);
-                let (bx, by) = (tcx + t1.cos() * rx, tcy + t1.sin() * ry);
-                for _ in 0..thick {
-                    bline(&mut buf, cw, ch, ax as i32, ay as i32, bx as i32, by as i32, sc);
-                }
-            }
+            for i in 1..arc.len() { seg(&mut buf, cw, ch, arc[i - 1], arc[i], sw, sc); }
             // Close with radial lines only when fill is also set (pie mode).
-            if fill.is_some() {
-                let (ax, ay) = (tcx + start.cos() * rx, tcy + start.sin() * ry);
-                let (bx, by) = (tcx + stop.cos()  * rx, tcy + stop.sin()  * ry);
-                for _ in 0..thick {
-                    bline(&mut buf, cw, ch, tcx as i32, tcy as i32, ax as i32, ay as i32, sc);
-                    bline(&mut buf, cw, ch, tcx as i32, tcy as i32, bx as i32, by as i32, sc);
-                }
+            if fill.is_some() && arc.len() >= 2 {
+                seg(&mut buf, cw, ch, centre, arc[0], sw, sc);
+                seg(&mut buf, cw, ch, centre, arc[arc.len() - 1], sw, sc);
             }
         }
     }
@@ -883,41 +880,53 @@ mod render {
         let fc = match with_style(|s| s.fill) { Some(c) => c, None => return };
         // Each font pixel maps to `cell` output pixels.  Round to the nearest
         // integer so pixels are square and there are no spacing gaps.
-        let cell = ((TEXT_SIZE.with(|ts| *ts.borrow()) / 8.0).max(1.0).round()) as i32;
+        let cell = text_cell() as i32;
         let cell_f = cell as f32;
         let (cw, canvas_h) = canvas_dims();
-        let (x, y) = text_origin(s, x, y);
-        let (tx, ty) = tfm(x, y);
-        let mut cursor_x = tx;
         let mut buf = pixel_buf().lock();
-        for byte in s.bytes() {
-            if byte < 32 || byte > 127 { cursor_x += 6.0 * cell_f; continue; }
-            let glyph = &FONT5X8[(byte - 32) as usize];
-            for col in 0..5usize {
-                let bits = glyph[col];
-                for row in 0..8usize {
-                    if bits & (1 << row) != 0 {
-                        let px = (cursor_x + col as f32 * cell_f) as i32;
-                        let py = (ty + row as f32 * cell_f) as i32;
-                        for dy in 0..cell {
-                            for dx in 0..cell {
-                                put(&mut buf, cw, canvas_h, px + dx, py + dy, fc);
+        // "\n" starts a new line; each line is aligned on its own
+        for (n, line) in s.split('\n').enumerate() {
+            let (lx, ly) = text_origin(line, x, y + n as f32 * text_leading());
+            let (tx, ty) = tfm(lx, ly);
+            if !(tx.is_finite() && ty.is_finite()) { continue; }
+            let (tx, ty) = (tx.clamp(-FAR, FAR), ty.clamp(-FAR, FAR));
+            let mut cursor_x = tx;
+            for c in line.chars() {
+                // nothing more of this line can land on the canvas
+                if cursor_x >= cw as f32 { break; }
+                let code = c as u32;
+                if (32..=127).contains(&code) && cursor_x + 6.0 * cell_f > 0.0 {
+                    let glyph = &FONT5X8[(code - 32) as usize];
+                    for col in 0..5usize {
+                        let bits = glyph[col];
+                        for row in 0..8usize {
+                            if bits & (1 << row) != 0 {
+                                let px = (cursor_x + col as f32 * cell_f) as i32;
+                                let py = (ty + row as f32 * cell_f) as i32;
+                                for dy in 0..cell {
+                                    hspan(&mut buf, cw, canvas_h, py + dy, px, px + cell - 1, fc);
+                                }
                             }
                         }
                     }
                 }
+                // the font only has ASCII; anything else leaves a gap one character wide
+                cursor_x += 6.0 * cell_f; // 5 cols + 1 px gap
             }
-            cursor_x += 6.0 * cell_f; // 5 cols + 1 px gap
         }
     }
 
-    /// Width in pixels of `s` at the current text size.
+    /// Width in pixels of `s` at the current text size (the widest line).
     pub fn text_width(s: &str) -> f32 {
-        let cell_f = ((TEXT_SIZE.with(|ts| *ts.borrow()) / 8.0).max(1.0).round()) as f32;
-        s.bytes().filter(|b| *b >= 32 && *b <= 127).count() as f32 * 6.0 * cell_f
+        let cell_f = text_cell();
+        s.split('\n').map(|l| l.chars().count()).max().unwrap_or(0) as f32 * 6.0 * cell_f
     }
 
-    pub fn set_text_size(size: f32) { TEXT_SIZE.with(|s| *s.borrow_mut() = size); }
+    pub fn set_text_size(size: f32) {
+        // NaN, zero and negatives would make every glyph loop misbehave
+        let size = if size.is_finite() { size.clamp(1.0, 2048.0) } else { 12.0 };
+        TEXT_SIZE.with(|s| *s.borrow_mut() = size);
+    }
 
     pub fn set_smooth(_on: bool) {}
 
@@ -936,6 +945,8 @@ mod render {
     fn text_cell() -> f32 {
         ((TEXT_SIZE.with(|ts| *ts.borrow()) / 8.0).max(1.0).round()) as f32
     }
+    /// Distance from one line of text to the next.
+    fn text_leading() -> f32 { 10.0 * text_cell() }
     /// Glyphs are 7 rows above the baseline and 1 below.
     pub fn text_ascent() -> f32 { 7.0 * text_cell() }
     pub fn text_descent() -> f32 { 1.0 * text_cell() }
@@ -999,19 +1010,24 @@ mod render {
     pub fn draw_image(id: u64, x: f32, y: f32, w: f32, h: f32) {
         let imgs = images().lock();
         let img = match imgs.get((id as usize).wrapping_sub(1)) { Some(i) => i, None => return };
+        if img.w == 0 || img.h == 0 { return; }
         let (x0, y0) = tfm(x, y);
         let (x1, y1) = tfm(x + w, y + h);
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) { return; }
         let (lx, hx) = (x0.min(x1), x0.max(x1));
         let (ly, hy) = (y0.min(y1), y0.max(y1));
         if hx - lx < 1.0 || hy - ly < 1.0 { return; }
         let tint = TINT.with(|t| t.get());
         let (cw, ch) = canvas_dims();
         let mut buf = pixel_buf().lock();
-        for py in ly.floor() as i32..hy.ceil() as i32 {
+        // only the part of the image that is on the canvas
+        let (py0, py1) = (ly.floor().max(0.0) as i32, hy.ceil().min(ch as f32) as i32);
+        let (px0, px1) = (lx.floor().max(0.0) as i32, hx.ceil().min(cw as f32) as i32);
+        for py in py0..py1 {
             let v = (py as f32 + 0.5 - ly) / (hy - ly);
             if !(0.0..1.0).contains(&v) { continue; }
             let sy = ((v * img.h as f32) as usize).min(img.h - 1);
-            for px in lx.floor() as i32..hx.ceil() as i32 {
+            for px in px0..px1 {
                 let u = (px as f32 + 0.5 - lx) / (hx - lx);
                 if !(0.0..1.0).contains(&u) { continue; }
                 let sx = ((u * img.w as f32) as usize).min(img.w - 1);
@@ -1079,22 +1095,37 @@ mod glfw {
     fn looping() -> bool { *LOOPING.get_or_init(|| Mutex::new(true)).lock().unwrap() }
 
     pub fn set_size(w: u32, h: u32) {
+        let (w, h) = (w.clamp(1, super::MAX_CANVAS), h.clamp(1, super::MAX_CANVAS));
         *WANT_W.get_or_init(|| Mutex::new(w)).lock().unwrap() = w;
         *WANT_H.get_or_init(|| Mutex::new(h)).lock().unwrap() = h;
         resize_canvas(w, h);
     }
     pub fn set_fullscreen(_on: bool) {} // not supported on minifb
-    pub fn set_frame_rate(f: f32) { *FRAME_RATE.get_or_init(|| Mutex::new(60.0)).lock().unwrap() = f; }
+    pub fn set_frame_rate(f: f32) {
+        // NaN, zero and negatives would stall or spin the loop
+        let f = if f.is_finite() { f.clamp(1.0, 1000.0) } else { 60.0 };
+        *FRAME_RATE.get_or_init(|| Mutex::new(60.0)).lock().unwrap() = f;
+        MEASURED_FPS.store(f.to_bits(), Ordering::Relaxed);
+    }
     pub fn set_looping(v: bool)   { *LOOPING.get_or_init(|| Mutex::new(true)).lock().unwrap() = v; }
-    pub fn request_redraw()       {}
-    pub fn exit_sketch()          { std::process::exit(0); }
+    static REDRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // f32 bits; 60.0 until the first frames have been timed
+    static MEASURED_FPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x42700000);
+    pub fn request_redraw()       { REDRAW.store(true, Ordering::Relaxed); }
+    pub fn exit_sketch()          {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(0);
+    }
+    /// Frames per second actually reached (smoothed), like Processing's frameRate.
+    pub fn measured_frame_rate() -> f32 { f32::from_bits(MEASURED_FPS.load(Ordering::Relaxed)) }
     pub fn set_window_title(t: &str) {
         *WANT_TITLE.get_or_init(|| Mutex::new(t.to_owned())).lock().unwrap() = t.to_owned();
     }
     pub static MOUSE_BUTTON:   std::sync::atomic::AtomicU32  = std::sync::atomic::AtomicU32::new(0);
     static CURSOR_VISIBLE:     std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     pub fn set_cursor_visible(v: bool) { CURSOR_VISIBLE.store(v, Ordering::Relaxed); }
-    pub fn current_frame_rate() -> f32 { fps() }
+    pub fn current_frame_rate() -> f32 { measured_frame_rate() }
     pub fn is_looping() -> bool { looping() }
 
     pub struct Runner { title: String }
@@ -1121,26 +1152,57 @@ mod glfw {
                 .get().map(|m| m.lock().unwrap().clone())
                 .unwrap_or_else(|| self.title.clone());
 
-            let mut window = Window::new(
+            let mut window = match Window::new(
                 &title,
                 w, h,
                 WindowOptions { resize: true, ..WindowOptions::default() },
-            ).expect("Failed to create minifb window");
+            ) {
+                Ok(win) => win,
+                Err(e) => {
+                    eprintln!("Could not open the sketch window ({}x{}): {}", w, h, e);
+                    std::process::exit(1);
+                }
+            };
 
-            let target_fps = fps();
+            let mut target_fps = fps();
             window.set_target_fps(target_fps as usize);
+
+            // Every key transition, in order, as the OS reports it. Polling
+            // the key state once a frame instead loses a quick tap whenever
+            // the press and the release land inside the same frame, which
+            // at low frame rates is most taps.
+            struct KeyTap(std::sync::Arc<Mutex<Vec<(Key, bool)>>>);
+            impl minifb::InputCallback for KeyTap {
+                fn add_char(&mut self, _c: u32) {}
+                fn set_key_state(&mut self, key: Key, down: bool) {
+                    if let Ok(mut q) = self.0.lock() { q.push((key, down)); }
+                }
+            }
+            let key_events: std::sync::Arc<Mutex<Vec<(Key, bool)>>> = Default::default();
+            window.set_input_callback(Box::new(KeyTap(key_events.clone())));
+            let mut held: Vec<Key> = Vec::new();   // keys we have reported as pressed
+            let mut quit = false;
 
             let start = Instant::now();
             let mut frame_count: u64 = 0;
+            let mut last_frame = Instant::now();
             let mut last_mouse_pressed = false;
             let mut last_mouse_x = 0.0f32;
             let mut last_mouse_y = 0.0f32;
 
-            while window.is_open() && !window.is_key_down(Key::Escape) {
+            // Escape closes the sketch, after the sketch's own keyPressed() has seen it
+            while window.is_open() && !quit {
+                // frameRate() can be called at any time, not just in setup()
+                if fps() != target_fps {
+                    target_fps = fps();
+                    window.set_target_fps(target_fps as usize);
+                }
                 let cur_w = window.get_size().0;
                 let cur_h = window.get_size().1;
-                if cur_w != CANVAS_W.load(Ordering::Relaxed) as usize
-                    || cur_h != CANVAS_H.load(Ordering::Relaxed) as usize
+                // a minimized window reports 0x0; keep the canvas as it is
+                if cur_w > 0 && cur_h > 0
+                    && (cur_w != CANVAS_W.load(Ordering::Relaxed) as usize
+                        || cur_h != CANVAS_H.load(Ordering::Relaxed) as usize)
                 {
                     resize_canvas(cur_w as u32, cur_h as u32);
                 }
@@ -1188,33 +1250,72 @@ mod glfw {
                     cb(Event::MouseWheel(scroll.1), &ctx);
                 }
 
-                // Key events (fire once per pressed key)
-                let shift = window.is_key_down(Key::LeftShift)
-                         || window.is_key_down(Key::RightShift);
-                let keys: Vec<Key> = window.get_keys_pressed(minifb::KeyRepeat::No);
-                for k in &keys {
-                    ctx.key_pressed = true;
-                    ctx.key_code = *k as u32;
-                    ctx.key = key_to_char(*k, shift);
-                    cb(Event::KeyPressed, &ctx);
-                    if ctx.key.is_some() { cb(Event::KeyTyped, &ctx); }
+                // Key events, one per real press and release
+                let batch: Vec<(Key, bool)> = key_events.lock()
+                    .map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+                // Auto-repeat shows up as a release followed at once by a
+                // press of the same key. That is not the key coming up.
+                let mut skip = vec![false; batch.len()];
+                for i in 0..batch.len() {
+                    if skip[i] || batch[i].1 { continue; }
+                    if let Some(j) = (i + 1..batch.len()).find(|&j| batch[j].0 == batch[i].0) {
+                        if batch[j].1 { skip[i] = true; skip[j] = true; }
+                    }
                 }
-                let keys_rel: Vec<Key> = window.get_keys_released();
-                for k in &keys_rel {
-                    ctx.key_code = *k as u32;
-                    ctx.key = key_to_char(*k, shift);
-                    cb(Event::KeyReleased, &ctx);
+                let shifted = |held: &Vec<Key>| held.contains(&Key::LeftShift) || held.contains(&Key::RightShift);
+                for (i, &(k, down)) in batch.iter().enumerate() {
+                    if skip[i] { continue; }
+                    if down {
+                        if held.contains(&k) { continue; }
+                        held.push(k);
+                        if k == Key::Escape { quit = true; }
+                        ctx.key_pressed = true;
+                        ctx.key_code = k as u32;
+                        ctx.key = key_to_char(k, shifted(&held));
+                        cb(Event::KeyPressed, &ctx);
+                        if ctx.key.is_some() { cb(Event::KeyTyped, &ctx); }
+                    } else if let Some(pos) = held.iter().position(|h| *h == k) {
+                        let shift = shifted(&held);
+                        held.remove(pos);
+                        ctx.key_pressed = !held.is_empty();
+                        ctx.key_code = k as u32;
+                        ctx.key = key_to_char(k, shift);
+                        cb(Event::KeyReleased, &ctx);
+                    }
+                }
+                if window.is_key_down(Key::Escape) { quit = true; }
+                // A key let go while the window didn't have focus never
+                // reports its release; don't leave it stuck down.
+                for k in held.clone() {
+                    if !window.is_key_down(k) {
+                        held.retain(|h| *h != k);
+                        ctx.key_pressed = !held.is_empty();
+                        ctx.key_code = k as u32;
+                        ctx.key = key_to_char(k, false);
+                        cb(Event::KeyReleased, &ctx);
+                    }
                 }
 
-                // Draw frame
-                if looping() {
+                // Draw frame. With noLoop() draw() still runs once, and again
+                // after each redraw(), like Processing.
+                let redraw = REDRAW.swap(false, Ordering::Relaxed);
+                if looping() || redraw || frame_count == 0 {
+                    frame_count += 1;   // the first draw() sees frameCount 1
+                    ctx.frame_count = frame_count;
+                    let now = Instant::now();
+                    let dt = now.duration_since(last_frame).as_secs_f32();
+                    last_frame = now;
+                    if frame_count > 1 && dt > 0.0 && looping() {
+                        let old = measured_frame_rate();
+                        let fresh = (1.0 / dt).min(1000.0);
+                        MEASURED_FPS.store((old * 0.9 + fresh * 0.1).to_bits(), Ordering::Relaxed);
+                    }
                     // key/key_code stay None/0 so sync_globals won't clobber the
                     // persisted last-pressed values; key_pressed reflects current hold state.
                     ctx.key = None; ctx.key_code = 0;
-                    ctx.key_pressed = !window.get_keys().is_empty();
+                    ctx.key_pressed = !held.is_empty();
                     ctx.mouse_x = mx; ctx.mouse_y = my; ctx.mouse_pressed = mouse_pressed;
                     cb(Event::Draw, &ctx);
-                    frame_count += 1;
                 }
 
                 // Blit pixel buffer
@@ -1277,6 +1378,7 @@ mod glfw {
             Comma => Some(','), Period => Some('.'), Slash => Some('/'),
             Backslash => Some('\\'), Space => Some(' '), Enter => Some('\n'),
             Tab => Some('\t'), Backspace => Some('\x08'),
+            Escape => Some('\x1b'), Delete => Some('\x7f'),
             _ => None,
         }
     }
@@ -1708,12 +1810,14 @@ pub fn mouse_button() -> u32 {
 
 pub fn noise3(x: f32, y: f32, z: f32) -> f32 { core::noise3(x, y, z) }
 pub fn noise_seed(seed: u64) { core::noise_seed(seed); }
-/// Accepted for compatibility; the value noise here has a single octave.
-pub fn noise_detail(_octaves: u32, _falloff: f32) {}
+/// Number of octaves summed, and how much each one counts relative to the
+/// one before (Processing's defaults: 4 and 0.5).
+pub fn noise_detail(octaves: u32, falloff: f32) { core::noise_detail(octaves, falloff); }
 #[inline] pub fn noiseSeed(seed: u64) { noise_seed(seed) }
 #[inline] pub fn randomGaussian() -> f32 { random_gaussian() }
 
-/// The target frame rate set by frame_rate().
+/// Frames per second the sketch is actually reaching (smoothed); starts at
+/// the target set by frame_rate().
 pub fn current_frame_rate() -> f32 {
     #[cfg(not(feature = "wasm"))] { glfw::current_frame_rate() }
     #[cfg(feature = "wasm")]      { 60.0 }
@@ -1721,6 +1825,17 @@ pub fn current_frame_rate() -> f32 {
 pub fn is_looping() -> bool {
     #[cfg(not(feature = "wasm"))] { glfw::is_looping() }
     #[cfg(feature = "wasm")]      { true }
+}
+
+/// Color of one canvas pixel as (r, g, b), each 0..255. Black outside the canvas.
+pub fn get_pixel(x: i32, y: i32) -> (u8, u8, u8) {
+    let (w, h) = (CANVAS_W.load(Ordering::Relaxed) as i32, CANVAS_H.load(Ordering::Relaxed) as i32);
+    if x < 0 || y < 0 || x >= w || y >= h { return (0, 0, 0); }
+    let buf = pixel_buf().lock();
+    match buf.get(y as usize * w as usize + x as usize) {
+        Some(p) => ((p >> 16) as u8, (p >> 8) as u8, *p as u8),
+        None    => (0, 0, 0),
+    }
 }
 
 // ─────────────────────────── saveFrame ───────────────────────────────────────
