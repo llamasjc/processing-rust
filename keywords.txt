@@ -283,6 +283,13 @@ OPEN	KEYWORD2
 CHORD	KEYWORD2
 PIE	KEYWORD2
 
+load_pixels	FUNCTION1
+update_pixels	FUNCTION1
+loadPixels	FUNCTION1
+updatePixels	FUNCTION1
+smooth	FUNCTION1
+no_smooth	FUNCTION1
+
 # ── Lifecycle functions ────────────────────────────────────────────────────────
 setup	FUNCTION2
 draw	FUNCTION2

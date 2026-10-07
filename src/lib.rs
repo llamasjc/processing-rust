@@ -287,6 +287,25 @@ mod render {
                 outline(&mut buf, cw, ch, &screen, sw, sc);
             } else if join == 2 && sc.a >= 1.0 {
                 for i in 1..n { capsule(&mut buf, cw, ch, screen[i-1], screen[i], sw, sc); }
+            } else if (join == 0 || (join == 2 && sc.a < 1.0)) && n > 2 && sw > 1.5 {
+                // open path, pointed joins: one polygon, then the ends
+                let r = sw.min(4096.0) * 0.5;
+                let mut path = screen.clone();
+                if cap == 2 {
+                    // PROJECT: half a weight further at both ends
+                    let stretch = |from: (f32, f32), to: (f32, f32)| -> (f32, f32) {
+                        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+                        let len = (dx * dx + dy * dy).sqrt();
+                        if len.is_finite() && len > 1.0e-6 { (to.0 + dx / len * r, to.1 + dy / len * r) } else { to }
+                    };
+                    path[0] = stretch(screen[1], screen[0]);
+                    path[n - 1] = stretch(screen[n - 2], screen[n - 1]);
+                }
+                stroke_path(&mut buf, cw, ch, &path, false, sw, sc);
+                if cap == 0 && sc.a >= 1.0 {
+                    capsule(&mut buf, cw, ch, screen[0], screen[0], sw, sc);
+                    capsule(&mut buf, cw, ch, screen[n - 1], screen[n - 1], sw, sc);
+                }
             } else {
                 // open path: square ends where pieces meet, the chosen cap at the two ends
                 for i in 1..n {
@@ -380,6 +399,11 @@ mod render {
     /// Beyond this, positions are clamped. Far outside any canvas, and small
     /// enough that f32 arithmetic on them stays finite.
     const FAR: f32 = 1.0e9;
+
+    // smooth() / noSmooth(): anti-aliased edges, on by default as in Processing.
+    static SMOOTH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    #[inline]
+    fn smooth_on() -> bool { SMOOTH.load(Ordering::Relaxed) }
 
     // blendMode(): how a drawn color combines with what is already there.
     // 0 BLEND (default), 1 ADD, 2 SUBTRACT, 3 DARKEST, 4 LIGHTEST,
@@ -481,6 +505,141 @@ mod render {
     /// when its centre is inside, and is written exactly once, so shapes that
     /// share an edge don't overlap and translucent fills have no seams.
     fn fill_poly(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], col: Color) {
+        if smooth_on() { fill_poly_smooth(buf, w, h, pts, col) } else { fill_poly_hard(buf, w, h, pts, col) }
+    }
+
+    /// Anti-aliased fill. Each pixel row is sampled on SUB lines; along a
+    /// line the covered length of every pixel is exact, so near-horizontal
+    /// and near-vertical edges both come out smooth. Pixels that are fully
+    /// inside are written in runs, exactly as the hard-edged fill does, so
+    /// only the edge pixels cost extra.
+    fn fill_poly_smooth(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], col: Color) {
+        const SUB: usize = 4;
+        if pts.len() < 3 || w == 0 || h == 0 { return; }
+        if !(col.a > 0.0) { return; }
+        if pts.iter().any(|p| p.0.is_nan() || p.1.is_nan()) { return; }
+        let pts: Vec<(f32, f32)> = pts.iter().map(|p| (p.0.clamp(-FAR, FAR), p.1.clamp(-FAR, FAR))).collect();
+        let n = pts.len();
+
+        let (mut ymin, mut ymax, mut xmin, mut xmax) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for p in &pts { ymin = ymin.min(p.1); ymax = ymax.max(p.1); xmin = xmin.min(p.0); xmax = xmax.max(p.0); }
+        let row0 = ymin.floor().max(0.0) as i64;
+        let row1 = (ymax.ceil().min(h as f32)) as i64;
+        let col0 = xmin.floor().max(0.0) as i64;
+        let col1 = (xmax.ceil().min(w as f32)) as i64;        // exclusive
+        if row0 >= row1 || col0 >= col1 { return; }
+        let span = (col1 - col0) as usize;
+
+        // per row: `part` takes the partly covered ends of each run, `step`
+        // marks where fully covered stretches start and stop
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> = std::cell::RefCell::new((Vec::new(), Vec::new()));
+        }
+        // both arrays are all zero between calls (every row cleans up after itself)
+        let (mut part, mut step) = SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        if part.len() < span + 1 { part.resize(span + 1, 0.0); step.resize(span + 1, 0.0); }
+        let mut xs: Vec<(f32, i32)> = Vec::with_capacity(8);
+        let weight = 1.0 / SUB as f32;
+
+        // Which edges cross which rows, so a row only looks at its own few
+        // edges instead of all of them: `first[r]..first[r + 1]` indexes the
+        // edges of row r in `edges_of`.
+        let rows = (row1 - row0) as usize;
+        let edge_rows = |i: usize| -> Option<(usize, usize)> {
+            let (a, b) = (pts[i], pts[(i + 1) % n]);
+            let (lo, hi) = (a.1.min(b.1), a.1.max(b.1));
+            if !(hi > lo) { return None; }                       // horizontal: never crossed
+            let r0 = (lo.floor() as i64).max(row0);
+            let r1 = (hi.floor() as i64).min(row1 - 1);
+            if r0 > r1 { None } else { Some(((r0 - row0) as usize, (r1 - row0) as usize)) }
+        };
+        let mut first = vec![0u32; rows + 2];
+        for i in 0..n {
+            if let Some((r0, r1)) = edge_rows(i) { for r in r0..=r1 { first[r + 2] += 1; } }
+        }
+        for r in 2..rows + 2 { first[r] += first[r - 1]; }
+        let mut edges_of = vec![0u32; first[rows + 1] as usize];
+        for i in 0..n {
+            if let Some((r0, r1)) = edge_rows(i) {
+                for r in r0..=r1 { edges_of[first[r + 1] as usize] = i as u32; first[r + 1] += 1; }
+            }
+        }
+
+        for row in row0..row1 {
+            let ri = (row - row0) as usize;
+            let mine = &edges_of[first[ri] as usize..first[ri + 1] as usize];
+            if mine.len() < 2 { continue; }
+            // the pixels this row actually reaches: [lo, hi]
+            let (mut lo, mut hi) = (usize::MAX, 0usize);
+            for sub in 0..SUB {
+                let yc = row as f32 + (sub as f32 + 0.5) / SUB as f32;
+                xs.clear();
+                for &ei in mine {
+                    let i = ei as usize;
+                    let (a, b) = (pts[i], pts[(i + 1) % n]);
+                    let up   = a.1 <= yc && b.1 > yc;
+                    let down = b.1 <= yc && a.1 > yc;
+                    if up || down {
+                        let t = (yc - a.1) / (b.1 - a.1);
+                        xs.push((a.0 + t * (b.0 - a.0), if up { 1 } else { -1 }));
+                    }
+                }
+                if xs.len() < 2 { continue; }
+                xs.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap_or(std::cmp::Ordering::Equal));
+                let mut winding = 0;
+                for k in 0..xs.len() - 1 {
+                    winding += xs[k].1;
+                    if winding == 0 { continue; }
+                    // covered stretch [xa, xb) on this line, relative to col0
+                    let xa = (xs[k].0 - col0 as f32).max(0.0);
+                    let xb = (xs[k + 1].0 - col0 as f32).min(span as f32);
+                    if !(xb > xa) { continue; }
+                    let (ia, ib) = (xa.floor() as usize, (xb.floor() as usize).min(span));
+                    lo = lo.min(ia);
+                    hi = hi.max(ib.min(span - 1));
+                    if ia == ib {
+                        part[ia] += (xb - xa) * weight;
+                    } else {
+                        part[ia] += (ia as f32 + 1.0 - xa) * weight;
+                        if ib < span { part[ib] += (xb - ib as f32) * weight; }
+                        if ia + 1 < ib { step[ia + 1] += weight; step[ib] -= weight; }
+                    }
+                }
+            }
+            if lo > hi { continue; }
+
+            // turn the two arrays into coverage and paint the row
+            let mut running = 0.0f32;
+            let mut run_start: Option<usize> = None;   // start of a stretch of full pixels
+            for i in lo..=hi {
+                running += step[i];
+                let cov = (running + part[i]).min(1.0);
+                step[i] = 0.0;
+                part[i] = 0.0;
+                if cov >= 0.999 {
+                    if run_start.is_none() { run_start = Some(i); }
+                    continue;
+                }
+                if let Some(s0) = run_start.take() {
+                    hspan(buf, w, h, row as i32, (col0 as usize + s0) as i32, (col0 as usize + i - 1) as i32, col);
+                }
+                if cov > 0.004 {
+                    put(buf, w, h, (col0 as usize + i) as i32, row as i32,
+                        Color::from_rgba(col.r, col.g, col.b, col.a * cov));
+                }
+            }
+            if let Some(s0) = run_start.take() {
+                hspan(buf, w, h, row as i32, (col0 as usize + s0) as i32, (col0 as usize + hi) as i32, col);
+            }
+            // a run that ends exactly at the right edge leaves its end marker one past hi
+            if hi + 1 <= span { step[hi + 1] = 0.0; part[hi + 1] = 0.0; }
+            step[span] = 0.0;
+            part[span] = 0.0;
+        }
+        SCRATCH.with(|s| *s.borrow_mut() = (part, step));
+    }
+
+    fn fill_poly_hard(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], col: Color) {
         if pts.len() < 3 || w == 0 || h == 0 { return; }
         if !(col.a > 0.0) { return; }
         if pts.iter().any(|p| p.0.is_nan() || p.1.is_nan()) { return; }
@@ -523,7 +682,10 @@ mod render {
     /// A straight stroke from a to b, `weight` pixels wide.
     fn seg(buf: &mut Vec<u32>, w: usize, h: usize,
            a: (f32, f32), b: (f32, f32), weight: f32, col: Color) {
-        if !(weight > 1.5) { return bline(buf, w, h, a.0, a.1, b.0, b.1, col); }
+        if !(weight > 1.5) {
+            if !smooth_on() { return bline(buf, w, h, a.0, a.1, b.0, b.1, col); }
+            return hairline(buf, w, h, a, b, col);
+        }
         let weight = weight.min(4096.0);
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let len = (dx * dx + dy * dy).sqrt();
@@ -535,11 +697,116 @@ mod render {
         ], col);
     }
 
+    /// Strokes a whole path as ONE polygon (both edges of the stroke, joined
+    /// at the ends), so a translucent or smoothed stroke is even along its
+    /// length: no darker joints, no hairline gaps between pieces. Corners are
+    /// pointed; one too sharp for that is cut off.
+    fn stroke_path(buf: &mut Vec<u32>, w: usize, h: usize,
+                   path: &[(f32, f32)], closed: bool, weight: f32, col: Color) {
+        // leave out points that repeat the one before
+        let mut pts: Vec<(f32, f32)> = Vec::with_capacity(path.len());
+        for p in path {
+            if !(p.0.is_finite() && p.1.is_finite()) { continue; }
+            if let Some(q) = pts.last() {
+                if (p.0 - q.0).abs() < 1.0e-4 && (p.1 - q.1).abs() < 1.0e-4 { continue; }
+            }
+            pts.push(*p);
+        }
+        if closed && pts.len() > 1 {
+            let (a, b) = (pts[0], pts[pts.len() - 1]);
+            if (a.0 - b.0).abs() < 1.0e-4 && (a.1 - b.1).abs() < 1.0e-4 { pts.pop(); }
+        }
+        let n = pts.len();
+        if n < 2 { return; }
+        let mut weight = weight;
+        if !(weight > 1.5) {
+            if !smooth_on() || n == 2 {
+                let last = if closed { n } else { n - 1 };
+                for i in 0..last { seg(buf, w, h, pts[i], pts[(i + 1) % n], weight, col); }
+                return;
+            }
+            // a smooth hairline: one pixel wide, through pixel centres (see hairline)
+            for p in pts.iter_mut() { *p = (p.0 + 0.5, p.1 + 0.5); }
+            weight = 1.0;
+        } else if n == 2 {
+            return seg(buf, w, h, pts[0], pts[1], weight, col);
+        }
+
+        let r = weight.min(4096.0) * 0.5;
+        // unit normal (to the left) of the piece from a to b
+        let normal = |a: (f32, f32), b: (f32, f32)| -> (f32, f32) {
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len = (dx * dx + dy * dy).sqrt().max(1.0e-9);
+            (-dy / len, dx / len)
+        };
+        let (mut left, mut right) = (Vec::with_capacity(n + 4), Vec::with_capacity(n + 4));
+        for i in 0..n {
+            let p = pts[i];
+            let before = if i > 0 { Some(normal(pts[i - 1], p)) } else if closed { Some(normal(pts[n - 1], p)) } else { None };
+            let after  = if i + 1 < n { Some(normal(p, pts[i + 1])) } else if closed { Some(normal(p, pts[0])) } else { None };
+            match (before, after) {
+                (Some(n0), Some(n1)) => {
+                    let (sx, sy) = (n0.0 + n1.0, n0.1 + n1.1);
+                    let len = (sx * sx + sy * sy).sqrt();
+                    let k = if len > 1.0e-4 { (sx * n0.0 + sy * n0.1) / len } else { 0.0 };
+                    if k < 0.25 {
+                        // too sharp for a point: square it off
+                        left.push((p.0 + n0.0 * r, p.1 + n0.1 * r));
+                        left.push((p.0 + n1.0 * r, p.1 + n1.1 * r));
+                        right.push((p.0 - n0.0 * r, p.1 - n0.1 * r));
+                        right.push((p.0 - n1.0 * r, p.1 - n1.1 * r));
+                    } else {
+                        let (mx, my) = (sx / len * r / k, sy / len * r / k);
+                        left.push((p.0 + mx, p.1 + my));
+                        right.push((p.0 - mx, p.1 - my));
+                    }
+                }
+                (Some(m), None) | (None, Some(m)) => {
+                    left.push((p.0 + m.0 * r, p.1 + m.1 * r));
+                    right.push((p.0 - m.0 * r, p.1 - m.1 * r));
+                }
+                (None, None) => {}
+            }
+        }
+        if left.len() < 2 { return; }
+        let mut poly = left.clone();
+        if closed {
+            // outer loop, across to the inner loop, around it the other way,
+            // and back: the two crossings cancel, the middle stays empty
+            poly.push(left[0]);
+            poly.push(right[0]);
+            poly.extend(right.iter().skip(1).rev());
+            poly.push(right[0]);
+        } else {
+            poly.extend(right.iter().rev());
+        }
+        fill_poly(buf, w, h, &poly, col);
+    }
+
+    /// A smooth line one pixel wide, through pixel centres like the stepped
+    /// one it replaces (so a line from (10, 10) sits on row 10, not between
+    /// rows 9 and 10).
+    fn hairline(buf: &mut Vec<u32>, w: usize, h: usize, a: (f32, f32), b: (f32, f32), col: Color) {
+        if !(a.0.is_finite() && a.1.is_finite() && b.0.is_finite() && b.1.is_finite()) { return; }
+        let (a, b) = ((a.0 + 0.5, a.1 + 0.5), (b.0 + 0.5, b.1 + 0.5));
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1.0e-6 {
+            return put(buf, w, h, a.0.clamp(-FAR, FAR) as i32, a.1.clamp(-FAR, FAR) as i32, col);
+        }
+        let (ux, uy) = (dx / len * 0.5, dy / len * 0.5);   // half a pixel along the line
+        let (nx, ny) = (-uy, ux);                          // half a pixel across it
+        fill_poly_smooth(buf, w, h, &[
+            (a.0 - ux - nx, a.1 - uy - ny), (a.0 - ux + nx, a.1 - uy + ny),
+            (b.0 + ux + nx, b.1 + uy + ny), (b.0 + ux - nx, b.1 + uy - ny),
+        ], col);
+    }
+
     /// A stroke from a to b with round ends, as one polygon so a translucent
     /// stroke is the same shade along its whole length.
     fn capsule(buf: &mut Vec<u32>, w: usize, h: usize,
                a: (f32, f32), b: (f32, f32), weight: f32, col: Color) {
-        if !(weight > 1.5) { return bline(buf, w, h, a.0, a.1, b.0, b.1, col); }
+        if !(weight > 1.5) { return seg(buf, w, h, a, b, weight, col); }
         let r = weight.min(4096.0) * 0.5;
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let len = (dx * dx + dy * dy).sqrt();
@@ -562,7 +829,7 @@ mod render {
     /// A line the way line() draws it: strokeCap() decides the ends.
     fn capped(buf: &mut Vec<u32>, w: usize, h: usize,
               a: (f32, f32), b: (f32, f32), weight: f32, col: Color, cap: u8) {
-        if !(weight > 1.5) { return bline(buf, w, h, a.0, a.1, b.0, b.1, col); }
+        if !(weight > 1.5) { return seg(buf, w, h, a, b, weight, col); }
         match cap {
             1 => seg(buf, w, h, a, b, weight, col),                    // SQUARE: stops at the ends
             2 => {                                                     // PROJECT: half a weight further
@@ -611,11 +878,7 @@ mod render {
     /// Outline with pointed (mitered) corners. A corner too sharp for a
     /// sensible point is cut off instead, as Processing does.
     fn outline_miter(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], weight: f32, col: Color) {
-        let n = pts.len();
-        for i in 0..n {
-            seg(buf, w, h, pts[i], pts[(i + 1) % n], weight, col);
-            if weight > 1.5 { miter(buf, w, h, pts[(i + n - 1) % n], pts[i], pts[(i + 1) % n], weight, col); }
-        }
+        stroke_path(buf, w, h, pts, true, weight, col);
     }
 
     /// Fills the outside of the corner at p out to the point where the two
@@ -745,9 +1008,7 @@ mod render {
         let pts = arc_points(cx, cy, w * 0.5, h * 0.5, 0.0, std::f32::consts::TAU, false);
         let mut buf = pixel_buf().lock();
         if let Some(fc) = fill { fill_poly(&mut buf, cw, ch, &pts, fc); }
-        if let Some(sc) = stroke {
-            for i in 0..pts.len() { seg(&mut buf, cw, ch, pts[i], pts[(i + 1) % pts.len()], sw, sc); }
-        }
+        if let Some(sc) = stroke { stroke_path(&mut buf, cw, ch, &pts, true, sw, sc); }
     }
 
     pub fn draw_rect(x: f32, y: f32, w: f32, h: f32) {
@@ -784,9 +1045,7 @@ mod render {
         }
         let mut buf = pixel_buf().lock();
         if let Some(fc) = fill { fill_poly(&mut buf, cw, ch, &pts, fc); }
-        if let Some(sc) = stroke {
-            for i in 0..pts.len() { seg(&mut buf, cw, ch, pts[i], pts[(i + 1) % pts.len()], sw, sc); }
-        }
+        if let Some(sc) = stroke { stroke_path(&mut buf, cw, ch, &pts, true, sw, sc); }
     }
 
     pub fn draw_triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
@@ -873,7 +1132,7 @@ mod render {
         }
 
         if let Some(sc) = stroke {
-            for i in 1..arc.len() { seg(&mut buf, cw, ch, arc[i - 1], arc[i], sw, sc); }
+            stroke_path(&mut buf, cw, ch, &arc, false, sw, sc);
             if arc.len() >= 2 {
                 match mode {
                     2 => capsule(&mut buf, cw, ch, arc[arc.len() - 1], arc[0], sw, sc),
@@ -1106,7 +1365,7 @@ mod render {
         TEXT_SIZE.with(|s| *s.borrow_mut() = size);
     }
 
-    pub fn set_smooth(_on: bool) {}
+    pub fn set_smooth(on: bool) { SMOOTH.store(on, Ordering::Relaxed); }
 
     pub fn reset_matrix() {
         MATRIX_STACK.with(|s| *s.borrow_mut().last_mut().unwrap() = identity());
@@ -1139,6 +1398,16 @@ mod render {
             _ => y,
         };
         (x, y)
+    }
+
+    /// The whole canvas, row by row, as 0xAARRGGBB (alpha always 255).
+    pub fn copy_pixels() -> Vec<u32> {
+        pixel_buf().lock().iter().map(|p| 0xFF00_0000 | (p & 0x00FF_FFFF)).collect()
+    }
+    /// Writes pixels back, as many as fit. Alpha is ignored: the canvas is opaque.
+    pub fn write_pixels(px: &[u32]) {
+        let mut buf = pixel_buf().lock();
+        for (d, s) in buf.iter_mut().zip(px.iter()) { *d = s & 0x00FF_FFFF; }
     }
 
     /// set(x, y, color): one pixel, no transform, no blending.
@@ -2235,6 +2504,14 @@ pub fn is_looping() -> bool {
     #[cfg(not(feature = "wasm"))] { glfw::is_looping() }
     #[cfg(feature = "wasm")]      { true }
 }
+
+/// loadPixels(): every pixel of the canvas as 0xAARRGGBB, row by row, so the
+/// pixel at (x, y) is at index y * width + x.
+pub fn load_pixels() -> Vec<u32> { render::copy_pixels() }
+/// updatePixels(): puts a (changed) copy from load_pixels() back on the canvas.
+pub fn update_pixels(pixels: &[u32]) { render::write_pixels(pixels); }
+#[inline] pub fn loadPixels() -> Vec<u32> { load_pixels() }
+#[inline] pub fn updatePixels(pixels: &[u32]) { update_pixels(pixels) }
 
 /// Sets one canvas pixel (r, g, b each 0..255). Not affected by transforms.
 pub fn set_pixel(x: i32, y: i32, r: f32, g: f32, b: f32) {
