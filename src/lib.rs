@@ -1090,6 +1090,11 @@ mod glfw {
     static WANT_W:     OnceLock<Mutex<u32>>  = OnceLock::new();
     static WANT_H:     OnceLock<Mutex<u32>>  = OnceLock::new();
     static WANT_TITLE: OnceLock<Mutex<String>> = OnceLock::new();
+    // Like Processing, a sketch window has a fixed size unless the sketch
+    // asks otherwise. A fixed size is also what makes tiling window managers
+    // (i3, sway, Hyprland, bspwm) float the window instead of tiling it.
+    static RESIZABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub fn set_resizable(on: bool) { RESIZABLE.store(on, Ordering::Relaxed); }
 
     fn fps() -> f32  { *FRAME_RATE.get_or_init(|| Mutex::new(60.0)).lock().unwrap() }
     fn looping() -> bool { *LOOPING.get_or_init(|| Mutex::new(true)).lock().unwrap() }
@@ -1155,7 +1160,7 @@ mod glfw {
             let mut window = match Window::new(
                 &title,
                 w, h,
-                WindowOptions { resize: true, ..WindowOptions::default() },
+                WindowOptions { resize: RESIZABLE.load(Ordering::Relaxed), ..WindowOptions::default() },
             ) {
                 Ok(win) => win,
                 Err(e) => {
@@ -1717,6 +1722,12 @@ pub fn exit() {
     #[cfg(feature = "wasm")]      wasm::exit_sketch();
 }
 
+/// Call in setup(): whether the sketch window can be resized (default: no).
+pub fn window_resizable(on: bool) {
+    #[cfg(not(feature = "wasm"))] glfw::set_resizable(on);
+    #[cfg(feature = "wasm")] { let _ = on; }
+}
+#[inline] pub fn windowResizable(on: bool) { window_resizable(on) }
 pub fn window_title(t: &str) {
     #[cfg(not(feature = "wasm"))] glfw::set_window_title(t);
 }
