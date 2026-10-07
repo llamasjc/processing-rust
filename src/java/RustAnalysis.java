@@ -17,7 +17,10 @@ public record RustAnalysis(
   /** Human-readable sketch name (used as the window title). */
   String sketchName,
   /** Locations (1-based {row, col}) of ERROR/MISSING nodes found during parsing. */
-  List<int[]> parseErrorLocations
+  List<int[]> parseErrorLocations,
+  /** 1-based sketch line each item starts on. Keys: the item's text as held in
+   *  lifecycleFns / passthroughItems, and "let:&lt;name&gt;" for a top-level binding. */
+  Map<String, Integer> itemLines
 ) {
   /** @return true if the parse found any ERROR or MISSING nodes. */
   public boolean hasParseErrors()     { return !parseErrorLocations.isEmpty(); }

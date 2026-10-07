@@ -54,7 +54,7 @@ public class RustBuild {
    *  {@code src/main.rs:42:5: error: …}
    */
   private static final Pattern ERR_LINE_PATTERN =
-    Pattern.compile("-->\\s+src/main\\.rs:(\\d+):(\\d+)");
+    Pattern.compile("(-->\\s+)?src[/\\\\]main\\.rs:(\\d+)(?::(\\d+))?");
 
   /** Matches the processing:: prefix that sketches should never see. */
   private static final Pattern CRATE_PREFIX_PATTERN =
@@ -72,6 +72,29 @@ public class RustBuild {
 
   /** Per-tab start lines in the concatenated source (1-based). */
   private int[] tabStartLines;
+
+  /** {first main.rs line, first sketch line, line count} per chunk; see RustEmitter. */
+  private List<int[]> lineMap = List.of();
+
+  // cargo while it is running, so Stop can end a build that is still going
+  private volatile Process cargoProc;
+  private volatile boolean cancelled;
+
+  /** Stops a build in progress. Safe from any thread, any number of times. */
+  public void cancel() {
+    cancelled = true;
+    Process p = cargoProc;
+    if (p != null) {
+      // cargo starts rustc as a child; take those down too
+      p.descendants().forEach(ProcessHandle::destroyForcibly);
+      p.destroyForcibly();
+    }
+  }
+
+  /** Shared cargo target dir: dependencies are compiled once for all sketches. */
+  private static File sharedTarget() {
+    return new File(Base.getSketchbookFolder(), "rust-build-cache/.shared-target");
+  }
 
   // ── Construction ────────────────────────────────────────────────────────────
 
@@ -100,6 +123,7 @@ public class RustBuild {
     RustEmitter emitter = new RustEmitter(analysis);
     String      mainRs  = emitter.emit();
     headerLineCount = emitter.getHeaderLineCount();
+    lineMap         = emitter.getLineMap();
 
     // 4 ── Ensure persistent cargo project exists ──────────────────────────────
     File cacheProject = ensureCacheProject();
@@ -127,6 +151,9 @@ public class RustBuild {
     for (int i = 0; i < codes.length; i++) {
       tabStartLines[i] = lineCount;
       String src = codes[i].getProgram();
+      if (src == null) src = "";
+      // "\r\n" and lone "\r" line ends would throw the line numbers off
+      src = src.replace("\r\n", "\n").replace('\r', '\n');
       sb.append(src);
       if (!src.endsWith("\n")) sb.append('\n');
       // Count lines in this tab
@@ -169,6 +196,19 @@ public class RustBuild {
       File libStamp = new File(cacheRoot.getParentFile(), ".lib-stamp");
       if (libStamp.exists() && libStamp.lastModified() > versionStamp.lastModified()) {
         needsScaffold = true;
+      }
+    }
+
+    // The engine itself changed (a mode update, or work on src/lib.rs): every
+    // sketch must pick it up, not keep compiling against its old copy.
+    if (!needsScaffold) {
+      for (String f : new String[] { "src/lib.rs", "Cargo.toml" }) {
+        File ours   = new File(mode.getFolder(), f);
+        File theirs = new File(cacheRoot, "processing/" + f);
+        if (!theirs.exists() || ours.length() != theirs.length()
+            || ours.lastModified() > theirs.lastModified()) {
+          needsScaffold = true;
+        }
       }
     }
 
@@ -258,11 +298,13 @@ public class RustBuild {
       System.getenv().getOrDefault("RUSTFLAGS", "") + " -C incremental=true");
 
     // Point all sketches at a shared target dir so deps are compiled once.
-    String sharedTarget = System.getProperty("user.home")
-      + "/sketchbook/rust-build-cache/.shared-target";
-    pb.environment().put("CARGO_TARGET_DIR", sharedTarget);
+    pb.environment().put("CARGO_TARGET_DIR", sharedTarget().getAbsolutePath());
 
+    if (cancelled) throw new InterruptedException("build cancelled");
     Process proc = pb.start();
+    cargoProc = proc;
+    if (cancelled) cancel();   // Stop arrived while cargo was starting
+    try { proc.getOutputStream().close(); } catch (IOException ignored) {}
 
     // Stream output, rewriting error lines in real time.
     BufferedReader reader = new BufferedReader(
@@ -271,29 +313,37 @@ public class RustBuild {
     // Collect structured diagnostics for gutter markers; first error for status bar.
     List<RustProblem> diagnostics = new ArrayList<>();
     String firstError = null;
+    boolean firstErrorLocated = false;
     String line;
     while ((line = reader.readLine()) != null) {
-      String rewritten = rewriteCargoError(line);
+      String rewritten = rewriteLocations(line);
       // Forward all output to the IDE console.
       mode.statusMessage(rewritten);
 
-      if (rewritten.startsWith("error") || rewritten.startsWith("warning")) {
-        // Try to extract tab + line from the rewritten error so we can build a marker.
-        // After rewriting, error lines look like:
-        //   error[E0308]: mismatched types
-        //   --> Sketch.pde:12:5
-        // We parse the --> line to get the gutter position.
-        RustProblem dp = parseRewrittenDiagnostic(rewritten);
-        if (dp != null) {
-          diagnostics.add(dp);
-        }
-        if (firstError == null && rewritten.startsWith("error")) {
-          firstError = rewritten;
-        }
+      // --message-format=short gives one line per problem:
+      //   Sketch.pde:12:5: error[E0308]: mismatched types: ...
+      RustProblem dp = parseRewrittenDiagnostic(rewritten);
+      if (dp != null) diagnostics.add(dp);
+      boolean located = dp != null && dp.getSeverity() == RustProblem.ERROR;
+      if (located && !firstErrorLocated) {
+        firstError = rewritten.trim();      // an error with a line beats one without
+        firstErrorLocated = true;
+      } else if (firstError == null
+                 && (rewritten.startsWith("error") || rewritten.contains(": error"))) {
+        firstError = rewritten.trim();
       }
     }
 
-    int exitCode = proc.waitFor();
+    int exitCode;
+    try {
+      exitCode = proc.waitFor();
+    } catch (InterruptedException e) {
+      cancel();
+      throw e;
+    } finally {
+      cargoProc = null;
+    }
+    if (cancelled) throw new InterruptedException("build cancelled");
     if (exitCode != 0) {
       String msg = firstError != null
         ? firstError
@@ -305,10 +355,7 @@ public class RustBuild {
     String profile   = release ? "release" : "debug";
     String sketchBin = sanitiseName(sketch.getName());
     String binaryName = isWindows() ? sketchBin + ".exe" : sketchBin;
-    String sharedTargetForBin = System.getProperty("user.home")
-      + "/sketchbook/rust-build-cache/.shared-target";
-    File binary = new File(sharedTargetForBin,
-      profile + "/" + binaryName);
+    File binary = new File(sharedTarget(), profile + "/" + binaryName);
 
     if (!binary.exists()) {
       throw new IOException("Build succeeded but binary not found: " + binary);
@@ -318,17 +365,13 @@ public class RustBuild {
 
   // ── Diagnostic parsing ──────────────────────────────────────────────────────
 
-  /** Matches rewritten cargo location lines: {@code --> Sketch.pde:12:5} */
+  /** A sketch location as it reads after rewriting: {@code Sketch.pde:12:5} */
   private static final Pattern REWRITTEN_LOCATION =
-    Pattern.compile("-->\\s+(\\S+\\.(?:pde|prs|rs)):(\\d+):(\\d+)");
+    Pattern.compile("(\\S+\\.(?:pde|prs|rs)):(\\d+):(\\d+)");
 
   /**
-   * Try to build a {@link RustProblem} from a rewritten cargo output line.
-   * Returns {@code null} if the line carries no parseable location.
-   *
-   * <p>After {@link #rewriteCargoError} runs, location lines look like:
-   * <pre>  --> Sketch.pde:12:5</pre>
-   * We match those and find the tab index by file name.
+   * A {@link RustProblem} from a rewritten cargo output line, or {@code null}
+   * if the line doesn't point into the sketch.
    */
   private RustProblem parseRewrittenDiagnostic(String line) {
     Matcher m = REWRITTEN_LOCATION.matcher(line);
@@ -338,18 +381,14 @@ public class RustBuild {
     int    lineNum  = Integer.parseInt(m.group(2));  // 1-based
     int    col      = Integer.parseInt(m.group(3));  // 1-based
 
-    // Find which tab this file name corresponds to.
-    processing.app.SketchCode[] codes = sketch.getCode();
-    int tabIndex = 0;
+    SketchCode[] codes = sketch.getCode();
+    int tabIndex = -1;
     for (int i = 0; i < codes.length; i++) {
-      if (codes[i].getFileName().equals(fileName)) {
-        tabIndex = i;
-        break;
-      }
+      if (codes[i].getFileName().equals(fileName)) { tabIndex = i; break; }
     }
+    if (tabIndex < 0) return null;   // generated code or the engine, not a tab
 
-    boolean isErr = line.startsWith("error") ||
-                    (line.contains("error") && !line.startsWith("warning"));
+    boolean isErr = line.contains("error") && !line.contains(": warning");
     return new RustProblem(tabIndex, lineNum - 1, col - 1,
                            line.trim(),
                            isErr ? RustProblem.ERROR : RustProblem.WARNING,
@@ -358,39 +397,49 @@ public class RustBuild {
 
   // ── Error rewriting ─────────────────────────────────────────────────────────
 
+  /** Where a line of the generated main.rs came from: {tab index, 1-based line in that tab}, or null. */
+  private int[] sketchPosition(int mainRsLine) {
+    if (tabStartLines == null || tabStartLines.length == 0) return null;
+    for (int[] chunk : lineMap) {
+      if (mainRsLine >= chunk[0] && mainRsLine < chunk[0] + chunk[2]) {
+        int sketchLine = chunk[1] + (mainRsLine - chunk[0]);
+        int tab = 0;
+        for (int i = tabStartLines.length - 1; i >= 0; i--) {
+          if (sketchLine >= tabStartLines[i]) { tab = i; break; }
+        }
+        return new int[] { tab, sketchLine - tabStartLines[tab] + 1 };
+      }
+    }
+    return null;
+  }
+
   /**
-   * Rewrite a rustc error line so that:
-   * <ul>
-   *   <li>Line numbers refer to the sketch tab, not main.rs.</li>
-   *   <li>{@code processing::} crate prefixes are stripped.</li>
-   * </ul>
+   * Rewrites a line of cargo or sketch output so that every
+   * {@code src/main.rs:LINE[:COL]} names the sketch tab and the line in that
+   * tab, and {@code processing::} prefixes are gone. Locations in generated
+   * glue (nothing the person wrote) are left as they are.
    */
-  private String rewriteCargoError(String line) {
-    // Strip processing:: prefixes (e.g. "processing::App" → "App").
+  public String rewriteLocations(String line) {
+    if (line == null) return null;
     line = CRATE_PREFIX_PATTERN.matcher(line).replaceAll("");
+    if (line.indexOf("main.rs") < 0) return line;
 
     Matcher m = ERR_LINE_PATTERN.matcher(line);
-    if (m.find()) {
-      int mainRsLine = Integer.parseInt(m.group(1));
-      int sketchLine = mainRsLine - headerLineCount;
-      if (sketchLine < 1) sketchLine = 1;
-
-      // Determine which tab owns this line.
-      int tabIndex = 0;
-      for (int i = tabStartLines.length - 1; i >= 0; i--) {
-        if (sketchLine >= tabStartLines[i]) {
-          tabIndex = i;
-          break;
+    StringBuilder sb = new StringBuilder();
+    while (m.find()) {
+      String repl = m.group();
+      try {
+        int[] pos = sketchPosition(Integer.parseInt(m.group(2)));
+        if (pos != null && pos[0] < sketch.getCodeCount()) {
+          repl = (m.group(1) != null ? m.group(1) : "")
+            + sketch.getCode(pos[0]).getFileName() + ":" + pos[1]
+            + (m.group(3) != null ? ":" + m.group(3) : "");
         }
-      }
-      int lineInTab = sketchLine - tabStartLines[tabIndex] + 1;
-      String tabName = sketch.getCode(tabIndex).getFileName();
-
-      line = line.substring(0, m.start()) +
-        "--> " + tabName + ":" + lineInTab + ":" + m.group(2) +
-        line.substring(m.end());
+      } catch (NumberFormatException ignored) {}
+      m.appendReplacement(sb, Matcher.quoteReplacement(repl));
     }
-    return line;
+    m.appendTail(sb);
+    return sb.toString();
   }
 
   // ── Utilities ───────────────────────────────────────────────────────────────
@@ -413,11 +462,10 @@ public class RustBuild {
       File bundle  = new File(modeDir, "prebuilt-deps/" + platform + ".tar.gz");
       if (!bundle.exists()) return;  // not bundled for this platform
 
-      File sharedDeps = new File(System.getProperty("user.home")
-        + "/sketchbook/rust-build-cache/.shared-target/debug/deps");
+      File sharedDeps = new File(sharedTarget(), "debug/deps");
 
-      File stamp = new File(System.getProperty("user.home")
-        + "/sketchbook/rust-build-cache/.prebuilt-stamp-" + platform);
+      File stamp = new File(Base.getSketchbookFolder(),
+        "rust-build-cache/.prebuilt-stamp-" + platform);
 
       // Re-extract if bundle is newer than stamp
       if (stamp.exists() && stamp.lastModified() >= bundle.lastModified()) return;

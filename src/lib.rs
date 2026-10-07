@@ -1148,6 +1148,34 @@ mod glfw {
         pub fn start<F>(self, mut cb: F) where F: FnMut(Event, &FrameContext) {
             use minifb::{Window, WindowOptions, Key, MouseMode, MouseButton};
 
+            // Set by the IDE that started this sketch.
+            // PROCESSING_WATCH_STDIN: the IDE keeps our stdin open and never
+            // writes to it, so end of input means the IDE is gone (crashed or
+            // killed) and nobody can press Stop any more. Close instead of
+            // staying behind as an orphan window.
+            if std::env::var_os("PROCESSING_WATCH_STDIN").is_some() {
+                let _ = std::thread::Builder::new().name("ide-watch".into()).spawn(|| {
+                    use std::io::Read;
+                    let mut buf = [0u8; 256];
+                    let mut stdin = std::io::stdin();
+                    loop {
+                        match stdin.read(&mut buf) {
+                            Ok(0) => std::process::exit(0),
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => return,   // no usable stdin: nothing to watch
+                        }
+                    }
+                });
+            }
+            // PROCESSING_PRESENT="width,height,x,y": present mode on that screen.
+            if let Ok(v) = std::env::var("PROCESSING_PRESENT") {
+                let n: Vec<i64> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                if n.len() == 4 && n[0] > 0 && n[1] > 0 {
+                    set_present(n[0] as usize, n[1] as usize, n[2] as isize, n[3] as isize);
+                }
+            }
+
             let init_w = CANVAS_W.load(Ordering::Relaxed);
             let init_h = CANVAS_H.load(Ordering::Relaxed);
 

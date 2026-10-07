@@ -71,6 +71,22 @@ public class RustEmitter {
 
   public int getHeaderLineCount() { return headerLineCount; }
 
+  // The generated file is not the sketch with a header on top: globals move
+  // into a struct, helper items come first, functions are reordered. So each
+  // chunk copied from the sketch records where it landed:
+  //   { first line in main.rs, first line in the sketch, number of lines }
+  // (all 1-based). RustBuild uses it to point errors at the real sketch line.
+  private final java.util.List<int[]> lineMap = new java.util.ArrayList<>();
+
+  public java.util.List<int[]> getLineMap() { return lineMap; }
+
+  /** Call just before appending {@code text}, which starts at sketch line {@code sketchLine}. */
+  private void mapChunk(StringBuilder sb, String text, Integer sketchLine) {
+    if (sketchLine == null || sketchLine < 1) return;
+    String t = text.endsWith("\n") ? text.substring(0, text.length() - 1) : text;
+    lineMap.add(new int[] { countLines(sb.toString()) + 1, sketchLine, countLines(t) + 1 });
+  }
+
   // ── Top-level emit ────────────────────────────────────────────────────────────
 
   public String emit() throws UnsupportedEncodingException {
@@ -83,6 +99,7 @@ public class RustEmitter {
     if (!analysis.passthroughItems().isEmpty()) {
       line(sb, "// ── user-defined items ───────────────────────────────────────────────────────");
       for (String item : analysis.passthroughItems()) {
+        mapChunk(sb, item, analysis.itemLines().get(item));
         sb.append(item);
         if (!item.endsWith("\n")) sb.append('\n');
         line(sb, "");
@@ -97,7 +114,11 @@ public class RustEmitter {
 
     emitLifecycleFns(sb);
     emitMain(sb);
-    return OverloadRewriter.rewrite(sb.toString());
+    String generated = sb.toString();
+    String rewritten = OverloadRewriter.rewrite(generated);
+    // the map is only good if the overload rewrite left every line where it was
+    if (countLines(rewritten) != countLines(generated)) lineMap.clear();
+    return rewritten;
   }
 
   // ── SketchState ───────────────────────────────────────────────────────────────
@@ -124,6 +145,7 @@ public class RustEmitter {
       String fieldType = b.typeAnn() != null ? b.typeAnn() : inferType(b.init());
       String tp   = fieldType != null ? ": " + fieldType : "";
       String init = b.init() != null ? b.init() : "Default::default()";
+      mapChunk(sb, "x", analysis.itemLines().get("let:" + b.name()));
       line(sb, "        " + kw + b.name() + tp + " = " + init + ";");
     }
     line(sb, "        Self {");
@@ -152,6 +174,10 @@ public class RustEmitter {
 
     for (Map.Entry<String, String> e : analysis.lifecycleFns().entrySet()) {
       String out = transformFn(e.getKey(), e.getValue());
+      // only when the rewrite kept the function's line structure
+      if (countLines(out.strip()) == countLines(e.getValue().strip())) {
+        mapChunk(sb, out, analysis.itemLines().get(e.getValue()));
+      }
       sb.append(out);
       if (!out.endsWith("\n")) sb.append('\n');
       line(sb, "");

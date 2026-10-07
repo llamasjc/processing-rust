@@ -86,6 +86,28 @@ public class RustMode extends Mode {
     }
   }
 
+  // ── Import Library menu ──────────────────────────────────────────────────────
+  //
+  // Rust sketches don't use Processing libraries, but Editor still asks for an
+  // Import Library menu on every window focus. Mode's default rebuild walks a
+  // library list this mode never fills in. Give it a disabled placeholder.
+
+  @Override
+  public void rebuildImportMenu() {
+    if (importMenu == null) {
+      importMenu = new javax.swing.JMenu("Import Library...");
+      javax.swing.JMenuItem none = new javax.swing.JMenuItem("No libraries for Rust sketches");
+      none.setEnabled(false);
+      importMenu.add(none);
+    }
+  }
+
+  @Override
+  public javax.swing.JMenu getImportMenu() {
+    rebuildImportMenu();
+    return importMenu;
+  }
+
   // ── Mode identity ────────────────────────────────────────────────────────────
 
   @Override

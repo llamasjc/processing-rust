@@ -67,6 +67,8 @@ public class RustAnalyzer {
   private final Map<String, SketchBinding> bindings       = new LinkedHashMap<>();
   private final Map<String, String>        lifecycleFns   = new LinkedHashMap<>();
   private final List<String>               passthroughItems = new ArrayList<>();
+  // 1-based sketch line each item starts on (see RustAnalysis.itemLines)
+  private final Map<String, Integer>       itemLines = new java.util.HashMap<>();
   /** 1-based {row, col} pairs for each ERROR / MISSING node found. */
   private final List<int[]>                parseErrorLocations = new ArrayList<>();
 
@@ -111,7 +113,8 @@ public class RustAnalyzer {
       Map.copyOf(lifecycleFns),
       List.copyOf(passthroughItems),
       sketchName,
-      List.copyOf(parseErrorLocations)
+      List.copyOf(parseErrorLocations),
+      Map.copyOf(itemLines)
     );
   }
 
@@ -139,6 +142,7 @@ public class RustAnalyzer {
     int count = root.getChildCount();
     // Accumulate attribute_item nodes; attach them to the following item.
     List<String> pendingAttrs = new ArrayList<>();
+    int attrsRow = -1;   // row of the first buffered attribute, or -1
 
     for (int i = 0; i < count; i++) {
       Node child = root.getChild(i);
@@ -152,15 +156,21 @@ public class RustAnalyzer {
         case "attribute_item" -> {
           // Buffer attributes — they'll be prepended to the next item's text.
           String text = sliceSource(child);
-          if (!text.isBlank()) pendingAttrs.add(text);
+          if (!text.isBlank()) {
+            if (pendingAttrs.isEmpty()) attrsRow = child.getStartPoint().getRow();
+            pendingAttrs.add(text);
+          }
         }
         case "let_declaration" -> {
           pendingAttrs.clear(); // attributes above top-level lets are unusual; drop them
+          attrsRow = -1;
           handleTopLevelLet(child);
         }
         case "function_item" -> {
-          handleFunction(child, pendingAttrs);
+          handleFunction(child, pendingAttrs,
+            (pendingAttrs.isEmpty() || attrsRow < 0 ? child.getStartPoint().getRow() : attrsRow) + 1);
           pendingAttrs.clear();
+          attrsRow = -1;
         }
         default -> {
           // Anything else (use_declaration, struct_item, impl_item, const_item,
@@ -172,8 +182,11 @@ public class RustAnalyzer {
               ? text
               : String.join("\n", pendingAttrs) + "\n" + text;
             passthroughItems.add(full);
+            itemLines.putIfAbsent(full,
+              (pendingAttrs.isEmpty() || attrsRow < 0 ? child.getStartPoint().getRow() : attrsRow) + 1);
           }
           pendingAttrs.clear();
+          attrsRow = -1;
         }
       }
     }
@@ -234,13 +247,14 @@ public class RustAnalyzer {
 
     if (name != null) {
       bindings.put(name, new SketchBinding(name, mutable, typeAnn, init));
+      itemLines.put("let:" + name, node.getStartPoint().getRow() + 1);
     }
   }
 
   // ── Functions ─────────────────────────────────────────────────────────────────
 
   /** Classify a top-level function as lifecycle or pass-through. */
-  private void handleFunction(Node node, List<String> attrs) {
+  private void handleFunction(Node node, List<String> attrs, int startLine) {
     String fnName = null;
     Node   nameNode = null;
     for (int i = 0; i < node.getChildCount(); i++) {
@@ -272,11 +286,13 @@ public class RustAnalyzer {
         ? fnText
         : String.join("\n", attrs) + "\n" + fnText;
       lifecycleFns.put(canonical, full);
+      itemLines.put(full, startLine);
     } else {
       String full = attrs.isEmpty()
         ? fnText
         : String.join("\n", attrs) + "\n" + fnText;
       passthroughItems.add(full);
+      itemLines.putIfAbsent(full, startLine);
     }
   }
 
@@ -305,6 +321,9 @@ public class RustAnalyzer {
             "\\b" + java.util.regex.Pattern.quote(name) + "\\b", canonical);
         }
         lifecycleFns.put(canonical, fnText);
+        int line = 1;
+        for (int c = 0; c < start; c++) if (source.charAt(c) == '\n') line++;
+        itemLines.put(fnText, line);
       }
     }
   }

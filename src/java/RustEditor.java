@@ -1,149 +1,336 @@
 package processing.mode.rust;
 
 import processing.app.Base;
+import processing.app.Formatter;
 import processing.app.Preferences;
+import processing.app.SketchCode;
+import processing.app.syntax.JEditTextArea;
+import processing.app.syntax.PdeInputHandler;
+import processing.app.syntax.PdeTextArea;
+import processing.app.syntax.PdeTextAreaDefaults;
 import processing.app.ui.Editor;
 import processing.app.ui.EditorException;
 import processing.app.ui.EditorState;
+import processing.app.ui.EditorToolbar;
 
-import javax.swing.*;
+import javax.swing.JMenu;
+import javax.swing.JMenuItem;
+import javax.swing.KeyStroke;
+import javax.swing.SwingUtilities;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import processing.app.Formatter;
-import processing.app.ui.EditorToolbar;
-import javax.swing.JMenu;
 
 /**
- * RustEditor – the sketch editor for RustMode.
+ * The sketch editor for RustMode: Run builds the sketch with cargo and starts
+ * it, Stop ends whichever of the two is going on.
  *
- * <p>Extends Processing's {@link Editor} base class and wires the Run / Stop
- * toolbar buttons to {@link RustBuild}.
+ * <p>There is at most one run per editor. Starting a new one stops the old
+ * one first, including a build that is still compiling.
  */
 public class RustEditor extends Editor {
 
   private static final Logger LOG = Logger.getLogger(RustEditor.class.getName());
 
-  private RustBuild        currentBuild;
-  private Process          runningProcess;
-  private RustInputHandler inputHandler;
+  /** One press of Run: the build, then the sketch process. */
+  private static final class Run {
+    volatile RustBuild build;
+    volatile Process   proc;
+    volatile Thread    thread;
+    volatile boolean   stopped;
+  }
+
+  private volatile Run current;
+
+  // Sketch processes that are still alive, across all editors. Emptied by a
+  // shutdown hook so quitting the IDE never leaves sketch windows behind.
+  private static final Set<Process> LIVE = ConcurrentHashMap.newKeySet();
+  static {
+    try {
+      Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+        for (Process p : LIVE) p.destroyForcibly();
+      }, "rustmode-stop-sketches"));
+    } catch (Throwable ignored) {}   // already shutting down
+  }
 
   protected RustEditor(Base base, String path, EditorState state, RustMode mode)
       throws EditorException {
     super(base, path, state, mode);
-    inputHandler = new RustInputHandler(this);
   }
-
-  @Override
-  public void deactivateRun() {}
-
-  // ── Mode accessors ────────────────────────────────────────────────────────────
 
   public RustMode getRustMode() {
     return (RustMode) getMode();
   }
 
-  // ── Toolbar actions ───────────────────────────────────────────────────────────
-
-    public void handleRun(boolean present, Runnable runAction, Runnable stopAction) {
-    // Sync the active tab's editor Document to SketchCode so getProgram()
-    // returns current content. The base handleRun() does this; we bypass it.
-    sketch.getCurrentCode().setProgram(getText());
-
-    // Kick the build off on a background thread so the EDT stays responsive.
-    new Thread(() -> {
-      try {
-        statusNotice("Building with cargo…");
-
-        // ── Pre-build lint (Tree-sitter, fast) ──────────────────────────────
-        String source = String.join("\n",
-          java.util.Arrays.stream(sketch.getCode())
-            .map(processing.app.SketchCode::getProgram)
-            .toArray(String[]::new));
-        RustAnalyzer analyzer = new RustAnalyzer(source, sketch.getName());
-        RustAnalysis  analysis = analyzer.analyse();
-        RustLinter    linter   = new RustLinter(sketch, analysis);
-        List<RustLinter.LintProblem> lintProblems = linter.lint();
-        if (!lintProblems.isEmpty()) {
-          // Log and surface the first problem in the status bar.
-          for (RustLinter.LintProblem p : lintProblems) {
-            String tabName = sketch.getCode(p.tabIndex()).getFileName();
-            LOG.warning("Lint: " + tabName + ":" + p.line() + ": " + p.message());
-          }
-          RustLinter.LintProblem first = lintProblems.get(0);
-          String tabName = sketch.getCode(first.tabIndex()).getFileName();
-          statusError(tabName + ":" + first.line() + ": " + first.message());
-          stopAction.run();
-          return;
-        }
-
-        boolean release = Preferences.getBoolean("build.release");
-        currentBuild = new RustBuild(sketch, getRustMode(), release);
-        File binary = currentBuild.build();
-
-        statusNotice("Running " + binary.getName() + "…");
-        runBinary(binary, stopAction);
-
-      } catch (CargoException e) {
-        LOG.log(Level.WARNING, "cargo build failed", e);
-        statusError(e.getMessage() != null ? e.getMessage() : "cargo build failed");
-        stopAction.run();
-      } catch (java.io.UnsupportedEncodingException e) {
-        statusError("Tree-sitter encoding error: " + e.getMessage());
-        stopAction.run();
-      } catch (Exception e) {
-        LOG.log(Level.WARNING, "Build failed", e);
-        statusError(e.getMessage() != null ? e.getMessage() : e.toString());
-        stopAction.run();
-      }
-    }, "RustMode-build").start();
-  }
-
-    public void handleStop() {
-    if (runningProcess != null && runningProcess.isAlive()) {
-      runningProcess.destroy();
-      runningProcess = null;
-    }
-    statusNotice("Stopped.");
-  }
-
-  // ── Binary launcher ───────────────────────────────────────────────────────────
-
-  private void runBinary(File binary, Runnable stopAction) throws Exception {
-    ProcessBuilder pb = new ProcessBuilder(binary.getAbsolutePath());
-    pb.directory(sketch.getFolder());
-    pb.redirectErrorStream(true);
-
-    runningProcess = pb.start();
-
-    // Stream sketch stdout to the IDE console.
-    // System.out is redirected to the Processing console panel at runtime.
-    new Thread(() -> {
-      try (var reader = new java.io.BufferedReader(
-          new java.io.InputStreamReader(runningProcess.getInputStream()))) {
-        String line;
-        while ((line = reader.readLine()) != null) {
-          System.out.println(line);
-        }
-      } catch (Exception ignored) {}
-      // Notify the toolbar that the run is finished.
-      SwingUtilities.invokeLater(stopAction);
-    }, "RustMode-runner").start();
-  }
-
-  // ── Syntax keywords ───────────────────────────────────────────────────────────
+  // ── Text area ─────────────────────────────────────────────────────────────────
+  //
+  // Editor's default is a bare JEditTextArea with no gutter, so no line
+  // numbers. Same text area as Java mode instead. Called from Editor's
+  // constructor, before our own fields are set.
 
   @Override
-  public String getCommentPrefix() {
-    return "//";
+  protected JEditTextArea createTextArea() {
+    return new PdeTextArea(new PdeTextAreaDefaults(getMode()), new PdeInputHandler(this), this);
   }
 
-  // ── Console helpers (delegating to base) ──────────────────────────────────────
+  // ── Run ───────────────────────────────────────────────────────────────────────
 
+  /** Run (present = false) or Present (present = true). Call on the event thread. */
+  public void startRun(boolean present) {
+    try {
+      // Copies every tab's live editor text into the sketch (and clears the
+      // console if that preference is on), so Run uses what is on screen,
+      // saved or not, in all tabs.
+      prepareRun();
+      stopCurrent();
+      statusNotice("Building with cargo...");
+
+      Run run = new Run();
+      java.awt.Rectangle screen = present ? screenBounds() : null;
+      Thread t = new Thread(() -> doRun(run, screen), "RustMode-run");
+      t.setDaemon(true);
+      run.thread = t;
+      current = run;
+      try { getToolbar().activateRun(); } catch (Throwable ignored) {}
+      t.start();
+    } catch (Throwable t) {
+      // whatever went wrong, the Run button has to keep working
+      LOG.log(Level.WARNING, "could not start the sketch", t);
+      current = null;
+      deactivateRun();
+      statusError("Could not start the sketch: " + t);
+    }
+  }
+
+  /** Runs on the run's own thread. */
+  private void doRun(Run run, java.awt.Rectangle presentOn) {
+    try {
+      // Quick checks with tree-sitter before cargo gets involved.
+      String source = String.join("\n",
+        Arrays.stream(sketch.getCode()).map(SketchCode::getProgram).toArray(String[]::new));
+      RustAnalysis analysis = new RustAnalyzer(source, sketch.getName()).analyse();
+      List<RustLinter.LintProblem> lint = new RustLinter(sketch, analysis).lint();
+      if (run.stopped) return;
+      if (!lint.isEmpty()) {
+        RustLinter.LintProblem first = lint.get(0);
+        for (RustLinter.LintProblem p : lint) {
+          System.err.println(tabName(p.tabIndex()) + ":" + p.line() + ": " + p.message());
+        }
+        showProblem(run, first.tabIndex(), first.line() - 1,
+          tabName(first.tabIndex()) + ":" + first.line() + ": " + first.message());
+        return;
+      }
+
+      RustBuild build = new RustBuild(sketch, getRustMode(), Preferences.getBoolean("build.release"));
+      run.build = build;
+      if (run.stopped) return;
+      File binary = build.build();
+      if (run.stopped) return;
+
+      statusNotice("Running " + sketch.getName() + "...");
+      int exit = runBinary(run, binary, presentOn);
+      if (run.stopped) return;
+      if (exit == 0) {
+        statusNotice("Done.");
+      } else {
+        statusError("The sketch stopped with an error (exit status " + exit + "). See the console.");
+      }
+
+    } catch (InterruptedException e) {
+      // Stop was pressed, or a new Run replaced this one
+    } catch (CargoException e) {
+      if (run.stopped) return;
+      String msg = e.getMessage() != null ? e.getMessage() : "cargo build failed";
+      RustProblem where = e.diagnostics().stream()
+        .filter(d -> d.getSeverity() == RustProblem.ERROR).findFirst().orElse(null);
+      if (where != null) showProblem(run, where.getTabIndex(), where.getLineNumber(), msg);
+      else statusError(msg);
+    } catch (Throwable e) {
+      if (run.stopped) return;
+      LOG.log(Level.WARNING, "run failed", e);
+      statusError(e.getMessage() != null ? e.getMessage() : e.toString());
+    } finally {
+      SwingUtilities.invokeLater(() -> {
+        if (current == run) {
+          current = null;
+          deactivateRun();
+        }
+      });
+    }
+  }
+
+  private String tabName(int tab) {
+    return tab >= 0 && tab < sketch.getCodeCount() ? sketch.getCode(tab).getFileName() : "sketch";
+  }
+
+  /** Shows an error and goes to its tab and line (0-based). Safe from any thread. */
+  private void showProblem(Run run, int tab, int line, String message) {
+    SwingUtilities.invokeLater(() -> {
+      if (run.stopped) return;
+      try {
+        if (tab >= 0 && tab < sketch.getCodeCount()) {
+          if (sketch.getCurrentCodeIndex() != tab) sketch.setCurrentCode(tab);
+          JEditTextArea ta = getTextArea();
+          int ln = Math.min(Math.max(line, 0), ta.getLineCount() - 1);
+          if (ln >= 0) {
+            int start = ta.getLineStartOffset(ln);
+            int stop  = Math.max(start, ta.getLineStopOffset(ln) - 1);
+            ta.select(start, stop);
+          }
+        }
+      } catch (Throwable t) {
+        LOG.log(Level.FINE, "couldn't highlight the error line", t);
+      }
+      statusError(message);
+    });
+  }
+
+  /** Starts the sketch and waits for it. Returns its exit status. */
+  private int runBinary(Run run, File binary, java.awt.Rectangle presentOn)
+      throws IOException, InterruptedException {
+    ProcessBuilder pb = new ProcessBuilder(binary.getAbsolutePath());
+    File dir = sketch.getFolder();
+    if (dir != null && dir.isDirectory()) pb.directory(dir);
+    // The sketch's stdin stays open and unused: if the IDE dies without a
+    // chance to clean up, the pipe closes and the sketch closes with it.
+    pb.environment().put("PROCESSING_WATCH_STDIN", "1");
+    if (presentOn != null && presentOn.width > 0 && presentOn.height > 0) {
+      pb.environment().put("PROCESSING_PRESENT",
+        presentOn.width + "," + presentOn.height + "," + presentOn.x + "," + presentOn.y);
+    } else {
+      pb.environment().remove("PROCESSING_PRESENT");
+    }
+
+    Process p = pb.start();
+    run.proc = p;
+    LIVE.add(p);
+    if (run.stopped) kill(p);   // Stop arrived while the sketch was starting
+
+    // println!() to the console in black, panics and eprintln!() in red.
+    // Separate threads so a full pipe on one stream can't block the other.
+    // A panic says "panicked at src/main.rs:26:21"; show the sketch tab and line.
+    RustBuild build = run.build;
+    Thread out = pump(p.getInputStream(), System.out, "RustMode-stdout", null);
+    Thread err = pump(p.getErrorStream(), System.err, "RustMode-stderr", build);
+    try {
+      int exit = p.waitFor();
+      out.join(1000);
+      err.join(1000);
+      return exit;
+    } catch (InterruptedException e) {
+      kill(p);
+      throw e;
+    } finally {
+      if (!p.isAlive()) LIVE.remove(p);
+    }
+  }
+
+  private static Thread pump(InputStream in, PrintStream out, String name, RustBuild map) {
+    Thread t = new Thread(() -> {
+      try (BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+        String line;
+        while ((line = r.readLine()) != null) {
+          if (map != null) {
+            try { line = map.rewriteLocations(line); } catch (RuntimeException ignored) {}
+          }
+          out.println(line);
+        }
+      } catch (IOException ignored) {
+      }
+    }, name);
+    t.setDaemon(true);
+    t.start();
+    return t;
+  }
+
+  private static void kill(Process p) {
+    p.destroy();
+    try {
+      if (!p.waitFor(1, TimeUnit.SECONDS)) p.destroyForcibly();
+    } catch (InterruptedException e) {
+      p.destroyForcibly();
+      Thread.currentThread().interrupt();
+    }
+    LIVE.remove(p);
+  }
+
+  // ── Stop ──────────────────────────────────────────────────────────────────────
+
+  public void handleStop() {
+    boolean wasRunning = current != null;
+    stopCurrent();
+    deactivateRun();
+    if (wasRunning) statusNotice("Stopped."); else statusEmpty();
+  }
+
+  /** Ends the current run, whether it is still building or already on screen. */
+  private void stopCurrent() {
+    Run run = current;
+    current = null;
+    if (run == null) return;
+    run.stopped = true;
+    RustBuild b = run.build;
+    if (b != null) b.cancel();
+    Process p = run.proc;
+    if (p != null) {
+      // off the event thread: waiting up to a second for the sketch to
+      // close must not freeze the editor
+      Thread k = new Thread(() -> kill(p), "RustMode-stop");
+      k.setDaemon(true);
+      k.start();
+    }
+    Thread t = run.thread;
+    if (t != null) t.interrupt();
+  }
+
+  @Override
+  public void internalCloseRunner() {
+    stopCurrent();
+  }
+
+  /** The Run button goes back to normal. Stopping the sketch is stopCurrent's job. */
+  @Override
+  public void deactivateRun() {
+    try { getToolbar().deactivateRun(); } catch (Throwable ignored) {}
+  }
+
+  @Override
+  public void dispose() {
+    stopCurrent();
+    super.dispose();
+  }
+
+  /** The screen this editor window is on (present mode covers that one). */
+  private java.awt.Rectangle screenBounds() {
+    try {
+      java.awt.GraphicsConfiguration gc = getGraphicsConfiguration();
+      if (gc != null) return gc.getBounds();
+    } catch (Throwable ignored) {}
+    try {
+      java.awt.Dimension d = java.awt.Toolkit.getDefaultToolkit().getScreenSize();
+      return new java.awt.Rectangle(0, 0, d.width, d.height);
+    } catch (Throwable t) {
+      return null;   // no screen info: runs in a normal window
+    }
+  }
+
+  // ── Cargo output ──────────────────────────────────────────────────────────────
+
+  /** A line of cargo output for the console; errors and warnings in red. */
   public void statusMessage(String msg) {
-    // Route cargo output to the IDE console.
-    // error/warning lines go to stderr (shown in red in the Processing console).
     if (msg.startsWith("error") || msg.startsWith("warning")) {
       System.err.println(msg);
     } else if (!msg.isBlank()) {
@@ -151,44 +338,90 @@ public class RustEditor extends Editor {
     }
   }
 
-  // ── Required abstract stubs ───────────────────────────────────────────────────
+  // ── Editor plumbing ───────────────────────────────────────────────────────────
 
   @Override
-  public void internalCloseRunner() {
-    if (runningProcess != null && runningProcess.isAlive()) {
-      runningProcess.destroy();
-      runningProcess = null;
-    }
+  public String getCommentPrefix() {
+    return "//";
   }
-
-
-  // ── Abstract method stubs required by Editor ─────────────────────────────────
 
   @Override
   public EditorToolbar createToolbar() {
-    return new processing.app.ui.EditorToolbar(this) {
-      @Override public void handleRun(int modifiers)  { RustEditor.this.handleRun(false, () -> {}, () -> {}); }
-      @Override public void handleStop()               { RustEditor.this.handleStop(); }
+    return new EditorToolbar(this) {
+      // mode 0 = Run, 1 = Present
+      @Override public void handleRun(int mode) { RustEditor.this.startRun(mode == 1); }
+      @Override public void handleStop()        { RustEditor.this.handleStop(); }
     };
   }
 
   @Override
   public Formatter createFormatter() {
-    return null; // No auto-format for Rust (rustfmt can be added later)
+    return null;   // rustfmt could go here later
   }
 
   @Override
-  public JMenu buildFileMenu()    { return buildFileMenu(new javax.swing.JMenuItem[0]); }
+  public JMenu buildFileMenu() {
+    return buildFileMenu(new JMenuItem[0]);
+  }
 
   @Override
-  public JMenu buildSketchMenu() { return buildSketchMenu(new javax.swing.JMenuItem[0]); }
+  public JMenu buildSketchMenu() {
+    int menuKey = java.awt.Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
+    JMenuItem run = new JMenuItem("Run");
+    run.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_R, menuKey));
+    run.addActionListener(e -> getToolbar().handleRun(0));
+    // fills the screen this window is on, sketch in the middle; Esc closes it
+    JMenuItem present = new JMenuItem("Present");
+    present.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_R, menuKey | InputEvent.SHIFT_DOWN_MASK));
+    present.addActionListener(e -> getToolbar().handleRun(1));
+    JMenuItem stop = new JMenuItem("Stop");
+    stop.addActionListener(e -> handleStop());
+    try {
+      // sets Editor's private sketchMenu field, which windowActivated needs
+      return buildSketchMenu(new JMenuItem[] { run, present, stop });
+    } catch (Throwable t) {
+      LOG.log(Level.WARNING, "Sketch menu fallback", t);
+      JMenu menu = new JMenu("Sketch");
+      menu.add(run);
+      menu.add(present);
+      menu.add(stop);
+      return menu;
+    }
+  }
 
   @Override
   public void handleImportLibrary(String jarPath) {
-    // Rust sketches don't use Processing libraries; no-op.
+    // Rust sketches don't use Processing libraries
   }
 
   @Override
-  public JMenu buildHelpMenu()   { return new JMenu("Help"); }
+  public JMenu buildHelpMenu() {
+    JMenu help = new JMenu("Help");
+    JMenuItem site = new JMenuItem("Rust Mode on GitHub");
+    site.addActionListener(e -> openUrl("https://github.com/pepc84/RustMode"));
+    help.add(site);
+    JMenuItem book = new JMenuItem("The Rust Book");
+    book.addActionListener(e -> openUrl("https://doc.rust-lang.org/book/"));
+    help.add(book);
+    JMenuItem std = new JMenuItem("Rust Standard Library");
+    std.addActionListener(e -> openUrl("https://doc.rust-lang.org/std/"));
+    help.add(std);
+    return help;
+  }
 
+  private static void openUrl(String url) {
+    Thread t = new Thread(() -> {
+      try {
+        if (System.getProperty("os.name", "").toLowerCase().contains("linux")) {
+          new ProcessBuilder("xdg-open", url).start();
+        } else {
+          java.awt.Desktop.getDesktop().browse(new java.net.URI(url));
+        }
+      } catch (Exception ex) {
+        System.err.println("[RustMode] couldn't open " + url + ": " + ex);
+      }
+    }, "rustmode-open-url");
+    t.setDaemon(true);
+    t.start();
+  }
 }
