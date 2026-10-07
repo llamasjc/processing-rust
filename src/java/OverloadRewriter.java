@@ -20,18 +20,24 @@ import java.util.Set;
 final class OverloadRewriter {
 
   /** name -> (argument count -> engine function). */
-  private static final Map<String, Map<Integer, String>> OVERLOADS = Map.of(
-    "fill",       Map.of(2, "fill_ga",       3, "fill_rgb",       4, "fill_rgba"),
-    "stroke",     Map.of(2, "stroke_ga",     3, "stroke_rgb",     4, "stroke_rgba"),
-    "background", Map.of(2, "background_ga", 3, "background_rgb", 4, "background_rgba"),
-    "rect",       Map.of(5, "rect_rounded"),
-    "scale",      Map.of(2, "scale_xy"),
-    "translate",  Map.of(3, "translate_3d"),
-    "random",     Map.of(2, "random_range"),
-    "noise",      Map.of(2, "noise2"),
-    "begin_shape", Map.of(1, "begin_shape_kind"),
-    "end_shape",  Map.of(1, "end_shape_mode")
+  private static final Map<String, Map<Integer, String>> OVERLOADS = Map.ofEntries(
+    Map.entry("fill",        Map.of(2, "fill_ga",       3, "fill_rgb",       4, "fill_rgba")),
+    Map.entry("stroke",      Map.of(2, "stroke_ga",     3, "stroke_rgb",     4, "stroke_rgba")),
+    Map.entry("background",  Map.of(2, "background_ga", 3, "background_rgb", 4, "background_rgba")),
+    Map.entry("tint",        Map.of(2, "tint_ga",       3, "tint_rgb",       4, "tint_rgba")),
+    Map.entry("rect",        Map.of(5, "rect_rounded")),
+    Map.entry("arc",         Map.of(7, "arc_mode")),
+    Map.entry("image",       Map.of(5, "image_sized")),
+    Map.entry("scale",       Map.of(2, "scale_xy")),
+    Map.entry("translate",   Map.of(3, "translate_3d")),
+    Map.entry("random",      Map.of(2, "random_range")),
+    Map.entry("noise",       Map.of(2, "noise2", 3, "noise3")),
+    Map.entry("begin_shape", Map.of(1, "begin_shape_kind")),
+    Map.entry("end_shape",   Map.of(1, "end_shape_mode"))
   );
+
+  /** Float functions whose last argument is a constant (PIE, CHORD...), not a number to convert. */
+  private static final Set<String> LAST_ARG_AS_IS = Set.of("arc_mode");
 
   /** Engine functions whose numeric parameters are all f32. */
   private static final Set<String> FLOAT_ARGS = Set.of(
@@ -42,7 +48,9 @@ final class OverloadRewriter {
     "triangle", "quad", "arc", "translate", "translate_3d", "rotate",
     "scale", "scale_xy", "stroke_weight", "text", "text_size", "frame_rate",
     "random", "random_range", "noise", "noise2",
-    "vertex", "bezier_vertex", "quadratic_vertex", "curve_vertex"
+    "vertex", "bezier_vertex", "quadratic_vertex", "curve_vertex",
+    "arc_mode", "bezier", "curve", "shear_x", "shear_y", "apply_matrix",
+    "tint", "tint_ga", "tint_rgb", "tint_rgba", "noise3"
   );
 
   private OverloadRewriter() {}
@@ -71,9 +79,10 @@ final class OverloadRewriter {
             int count = empty ? 0 : args.size();
             String target = OVERLOADS.getOrDefault(name, Map.of()).getOrDefault(count, name);
             List<String> fixed = new ArrayList<>();
-            for (String a : args) {
-              String r = rewrite(a);
-              if (FLOAT_ARGS.contains(target) && !"size".equals(target)) r = floatLiteral(r);
+            for (int ai = 0; ai < args.size(); ai++) {
+              String r = rewrite(args.get(ai));
+              boolean asIs = LAST_ARG_AS_IS.contains(target) && ai == args.size() - 1;
+              if (FLOAT_ARGS.contains(target) && !"size".equals(target) && !asIs) r = floatLiteral(r);
               fixed.add(r);
             }
             out.append(target).append(src, j, k + 1).append(String.join(",", fixed)).append(')');

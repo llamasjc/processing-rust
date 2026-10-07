@@ -278,8 +278,35 @@ mod render {
             }
         }
         if has_stroke && n >= 2 {
-            for i in 1..n { draw_line(pts[i-1].0, pts[i-1].1, pts[i].0, pts[i].1); }
-            if close { draw_line(pts[n-1].0, pts[n-1].1, pts[0].0, pts[0].1); }
+            let (sc, sw, cap, join) = with_style(|s| (s.stroke, s.stroke_weight, s.cap, s.join));
+            let Some(sc) = sc else { return };
+            let (cw, ch) = canvas_dims();
+            let screen: Vec<(f32, f32)> = pts.iter().map(|p| tfm(p.0, p.1)).collect();
+            let mut buf = pixel_buf().lock();
+            if close && n >= 3 {
+                outline(&mut buf, cw, ch, &screen, sw, sc);
+            } else if join == 2 && sc.a >= 1.0 {
+                for i in 1..n { capsule(&mut buf, cw, ch, screen[i-1], screen[i], sw, sc); }
+            } else {
+                // open path: square ends where pieces meet, the chosen cap at the two ends
+                for i in 1..n {
+                    let piece_cap = if n == 2 { cap } else { 1 };
+                    capped(&mut buf, cw, ch, screen[i-1], screen[i], sw, sc, piece_cap);
+                    if (join == 1 || join == 2) && i + 1 < n && sw > 1.5 {
+                        bevel(&mut buf, cw, ch, screen[i-1], screen[i], screen[i+1], sw, sc);
+                    }
+                }
+                if n > 2 && sw > 1.5 {
+                    if join == 0 {
+                        for i in 1..n - 1 { miter(&mut buf, cw, ch, screen[i-1], screen[i], screen[i+1], sw, sc); }
+                    }
+                    if cap == 0 {
+                        // round ends
+                        capsule(&mut buf, cw, ch, screen[0], screen[0], sw, sc);
+                        capsule(&mut buf, cw, ch, screen[n-1], screen[n-1], sw, sc);
+                    }
+                }
+            }
         }
     }
 
@@ -294,6 +321,8 @@ mod render {
         fill:         Option<Color>,
         stroke:       Option<Color>,
         stroke_weight: f32,
+        cap:  u8,   // 0 ROUND (default), 1 SQUARE, 2 PROJECT
+        join: u8,   // 0 MITER (default), 1 BEVEL, 2 ROUND
     }
     impl Default for Style {
         fn default() -> Self {
@@ -301,6 +330,8 @@ mod render {
                 fill:   Some(Color::from_gray(1.0)),
                 stroke: Some(Color::from_gray(0.0)),
                 stroke_weight: 1.0,
+                cap: 0,
+                join: 0,
             }
         }
     }
@@ -350,20 +381,48 @@ mod render {
     /// enough that f32 arithmetic on them stays finite.
     const FAR: f32 = 1.0e9;
 
+    // blendMode(): how a drawn color combines with what is already there.
+    // 0 BLEND (default), 1 ADD, 2 SUBTRACT, 3 DARKEST, 4 LIGHTEST,
+    // 5 DIFFERENCE, 6 EXCLUSION, 7 MULTIPLY, 8 SCREEN, 9 REPLACE
+    static BLEND_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    pub fn set_blend_mode(mode: u8) { BLEND_MODE.store(if mode <= 9 { mode } else { 0 }, Ordering::Relaxed); }
+    #[inline]
+    fn blend_mode() -> u8 { BLEND_MODE.load(Ordering::Relaxed) }
+
     #[inline]
     fn blend(dst: u32, col: Color) -> u32 {
-        let a = col.a;
+        let a = col.a.clamp(0.0, 1.0);
         let dr = ((dst >> 16) & 0xFF) as f32 / 255.0;
         let dg = ((dst >> 8) & 0xFF) as f32 / 255.0;
         let db = (dst & 0xFF) as f32 / 255.0;
-        Color::from_rgb(dr + (col.r - dr) * a, dg + (col.g - dg) * a, db + (col.b - db) * a).to_u32()
+        let mode = blend_mode();
+        if mode == 0 {
+            return Color::from_rgb(dr + (col.r - dr) * a, dg + (col.g - dg) * a, db + (col.b - db) * a).to_u32();
+        }
+        // the mode's result for a fully opaque source, then faded in by alpha
+        let f = |d: f32, s: f32| -> f32 {
+            let s = s.clamp(0.0, 1.0);
+            let full = match mode {
+                1 => d + s,
+                2 => d - s,
+                3 => d.min(s),
+                4 => d.max(s),
+                5 => (d - s).abs(),
+                6 => d + s - 2.0 * d * s,
+                7 => d * s,
+                8 => 1.0 - (1.0 - d) * (1.0 - s),
+                _ => s,
+            };
+            if mode == 9 { full } else { d + (full - d) * a }
+        };
+        Color::from_rgb(f(dr, col.r), f(dg, col.g), f(db, col.b)).to_u32()
     }
 
     fn put(buf: &mut Vec<u32>, w: usize, h: usize, x: i32, y: i32, col: Color) {
         if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 { return; }
         if !(col.a > 0.0) { return; }             // also skips a NaN alpha
         if let Some(p) = buf.get_mut(y as usize * w + x as usize) {
-            *p = if col.a >= 1.0 { col.to_u32() } else { blend(*p, col) };
+            *p = if col.a >= 1.0 && blend_mode() == 0 { col.to_u32() } else { blend(*p, col) };
         }
     }
 
@@ -375,7 +434,7 @@ mod render {
         if x0 > x1 { return; }
         let row = y as usize * w;
         if let Some(run) = buf.get_mut(row + x0 as usize..=row + x1 as usize) {
-            if col.a >= 1.0 { run.fill(col.to_u32()); }
+            if col.a >= 1.0 && blend_mode() == 0 { run.fill(col.to_u32()); }
             else { for p in run { *p = blend(*p, col); } }
         }
     }
@@ -476,24 +535,112 @@ mod render {
         ], col);
     }
 
-    /// Stroke the outline of a few-cornered shape (rect, triangle, quad).
-    /// Thick edges are run half a weight past each corner so the corners come
-    /// out square instead of notched.
-    fn outline(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], weight: f32, col: Color) {
-        let n = pts.len();
-        for i in 0..n {
-            let (mut a, mut b) = (pts[i], pts[(i + 1) % n]);
-            if weight > 1.5 {
+    /// A stroke from a to b with round ends, as one polygon so a translucent
+    /// stroke is the same shade along its whole length.
+    fn capsule(buf: &mut Vec<u32>, w: usize, h: usize,
+               a: (f32, f32), b: (f32, f32), weight: f32, col: Color) {
+        if !(weight > 1.5) { return bline(buf, w, h, a.0, a.1, b.0, b.1, col); }
+        let r = weight.min(4096.0) * 0.5;
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if !len.is_finite() { return; }
+        let base = if len < 1.0e-6 { 0.0 } else { dy.atan2(dx) };
+        let n = ((r * 1.6) as usize).clamp(4, 48);   // points per half circle
+        let mut pts = Vec::with_capacity(2 * n + 2);
+        let pi = std::f32::consts::PI;
+        for i in 0..=n {   // around b
+            let t = base - pi / 2.0 + pi * (i as f32 / n as f32);
+            pts.push((b.0 + t.cos() * r, b.1 + t.sin() * r));
+        }
+        for i in 0..=n {   // around a
+            let t = base + pi / 2.0 + pi * (i as f32 / n as f32);
+            pts.push((a.0 + t.cos() * r, a.1 + t.sin() * r));
+        }
+        fill_poly(buf, w, h, &pts, col);
+    }
+
+    /// A line the way line() draws it: strokeCap() decides the ends.
+    fn capped(buf: &mut Vec<u32>, w: usize, h: usize,
+              a: (f32, f32), b: (f32, f32), weight: f32, col: Color, cap: u8) {
+        if !(weight > 1.5) { return bline(buf, w, h, a.0, a.1, b.0, b.1, col); }
+        match cap {
+            1 => seg(buf, w, h, a, b, weight, col),                    // SQUARE: stops at the ends
+            2 => {                                                     // PROJECT: half a weight further
                 let (dx, dy) = (b.0 - a.0, b.1 - a.1);
                 let len = (dx * dx + dy * dy).sqrt();
-                if len.is_finite() && len > 1.0e-6 {
-                    let e = weight.min(4096.0) * 0.5 / len;
-                    a = (a.0 - dx * e, a.1 - dy * e);
-                    b = (b.0 + dx * e, b.1 + dy * e);
-                }
+                if !len.is_finite() || len < 1.0e-6 { return; }
+                let e = weight.min(4096.0) * 0.5 / len;
+                seg(buf, w, h, (a.0 - dx * e, a.1 - dy * e), (b.0 + dx * e, b.1 + dy * e), weight, col);
             }
-            seg(buf, w, h, a, b, weight, col);
+            _ => capsule(buf, w, h, a, b, weight, col),               // ROUND
         }
+    }
+
+    /// Outline of a closed shape with corners (rect, triangle, quad):
+    /// strokeJoin() decides the corners.
+    fn outline(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], weight: f32, col: Color) {
+        let join = with_style(|s| s.join);
+        let n = pts.len();
+        match join {
+            1 => for i in 0..n {                                       // BEVEL: corners cut off
+                seg(buf, w, h, pts[i], pts[(i + 1) % n], weight, col);
+                if weight > 1.5 { bevel(buf, w, h, pts[(i + n - 1) % n], pts[i], pts[(i + 1) % n], weight, col); }
+            },
+            2 => for i in 0..n { capsule(buf, w, h, pts[i], pts[(i + 1) % n], weight, col); },   // ROUND
+            _ => outline_miter(buf, w, h, pts, weight, col),
+        }
+    }
+
+    /// The triangle that closes the gap on the outside of a corner at p.
+    fn bevel(buf: &mut Vec<u32>, w: usize, h: usize,
+             prev: (f32, f32), p: (f32, f32), next: (f32, f32), weight: f32, col: Color) {
+        let unit = |a: (f32, f32), b: (f32, f32)| -> Option<(f32, f32)> {
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len = (dx * dx + dy * dy).sqrt();
+            if len.is_finite() && len > 1.0e-6 { Some((dx / len, dy / len)) } else { None }
+        };
+        let (Some(d0), Some(d1)) = (unit(prev, p), unit(p, next)) else { return };
+        let r = weight.min(4096.0) * 0.5;
+        let cross = d0.0 * d1.1 - d0.1 * d1.0;
+        let side = if cross > 0.0 { -1.0 } else { 1.0 };   // the outside of the turn
+        let a = (p.0 - d0.1 * r * side, p.1 + d0.0 * r * side);
+        let b = (p.0 - d1.1 * r * side, p.1 + d1.0 * r * side);
+        fill_poly(buf, w, h, &[p, a, b], col);
+    }
+
+    /// Outline with pointed (mitered) corners. A corner too sharp for a
+    /// sensible point is cut off instead, as Processing does.
+    fn outline_miter(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], weight: f32, col: Color) {
+        let n = pts.len();
+        for i in 0..n {
+            seg(buf, w, h, pts[i], pts[(i + 1) % n], weight, col);
+            if weight > 1.5 { miter(buf, w, h, pts[(i + n - 1) % n], pts[i], pts[(i + 1) % n], weight, col); }
+        }
+    }
+
+    /// Fills the outside of the corner at p out to the point where the two
+    /// edges of the stroke meet.
+    fn miter(buf: &mut Vec<u32>, w: usize, h: usize,
+             prev: (f32, f32), p: (f32, f32), next: (f32, f32), weight: f32, col: Color) {
+        let unit = |a: (f32, f32), b: (f32, f32)| -> Option<(f32, f32)> {
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len = (dx * dx + dy * dy).sqrt();
+            if len.is_finite() && len > 1.0e-6 { Some((dx / len, dy / len)) } else { None }
+        };
+        let (Some(d0), Some(d1)) = (unit(prev, p), unit(p, next)) else { return };
+        let r = weight.min(4096.0) * 0.5;
+        let cross = d0.0 * d1.1 - d0.1 * d1.0;
+        if cross.abs() < 1.0e-4 { return; }                // straight on: nothing to fill
+        let side = if cross > 0.0 { -1.0 } else { 1.0 };   // the outside of the turn
+        let n0 = (-d0.1 * side, d0.0 * side);
+        let n1 = (-d1.1 * side, d1.0 * side);
+        let a = (p.0 + n0.0 * r, p.1 + n0.1 * r);
+        let b = (p.0 + n1.0 * r, p.1 + n1.1 * r);
+        let k = 1.0 + n0.0 * n1.0 + n0.1 * n1.1;
+        // the point would be more than 4 stroke widths long: cut it off
+        if k < 0.03 { return fill_poly(buf, w, h, &[p, a, b], col); }
+        let tip = (p.0 + (n0.0 + n1.0) * r / k, p.1 + (n0.1 + n1.1) * r / k);
+        fill_poly(buf, w, h, &[p, a, tip, b], col);
     }
 
     /// How many pixels one unit along each axis covers under the current
@@ -573,6 +720,10 @@ mod render {
     pub fn set_stroke_rgba(r: f32, g: f32, b: f32, a: f32) { with_style_mut(|s| s.stroke = Some(Color::from_rgba(r,g,b,a))); }
     pub fn set_stroke_none()                          { with_style_mut(|s| s.stroke = None); }
     pub fn set_stroke_color(c: Color)                 { with_style_mut(|s| s.stroke = Some(c)); }
+    /// 0 ROUND, 1 SQUARE, 2 PROJECT
+    pub fn set_stroke_cap(cap: u8)   { with_style_mut(|s| s.cap  = if cap  <= 2 { cap }  else { 0 }); }
+    /// 0 MITER, 1 BEVEL, 2 ROUND
+    pub fn set_stroke_join(join: u8) { with_style_mut(|s| s.join = if join <= 2 { join } else { 0 }); }
     pub fn set_stroke_weight(w: f32) {
         // NaN and negatives fall back to a hairline
         with_style_mut(|s| s.stroke_weight = if w > 0.0 { w.min(4096.0) } else { 1.0 });
@@ -651,8 +802,9 @@ mod render {
         let (cw, ch) = canvas_dims();
         let (sc, sw) = with_style(|s| (s.stroke, s.stroke_weight));
         if let Some(c) = sc {
+            let cap = with_style(|s| s.cap);
             let mut buf = pixel_buf().lock();
-            seg(&mut buf, cw, ch, tfm(x1, y1), tfm(x2, y2), sw, c);
+            capped(&mut buf, cw, ch, tfm(x1, y1), tfm(x2, y2), sw, c, cap);
         }
     }
 
@@ -689,6 +841,11 @@ mod render {
     }
 
     pub fn draw_arc(cx: f32, cy: f32, w: f32, h: f32, start: f32, stop: f32) {
+        draw_arc_mode(cx, cy, w, h, start, stop, 0)
+    }
+    /// mode: 0 default (filled as a pie, only the curve stroked), 1 OPEN,
+    /// 2 CHORD, 3 PIE, as in Processing.
+    pub fn draw_arc_mode(cx: f32, cy: f32, w: f32, h: f32, start: f32, stop: f32, mode: u8) {
         if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()
              && start.is_finite() && stop.is_finite()) { return; }
         let (cw, ch) = canvas_dims();
@@ -701,21 +858,31 @@ mod render {
         let centre = tfm(cx, cy);
         let mut buf = pixel_buf().lock();
 
-        // Fill: a pie slice.
+        let pie_shape = mode == 0 || mode == 3;
         if let Some(fc) = fill {
-            let mut pie = Vec::with_capacity(arc.len() + 1);
-            pie.push(centre);
-            pie.extend_from_slice(&arc);
-            fill_poly(&mut buf, cw, ch, &pie, fc);
+            if pie_shape {
+                let mut pie = Vec::with_capacity(arc.len() + 1);
+                pie.push(centre);
+                pie.extend_from_slice(&arc);
+                fill_poly(&mut buf, cw, ch, &pie, fc);
+            } else {
+                // OPEN and CHORD: the area between the curve and the straight
+                // line joining its ends
+                fill_poly(&mut buf, cw, ch, &arc, fc);
+            }
         }
 
-        // Stroke: arc outline + two radial lines closing the pie.
         if let Some(sc) = stroke {
             for i in 1..arc.len() { seg(&mut buf, cw, ch, arc[i - 1], arc[i], sw, sc); }
-            // Close with radial lines only when fill is also set (pie mode).
-            if fill.is_some() && arc.len() >= 2 {
-                seg(&mut buf, cw, ch, centre, arc[0], sw, sc);
-                seg(&mut buf, cw, ch, centre, arc[arc.len() - 1], sw, sc);
+            if arc.len() >= 2 {
+                match mode {
+                    2 => capsule(&mut buf, cw, ch, arc[arc.len() - 1], arc[0], sw, sc),
+                    3 => {
+                        capsule(&mut buf, cw, ch, centre, arc[0], sw, sc);
+                        capsule(&mut buf, cw, ch, centre, arc[arc.len() - 1], sw, sc);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -748,6 +915,17 @@ mod render {
             *top = mat_mul(top, &r);
         });
     }
+    /// Multiplies the current matrix by [a c e; b d f].
+    pub fn apply_matrix(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) {
+        if ![a, b, c, d, e, f].iter().all(|v| v.is_finite()) { return; }
+        MATRIX_STACK.with(|s| {
+            let mut st = s.borrow_mut();
+            let top = st.last_mut().unwrap();
+            *top = mat_mul(top, &[a, b, c, d, e, f]);
+        });
+    }
+    pub fn shear_x(angle: f32) { apply_matrix(1.0, 0.0, angle.tan(), 1.0, 0.0, 0.0); }
+    pub fn shear_y(angle: f32) { apply_matrix(1.0, angle.tan(), 0.0, 1.0, 0.0, 0.0); }
     pub fn scale(sx: f32, sy: f32, _sz: f32) {
         MATRIX_STACK.with(|s| {
             let mut st = s.borrow_mut();
@@ -961,6 +1139,14 @@ mod render {
             _ => y,
         };
         (x, y)
+    }
+
+    /// set(x, y, color): one pixel, no transform, no blending.
+    pub fn set_pixel(x: i32, y: i32, col: Color) {
+        let (cw, ch) = canvas_dims();
+        if x < 0 || y < 0 || x >= cw as i32 || y >= ch as i32 { return; }
+        let mut buf = pixel_buf().lock();
+        if let Some(p) = buf.get_mut(y as usize * cw + x as usize) { *p = col.to_u32(); }
     }
 
     // ── Images ────────────────────────────────────────────────────────────
@@ -1645,19 +1831,44 @@ pub fn stroke_weight(w: f32)                              { render::set_stroke_w
 
 // ─────────────────────────── Primitive shapes ────────────────────────────────
 
-pub fn ellipse(x: f32, y: f32, w: f32, h: f32)           { render::draw_ellipse(x, y, w, h); }
-pub fn circle(x: f32, y: f32, d: f32)                    { render::draw_ellipse(x, y, d, d); }
-pub fn rect(x: f32, y: f32, w: f32, h: f32)              { render::draw_rect(x, y, w, h); }
-pub fn rect_rounded(x: f32, y: f32, w: f32, h: f32, r: f32) { render::draw_rect_rounded(x, y, w, h, r); }
+pub fn ellipse(x: f32, y: f32, w: f32, h: f32) {
+    let (x, y, w, h) = ellipse_box(x, y, w, h);
+    render::draw_ellipse(x, y, w, h);
+}
+pub fn circle(x: f32, y: f32, d: f32)                    { ellipse(x, y, d, d); }
+pub fn rect(x: f32, y: f32, w: f32, h: f32) {
+    let (x, y, w, h) = corner_box(RECT_MODE.load(Ordering::Relaxed), x, y, w, h);
+    render::draw_rect(x, y, w, h);
+}
+pub fn rect_rounded(x: f32, y: f32, w: f32, h: f32, r: f32) {
+    let (x, y, w, h) = corner_box(RECT_MODE.load(Ordering::Relaxed), x, y, w, h);
+    render::draw_rect_rounded(x, y, w, h, r);
+}
 #[inline] pub fn rectRounded(x: f32, y: f32, w: f32, h: f32, r: f32) { rect_rounded(x, y, w, h, r) }
-pub fn square(x: f32, y: f32, s: f32)                    { render::draw_rect(x, y, s, s); }
+pub fn square(x: f32, y: f32, s: f32)                    { rect(x, y, s, s); }
 pub fn triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) { render::draw_triangle(x1, y1, x2, y2, x3, y3); }
 pub fn line(x1: f32, y1: f32, x2: f32, y2: f32)          { render::draw_line(x1, y1, x2, y2); }
 pub fn point(x: f32, y: f32)                              { render::draw_point(x, y); }
 pub fn quad(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, x4: f32, y4: f32) {
     render::draw_quad(x1, y1, x2, y2, x3, y3, x4, y4);
 }
-pub fn arc(x: f32, y: f32, w: f32, h: f32, start: f32, stop: f32) { render::draw_arc(x, y, w, h, start, stop); }
+pub fn arc(x: f32, y: f32, w: f32, h: f32, start: f32, stop: f32) {
+    let (x, y, w, h) = ellipse_box(x, y, w, h);
+    render::draw_arc(x, y, w, h, start, stop);
+}
+pub const OPEN:  u32 = 1;
+pub const CHORD: u32 = 2;
+pub const PIE:   u32 = 3;
+/// arc() with a closing style: OPEN, CHORD or PIE.
+pub fn arc_mode(x: f32, y: f32, w: f32, h: f32, start: f32, stop: f32, mode: u32) {
+    let (x, y, w, h) = ellipse_box(x, y, w, h);
+    render::draw_arc_mode(x, y, w, h, start, stop, if mode <= 3 { mode as u8 } else { 0 });
+}
+/// Centre and size of an ellipse from a call made in the current ellipseMode().
+fn ellipse_box(a: f32, b: f32, c: f32, d: f32) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = corner_box(ELLIPSE_MODE.load(Ordering::Relaxed), a, b, c, d);
+    (x + w / 2.0, y + h / 2.0, w, h)
+}
 
 // ─────────────────────────── Transforms ──────────────────────────────────────
 
@@ -1670,6 +1881,12 @@ pub fn translate_3d(x: f32, y: f32, z: f32) { render::translate(x, y, z); }
 pub fn rotate(angle: f32)         { render::rotate_z(angle); }
 pub fn scale(s: f32)              { render::scale(s, s, 1.0); }
 pub fn scale_xy(sx: f32, sy: f32) { render::scale(sx, sy, 1.0); }
+pub fn shear_x(angle: f32) { render::shear_x(angle); }
+pub fn shear_y(angle: f32) { render::shear_y(angle); }
+/// Multiplies the current transform by the matrix [a c e; b d f].
+pub fn apply_matrix(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) { render::apply_matrix(a, b, c, d, e, f); }
+#[inline] pub fn shearX(angle: f32) { shear_x(angle) }
+#[inline] pub fn shearY(angle: f32) { shear_y(angle) }
 
 // ──────────────────────────── Style state ────────────────────────────────────
 
@@ -1851,8 +2068,103 @@ pub fn reset_matrix() { render::reset_matrix(); }
 
 // Stroke caps and joins are accepted for compatibility; the software
 // rasterizer always draws round-ish caps and mitred joins.
-pub fn stroke_cap(_cap: u32)  {}
-pub fn stroke_join(_join: u32) {}
+// Processing's own numbers, so sketches can also pass them around as ints.
+pub const SQUARE:  u32 = 1;
+pub const ROUND:   u32 = 2;
+pub const PROJECT: u32 = 4;
+pub const MITER:   u32 = 8;
+pub const BEVEL:   u32 = 32;
+/// Ends of lines: ROUND (default), SQUARE or PROJECT.
+pub fn stroke_cap(cap: u32) {
+    render::set_stroke_cap(match cap { SQUARE => 1, PROJECT => 2, _ => 0 });
+}
+/// Corners of shapes: MITER (default), BEVEL or ROUND.
+pub fn stroke_join(join: u32) {
+    render::set_stroke_join(match join { BEVEL => 1, ROUND => 2, _ => 0 });
+}
+#[inline] pub fn strokeCap(cap: u32)   { stroke_cap(cap) }
+#[inline] pub fn strokeJoin(join: u32) { stroke_join(join) }
+
+// ─────────────────────────── Blend modes ─────────────────────────────────────
+pub const REPLACE:    u32 = 0;
+pub const BLEND:      u32 = 1;
+pub const ADD:        u32 = 2;
+pub const SUBTRACT:   u32 = 4;
+pub const LIGHTEST:   u32 = 8;
+pub const DARKEST:    u32 = 16;
+pub const DIFFERENCE: u32 = 32;
+pub const EXCLUSION:  u32 = 64;
+pub const MULTIPLY:   u32 = 128;
+pub const SCREEN:     u32 = 256;
+/// How new drawing combines with what is already on the canvas.
+pub fn blend_mode(mode: u32) {
+    render::set_blend_mode(match mode {
+        ADD => 1, SUBTRACT => 2, DARKEST => 3, LIGHTEST => 4, DIFFERENCE => 5,
+        EXCLUSION => 6, MULTIPLY => 7, SCREEN => 8, REPLACE => 9, _ => 0,
+    });
+}
+#[inline] pub fn blendMode(mode: u32) { blend_mode(mode) }
+
+// ─────────────────────────── Shape modes ─────────────────────────────────────
+pub const CORNER:  u32 = 0;
+pub const CORNERS: u32 = 1;
+pub const RADIUS:  u32 = 2;
+pub const CENTER:  u32 = 3;
+static RECT_MODE:    std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(CORNER);
+static ELLIPSE_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(CENTER);
+static IMAGE_MODE:   std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(CORNER);
+/// How rect() reads its four numbers: CORNER (default), CORNERS, CENTER or RADIUS.
+pub fn rect_mode(mode: u32)    { RECT_MODE.store(mode, Ordering::Relaxed); }
+/// How ellipse() reads its four numbers: CENTER (default), RADIUS, CORNER or CORNERS.
+pub fn ellipse_mode(mode: u32) { ELLIPSE_MODE.store(mode, Ordering::Relaxed); }
+/// How image() reads its position: CORNER (default), CORNERS or CENTER.
+pub fn image_mode(mode: u32)   { IMAGE_MODE.store(mode, Ordering::Relaxed); }
+#[inline] pub fn rectMode(mode: u32)    { rect_mode(mode) }
+#[inline] pub fn ellipseMode(mode: u32) { ellipse_mode(mode) }
+#[inline] pub fn imageMode(mode: u32)   { image_mode(mode) }
+
+/// (x, y, w, h) with (x, y) the top-left corner, from the four numbers of a
+/// call made in the given mode.
+fn corner_box(mode: u32, a: f32, b: f32, c: f32, d: f32) -> (f32, f32, f32, f32) {
+    match mode {
+        CORNERS => (a.min(c), b.min(d), (c - a).abs(), (d - b).abs()),
+        RADIUS  => (a - c, b - d, c * 2.0, d * 2.0),
+        CENTER  => (a - c / 2.0, b - d / 2.0, c, d),
+        _       => (a, b, c, d),
+    }
+}
+
+// ─────────────────────────── Date and time ───────────────────────────────────
+//
+// Local time when the IDE started the sketch (it passes the UTC offset in
+// PROCESSING_UTC_OFFSET, in seconds); UTC for a sketch run on its own.
+
+fn local_seconds() -> i64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0);
+    let offset = std::env::var("PROCESSING_UTC_OFFSET").ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|o| o.abs() <= 18 * 3600).unwrap_or(0);
+    now + offset
+}
+/// (year, month 1..12, day 1..31) of a day count since 1970-01-01.
+fn civil(days: i64) -> (i32, i32, i32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    ((yoe + era * 400 + if m <= 2 { 1 } else { 0 }) as i32, m as i32, d as i32)
+}
+pub fn year()   -> i32 { civil(local_seconds().div_euclid(86_400)).0 }
+pub fn month()  -> i32 { civil(local_seconds().div_euclid(86_400)).1 }
+pub fn day()    -> i32 { civil(local_seconds().div_euclid(86_400)).2 }
+pub fn hour()   -> i32 { (local_seconds().rem_euclid(86_400) / 3600) as i32 }
+pub fn minute() -> i32 { (local_seconds().rem_euclid(3600) / 60) as i32 }
+pub fn second() -> i32 { local_seconds().rem_euclid(60) as i32 }
 
 // ─────────────────────────── Text alignment ──────────────────────────────────
 
@@ -1878,13 +2190,20 @@ pub fn text_descent() -> f32 { render::text_descent() }
 pub fn load_image(path: &str) -> u64 { render::load_image(path) }
 pub fn image(id: u64, x: f32, y: f32) {
     let (w, h) = render::image_size(id);
+    // CORNERS needs both corners; with one point it is a corner
+    let (x, y) = if IMAGE_MODE.load(Ordering::Relaxed) == CENTER { (x - w / 2.0, y - h / 2.0) } else { (x, y) };
     render::draw_image(id, x, y, w, h);
 }
-pub fn image_sized(id: u64, x: f32, y: f32, w: f32, h: f32) { render::draw_image(id, x, y, w, h); }
+pub fn image_sized(id: u64, x: f32, y: f32, w: f32, h: f32) {
+    let (x, y, w, h) = corner_box(IMAGE_MODE.load(Ordering::Relaxed), x, y, w, h);
+    render::draw_image(id, x, y, w, h);
+}
 pub fn image_width(id: u64)  -> f32 { render::image_size(id).0 }
 pub fn image_height(id: u64) -> f32 { render::image_size(id).1 }
 pub fn tint(gray: f32)                            { render::set_tint(Some(Color::from_gray(gray / 255.0))); }
 pub fn tint_rgba(r: f32, g: f32, b: f32, a: f32)  { render::set_tint(Some(Color::from_rgba(r/255.0, g/255.0, b/255.0, a/255.0))); }
+pub fn tint_rgb(r: f32, g: f32, b: f32)           { tint_rgba(r, g, b, 255.0); }
+pub fn tint_ga(gray: f32, a: f32)                 { tint_rgba(gray, gray, gray, a); }
 pub fn no_tint()                                  { render::set_tint(None); }
 #[inline] pub fn loadImage(path: &str) -> u64 { load_image(path) }
 #[inline] pub fn noTint() { no_tint() }
@@ -1915,6 +2234,11 @@ pub fn current_frame_rate() -> f32 {
 pub fn is_looping() -> bool {
     #[cfg(not(feature = "wasm"))] { glfw::is_looping() }
     #[cfg(feature = "wasm")]      { true }
+}
+
+/// Sets one canvas pixel (r, g, b each 0..255). Not affected by transforms.
+pub fn set_pixel(x: i32, y: i32, r: f32, g: f32, b: f32) {
+    render::set_pixel(x, y, Color::from_rgb(r / 255.0, g / 255.0, b / 255.0));
 }
 
 /// Color of one canvas pixel as (r, g, b), each 0..255. Black outside the canvas.

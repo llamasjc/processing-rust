@@ -5,9 +5,9 @@ import processing.app.Formatter;
 import processing.app.Preferences;
 import processing.app.SketchCode;
 import processing.app.syntax.JEditTextArea;
-import processing.app.syntax.PdeInputHandler;
 import processing.app.syntax.PdeTextArea;
 import processing.app.syntax.PdeTextAreaDefaults;
+import processing.app.syntax.SyntaxDocument;
 import processing.app.ui.Editor;
 import processing.app.ui.EditorException;
 import processing.app.ui.EditorState;
@@ -27,6 +27,9 @@ import java.io.InputStreamReader;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -66,9 +69,77 @@ public class RustEditor extends Editor {
     } catch (Throwable ignored) {}   // already shutting down
   }
 
+  // One token marker per tab: each tab has its own document, and a marker
+  // holds the colors for exactly one text.
+  private final Map<SyntaxDocument, TsRustTokenMarker> markers = new IdentityHashMap<>();
+  private boolean ready;   // false while Editor's constructor is still running
+
   protected RustEditor(Base base, String path, EditorState state, RustMode mode)
       throws EditorException {
     super(base, path, state, mode);
+    ready = true;
+    try {
+      attachTokenMarker();
+    } catch (Throwable t) {
+      LOG.log(Level.WARNING, "couldn't set up highlighting", t);
+    }
+  }
+
+  // ── Syntax colors ─────────────────────────────────────────────────────────────
+
+  /**
+   * Editor calls this whenever another tab is shown (and while a sketch is
+   * loading). The tab's document may be brand new, so this is the place to
+   * give it a marker.
+   */
+  @Override
+  public void setCode(SketchCode code) {
+    super.setCode(code);
+    if (ready) {
+      try {
+        attachTokenMarker();
+      } catch (Throwable t) {
+        LOG.log(Level.WARNING, "couldn't set up highlighting for this tab", t);
+      }
+    }
+  }
+
+  /** Makes sure the document now in the text area has a Rust token marker. */
+  private void attachTokenMarker() {
+    // Without the native library, keep Processing's keyword-based colors.
+    if (!RustMode.isNativeLoaded()) return;
+    // ...and the same if the query file didn't make it into the jar
+    if (TsRustTokenMarker.class.getResource("/queries/rust-highlights.scm") == null) return;
+    SyntaxDocument doc = getTextArea().getDocument();
+    if (doc == null || markers.containsKey(doc)) return;
+
+    TsRustTokenMarker marker = new TsRustTokenMarker();
+    // highlights are rebuilt off the event thread; repaint once they're ready
+    marker.setRepaintHook(() -> SwingUtilities.invokeLater(() -> {
+      if (getTextArea().getDocument() == doc) getTextArea().getPainter().repaint();
+    }));
+    doc.setTokenMarker(marker);
+    doc.addDocumentListener(new javax.swing.event.DocumentListener() {
+      public void insertUpdate(javax.swing.event.DocumentEvent e)  { marker.invalidate(doc); }
+      public void removeUpdate(javax.swing.event.DocumentEvent e)  { marker.invalidate(doc); }
+      public void changedUpdate(javax.swing.event.DocumentEvent e) { marker.invalidate(doc); }
+    });
+    markers.put(doc, marker);
+    marker.invalidate(doc);
+
+    // drop the markers of tabs that no longer exist
+    if (markers.size() > sketch.getCodeCount()) {
+      java.util.Set<SyntaxDocument> open = Collections.newSetFromMap(new IdentityHashMap<>());
+      for (SketchCode c : sketch.getCode()) {
+        Object d = c.getDocument();
+        if (d instanceof SyntaxDocument) open.add((SyntaxDocument) d);
+      }
+      markers.entrySet().removeIf(e -> {
+        if (open.contains(e.getKey())) return false;
+        e.getValue().dispose();
+        return true;
+      });
+    }
   }
 
   public RustMode getRustMode() {
@@ -78,12 +149,12 @@ public class RustEditor extends Editor {
   // ── Text area ─────────────────────────────────────────────────────────────────
   //
   // Editor's default is a bare JEditTextArea with no gutter, so no line
-  // numbers. Same text area as Java mode instead. Called from Editor's
-  // constructor, before our own fields are set.
+  // numbers. Same text area as Java mode instead, with Rust typing help on
+  // top. Called from Editor's constructor, before our own fields are set.
 
   @Override
   protected JEditTextArea createTextArea() {
-    return new PdeTextArea(new PdeTextAreaDefaults(getMode()), new PdeInputHandler(this), this);
+    return new PdeTextArea(new PdeTextAreaDefaults(getMode()), new RustInputHandler(this), this);
   }
 
   // ── Run ───────────────────────────────────────────────────────────────────────
@@ -207,6 +278,9 @@ public class RustEditor extends Editor {
     // The sketch's stdin stays open and unused: if the IDE dies without a
     // chance to clean up, the pipe closes and the sketch closes with it.
     pb.environment().put("PROCESSING_WATCH_STDIN", "1");
+    // hour(), minute(), day()... in local time
+    pb.environment().put("PROCESSING_UTC_OFFSET",
+      String.valueOf(java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000));
     if (presentOn != null && presentOn.width > 0 && presentOn.height > 0) {
       pb.environment().put("PROCESSING_PRESENT",
         presentOn.width + "," + presentOn.height + "," + presentOn.x + "," + presentOn.y);
@@ -310,6 +384,8 @@ public class RustEditor extends Editor {
   @Override
   public void dispose() {
     stopCurrent();
+    for (TsRustTokenMarker m : markers.values()) m.dispose();
+    markers.clear();
     super.dispose();
   }
 
