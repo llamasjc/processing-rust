@@ -1095,6 +1095,13 @@ mod glfw {
     // (i3, sway, Hyprland, bspwm) float the window instead of tiling it.
     static RESIZABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pub fn set_resizable(on: bool) { RESIZABLE.store(on, Ordering::Relaxed); }
+    // Present mode: a borderless window that covers one screen, with the
+    // sketch centered on a plain background. (width, height, x, y) of the screen.
+    static PRESENT: Mutex<Option<(usize, usize, isize, isize)>> = Mutex::new(None);
+    pub fn set_present(w: usize, h: usize, x: isize, y: isize) {
+        if w > 0 && h > 0 { *PRESENT.lock().unwrap() = Some((w.min(16384), h.min(16384), x, y)); }
+    }
+    const PRESENT_BACKGROUND: u32 = 0xFF_66_66_66;   // Processing's default
 
     fn fps() -> f32  { *FRAME_RATE.get_or_init(|| Mutex::new(60.0)).lock().unwrap() }
     fn looping() -> bool { *LOOPING.get_or_init(|| Mutex::new(true)).lock().unwrap() }
@@ -1157,17 +1164,28 @@ mod glfw {
                 .get().map(|m| m.lock().unwrap().clone())
                 .unwrap_or_else(|| self.title.clone());
 
-            let mut window = match Window::new(
-                &title,
-                w, h,
-                WindowOptions { resize: RESIZABLE.load(Ordering::Relaxed), ..WindowOptions::default() },
-            ) {
+            let present = *PRESENT.lock().unwrap();
+            let (win_w, win_h, options) = match present {
+                Some((pw, ph, _, _)) => (pw, ph, WindowOptions {
+                    borderless: true, topmost: true, resize: false, ..WindowOptions::default() }),
+                None => (w, h, WindowOptions {
+                    resize: RESIZABLE.load(Ordering::Relaxed), ..WindowOptions::default() }),
+            };
+            let mut window = match Window::new(&title, win_w, win_h, options) {
                 Ok(win) => win,
                 Err(e) => {
                     eprintln!("Could not open the sketch window ({}x{}): {}", w, h, e);
                     std::process::exit(1);
                 }
             };
+
+            if let Some((_, _, px, py)) = present { window.set_position(px, py); }
+            // what is shown in present mode: the background with the canvas in the middle
+            let mut screen: Vec<u32> = match present {
+                Some((pw, ph, _, _)) => vec![PRESENT_BACKGROUND; pw * ph],
+                None => Vec::new(),
+            };
+            let mut screen_canvas = (0usize, 0usize);   // canvas size the background was laid out for
 
             let mut target_fps = fps();
             window.set_target_fps(target_fps as usize);
@@ -1205,16 +1223,23 @@ mod glfw {
                 let cur_w = window.get_size().0;
                 let cur_h = window.get_size().1;
                 // a minimized window reports 0x0; keep the canvas as it is
-                if cur_w > 0 && cur_h > 0
+                if present.is_none() && cur_w > 0 && cur_h > 0
                     && (cur_w != CANVAS_W.load(Ordering::Relaxed) as usize
                         || cur_h != CANVAS_H.load(Ordering::Relaxed) as usize)
                 {
                     resize_canvas(cur_w as u32, cur_h as u32);
                 }
 
-                let (mx, my) = window.get_mouse_pos(MouseMode::Clamp)
+                let (mut mx, mut my) = window.get_mouse_pos(MouseMode::Clamp)
                     .map(|(x,y)| (x, y))
                     .unwrap_or((0.0, 0.0));
+                if let Some((pw, ph, _, _)) = present {
+                    // the sketch sits in the middle of the screen
+                    let cw = CANVAS_W.load(Ordering::Relaxed) as f32;
+                    let ch = CANVAS_H.load(Ordering::Relaxed) as f32;
+                    mx = (mx - ((pw as f32 - cw) / 2.0).floor()).clamp(0.0, (cw - 1.0).max(0.0));
+                    my = (my - ((ph as f32 - ch) / 2.0).floor()).clamp(0.0, (ch - 1.0).max(0.0));
+                }
 
                 let (bl, br, bm) = (window.get_mouse_down(MouseButton::Left),
                                     window.get_mouse_down(MouseButton::Right),
@@ -1327,8 +1352,28 @@ mod glfw {
                 let buf = pixel_buf().lock();
                 let cw = CANVAS_W.load(Ordering::Relaxed) as usize;
                 let ch = CANVAS_H.load(Ordering::Relaxed) as usize;
-                let _ = window.update_with_buffer(&buf, cw, ch);
-                drop(buf);
+                if let Some((pw, ph, _, _)) = present {
+                    if screen_canvas != (cw, ch) {
+                        screen.iter_mut().for_each(|p| *p = PRESENT_BACKGROUND);
+                        screen_canvas = (cw, ch);
+                    }
+                    // centered; a canvas bigger than the screen shows its middle
+                    let (copy_w, copy_h) = (cw.min(pw), ch.min(ph));
+                    let (dst_x, dst_y) = ((pw - copy_w) / 2, (ph - copy_h) / 2);
+                    let (src_x, src_y) = ((cw - copy_w) / 2, (ch - copy_h) / 2);
+                    if buf.len() >= cw * ch {
+                        for row in 0..copy_h {
+                            let s0 = (src_y + row) * cw + src_x;
+                            let d0 = (dst_y + row) * pw + dst_x;
+                            screen[d0..d0 + copy_w].copy_from_slice(&buf[s0..s0 + copy_w]);
+                        }
+                    }
+                    drop(buf);
+                    let _ = window.update_with_buffer(&screen, pw, ph);
+                } else {
+                    let _ = window.update_with_buffer(&buf, cw, ch);
+                    drop(buf);
+                }
 
                 last_mouse_pressed = mouse_pressed;
                 last_mouse_x = mx;
@@ -1728,6 +1773,12 @@ pub fn window_resizable(on: bool) {
     #[cfg(feature = "wasm")] { let _ = on; }
 }
 #[inline] pub fn windowResizable(on: bool) { window_resizable(on) }
+/// Present mode: cover the screen at (x, y) of size w x h, sketch centered.
+/// Call before the window opens (the IDE does, when Present is pressed).
+pub fn present(w: usize, h: usize, x: isize, y: isize) {
+    #[cfg(not(feature = "wasm"))] glfw::set_present(w, h, x, y);
+    #[cfg(feature = "wasm")] { let _ = (w, h, x, y); }
+}
 pub fn window_title(t: &str) {
     #[cfg(not(feature = "wasm"))] glfw::set_window_title(t);
 }
