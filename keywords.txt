@@ -324,6 +324,15 @@ THRESHOLD	KEYWORD2
 ERODE	KEYWORD2
 DILATE	KEYWORD2
 
+load_shape	FUNCTION1
+loadShape	FUNCTION1
+shape	FUNCTION1
+shape_sized	FUNCTION1
+shape_width	FUNCTION1
+shape_height	FUNCTION1
+shape_disable_style	FUNCTION1
+shape_enable_style	FUNCTION1
+
 # ── Lifecycle functions ────────────────────────────────────────────────────────
 setup	FUNCTION2
 draw	FUNCTION2

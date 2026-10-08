@@ -1874,6 +1874,12 @@ mod render {
         let smooth = smooth_on() && !same_size;
         // from a canvas point back to sketch coordinates
         let (ia, ib, ic, id) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
+        // A turned picture gets soft edges: how much of each border pixel it
+        // covers, from how far inside the outline the pixel's centre is.
+        let side = |a: (f32, f32), b: (f32, f32)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+        let (wide, tall) = (side(corners[0], corners[1]), side(corners[0], corners[3]));
+        let soft = smooth && !upright && wide > 1.0 && tall > 1.0;
+        let (eu, ev) = if soft { (0.5 / wide, 0.5 / tall) } else { (0.0, 0.0) };
         let mut buf = pixel_buf().lock();
         // only the part of the picture that is on the canvas
         let (py0, py1) = (ly.floor().max(0.0) as i32, hy.ceil().min(ch as f32) as i32);
@@ -1883,7 +1889,12 @@ mod render {
                 let (dx, dy) = (px as f32 + 0.5 - m[4], py as f32 + 0.5 - m[5]);
                 let u = ((ia * dx + ic * dy) - x) / w;
                 let v = ((ib * dx + id * dy) - y) / h;
-                if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) { continue; }
+                if !(u >= -eu && u < 1.0 + eu && v >= -ev && v < 1.0 + ev) { continue; }
+                let cover = if soft {
+                    (u * wide).min((1.0 - u) * wide).min(v * tall).min((1.0 - v) * tall) + 0.5
+                } else { 1.0 };
+                if cover <= 0.0 { continue; }
+                let (u, v) = (u.clamp(0.0, 0.999_999), v.clamp(0.0, 0.999_999));
                 let mut c = if smooth {
                     // between the four nearest source pixels
                     let (fx, fy) = ((u * iw as f32 - 0.5).max(0.0), (v * ih as f32 - 0.5).max(0.0));
@@ -1904,9 +1915,576 @@ mod render {
                     sample(sy * iw + sx)
                 };
                 if let Some(t) = tint { c = Color::from_rgba(c.r * t.r, c.g * t.g, c.b * t.b, c.a * t.a); }
+                if cover < 1.0 { c.a *= cover; }
                 if c.a > 0.0 { put(&mut buf, cw, ch, px, py, c); }
             }
         }
+    }
+
+    // ── loadShape(): SVG ──────────────────────────────────────────────────
+    //
+    // The everyday part of SVG: paths (all commands, arcs included), rect,
+    // circle, ellipse, line, polyline, polygon, groups with transforms, and
+    // fill / stroke / stroke-width / opacity given as attributes or in
+    // style="...". Text, gradients, clipping, <use> and CSS classes are not
+    // read; a gradient or pattern fill shows as a plain gray.
+    //
+    // Everything is flattened to straight pieces in the file's own
+    // coordinates when it is loaded, so drawing a shape is as cheap as
+    // drawing its polygons.
+
+    struct SvgItem {
+        contours: Vec<(Vec<(f32, f32)>, bool)>,   // points, closed?
+        fill: Option<Color>,
+        stroke: Option<Color>,
+        weight: f32,
+    }
+    struct SvgShape { x: f32, y: f32, w: f32, h: f32, items: Vec<SvgItem>, own_style: bool }
+    fn shapes() -> &'static parking_lot::Mutex<Vec<SvgShape>> {
+        static S: std::sync::OnceLock<parking_lot::Mutex<Vec<SvgShape>>> = std::sync::OnceLock::new();
+        S.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+    }
+    const MAX_SHAPES: usize = 256;
+    const MAX_SVG_BYTES: u64 = 32 * 1024 * 1024;
+    const MAX_SVG_POINTS: usize = 2_000_000;
+
+    #[derive(Clone)]
+    struct SvgStyle { fill: Option<Color>, stroke: Option<Color>, weight: f32, fill_a: f32, stroke_a: f32, opacity: f32 }
+
+    /// Loads an SVG file. Returns its id (1 or more), or 0 if it can't be read.
+    pub fn load_shape(path: &str) -> u64 {
+        let load = || -> Result<SvgShape, String> {
+            let file = std::path::Path::new(path);
+            let file = if file.is_file() { file.to_path_buf() } else { std::path::Path::new("data").join(path) };
+            let len = std::fs::metadata(&file).map_err(|e| e.to_string())?.len();
+            if len > MAX_SVG_BYTES { return Err("file is too large".into()); }
+            let text = String::from_utf8_lossy(&std::fs::read(&file).map_err(|e| e.to_string())?).into_owned();
+            parse_svg(&text)
+        };
+        let mut all = shapes().lock();
+        if all.len() >= MAX_SHAPES {
+            eprintln!("loadShape(\"{}\"): too many shapes (load them once in setup(), not every frame)", path);
+            return 0;
+        }
+        match load() {
+            Ok(s)  => { all.push(s); all.len() as u64 }
+            Err(e) => { eprintln!("loadShape(\"{}\"): {} (SVG files are supported)", path, e); 0 }
+        }
+    }
+    pub fn shape_size(id: u64) -> (f32, f32) {
+        shapes().lock().get((id as usize).wrapping_sub(1)).map(|s| (s.w, s.h)).unwrap_or((0.0, 0.0))
+    }
+    /// disableStyle() / enableStyle(): draw with the sketch's fill and stroke
+    /// instead of the colors in the file.
+    pub fn shape_own_style(id: u64, on: bool) {
+        if let Some(s) = shapes().lock().get_mut((id as usize).wrapping_sub(1)) { s.own_style = on; }
+    }
+
+    /// Draws a shape into (x, y, w, h), through the current transform.
+    pub fn draw_shape(id: u64, x: f32, y: f32, w: f32, h: f32) {
+        let all = shapes().lock();
+        let Some(shape) = all.get((id as usize).wrapping_sub(1)) else { return };
+        if !(shape.w > 0.0 && shape.h > 0.0) || !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) { return; }
+        let (sx, sy) = (w / shape.w, h / shape.h);
+        let place = |p: &(f32, f32)| tfm(x + (p.0 - shape.x) * sx, y + (p.1 - shape.y) * sy);
+        let grow = matrix_scale() * (sx.abs() * sy.abs()).sqrt();
+        let (cw, ch) = canvas_dims();
+        let (cur_fill, cur_stroke, cur_weight) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
+        let mut buf = pixel_buf().lock();
+        for item in &shape.items {
+            let (fill, stroke, weight) = if shape.own_style {
+                (item.fill, item.stroke, (item.weight * grow).max(0.0))
+            } else {
+                (cur_fill, cur_stroke, cur_weight)
+            };
+            let screen: Vec<(Vec<(f32, f32)>, bool)> =
+                item.contours.iter().map(|(pts, closed)| (pts.iter().map(place).collect(), *closed)).collect();
+            if let Some(fc) = fill {
+                // all contours as one polygon: each is walked and left again
+                // through its first point, and those crossings cancel, so
+                // holes stay holes and nothing is painted twice
+                let mut poly: Vec<(f32, f32)> = Vec::new();
+                let mut anchor: Option<(f32, f32)> = None;
+                for (pts, _) in &screen {
+                    if pts.len() < 3 { continue; }
+                    poly.extend_from_slice(pts);
+                    poly.push(pts[0]);
+                    match anchor { None => anchor = Some(pts[0]), Some(a) => poly.push(a) }
+                }
+                if poly.len() >= 3 { fill_poly(&mut buf, cw, ch, &poly, fc); }
+            }
+            if let Some(sc) = stroke {
+                if weight > 0.0 {
+                    for (pts, closed) in &screen { stroke_path(&mut buf, cw, ch, pts, *closed, weight, sc); }
+                }
+            }
+        }
+    }
+
+    // ── SVG reading ───────────────────────────────────────────────────────
+
+    fn parse_svg(text: &str) -> Result<SvgShape, String> {
+        let mut shape = SvgShape { x: 0.0, y: 0.0, w: 0.0, h: 0.0, items: Vec::new(), own_style: true };
+        let base = SvgStyle { fill: Some(Color::from_gray(0.0)), stroke: None, weight: 1.0, fill_a: 1.0, stroke_a: 1.0, opacity: 1.0 };
+        // one entry per open element: its transform and style, and whether its contents are drawn
+        let mut stack: Vec<(Mat, SvgStyle, bool)> = vec![(identity(), base, true)];
+        let mut seen_svg = false;
+        let mut points = 0usize;
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        while let Some(off) = text[i..].find('<') {
+            let start = i + off;
+            let rest = &text[start..];
+            if rest.starts_with("<!--") { i = start + rest.find("-->").map(|e| e + 3).unwrap_or(rest.len()); continue; }
+            if rest.starts_with("<![CDATA[") { i = start + rest.find("]]>").map(|e| e + 3).unwrap_or(rest.len()); continue; }
+            if rest.starts_with("<?") || rest.starts_with("<!") { i = start + rest.find('>').map(|e| e + 1).unwrap_or(rest.len()); continue; }
+            // the end of the tag, not counting a '>' inside a quoted value
+            let mut end = start + 1;
+            let mut quote = 0u8;
+            while end < bytes.len() {
+                let b = bytes[end];
+                if quote != 0 { if b == quote { quote = 0; } }
+                else if b == b'"' || b == b'\'' { quote = b; }
+                else if b == b'>' { break; }
+                end += 1;
+            }
+            if end >= bytes.len() { break; }
+            let tag = &text[start + 1..end];
+            i = end + 1;
+            if let Some(name) = tag.strip_prefix('/') {
+                let _ = name;
+                if stack.len() > 1 { stack.pop(); }
+                continue;
+            }
+            let self_closing = tag.ends_with('/');
+            let tag = tag.trim_end_matches('/');
+            let name_end = tag.find(|c: char| c.is_whitespace()).unwrap_or(tag.len());
+            let name = tag[..name_end].rsplit(':').next().unwrap_or("");
+            let attrs = svg_attrs(&tag[name_end..]);
+            let get = |k: &str| attrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+            let num = |k: &str| get(k).and_then(svg_length).unwrap_or(0.0);
+
+            let (parent_m, parent_style, parent_drawn) = stack.last().cloned().unwrap();
+            let mut m = parent_m;
+            if let Some(t) = get("transform") { m = mat_mul(&m, &svg_transform(t)); }
+            let mut style = parent_style.clone();
+            svg_apply_style(&mut style, &attrs);
+            // things that are defined, not drawn
+            let drawn = parent_drawn && !matches!(name, "defs" | "clipPath" | "mask" | "symbol" | "pattern" | "marker"
+                | "linearGradient" | "radialGradient" | "metadata" | "title" | "desc" | "style" | "script")
+                && get("display") != Some("none");
+
+            if name == "svg" && !seen_svg {
+                seen_svg = true;
+                let vb: Vec<f32> = get("viewBox").map(svg_numbers).unwrap_or_default();
+                if vb.len() == 4 && vb[2] > 0.0 && vb[3] > 0.0 {
+                    shape.x = vb[0]; shape.y = vb[1]; shape.w = vb[2]; shape.h = vb[3];
+                } else {
+                    shape.w = num("width"); shape.h = num("height");
+                }
+            }
+
+            let mut contours: Vec<(Vec<(f32, f32)>, bool)> = Vec::new();
+            if drawn {
+                match name {
+                    "path" => if let Some(d) = get("d") { contours = svg_path(d); },
+                    "rect" => {
+                        let (x, y, w, h) = (num("x"), num("y"), num("width"), num("height"));
+                        if w > 0.0 && h > 0.0 {
+                            let rx = get("rx").and_then(svg_length);
+                            let ry = get("ry").and_then(svg_length);
+                            let (rx, ry) = (rx.or(ry).unwrap_or(0.0).min(w / 2.0), ry.or(rx).unwrap_or(0.0).min(h / 2.0));
+                            if rx > 0.0 && ry > 0.0 {
+                                let mut pts = Vec::new();
+                                let pi = std::f32::consts::PI;
+                                for (cx, cy, a0) in [(x + w - rx, y + ry, -pi / 2.0), (x + w - rx, y + h - ry, 0.0),
+                                                     (x + rx, y + h - ry, pi / 2.0), (x + rx, y + ry, pi)] {
+                                    for k in 0..=8 {
+                                        let a = a0 + pi / 2.0 * k as f32 / 8.0;
+                                        pts.push((cx + a.cos() * rx, cy + a.sin() * ry));
+                                    }
+                                }
+                                contours.push((pts, true));
+                            } else {
+                                contours.push((vec![(x, y), (x + w, y), (x + w, y + h), (x, y + h)], true));
+                            }
+                        }
+                    }
+                    "circle" | "ellipse" => {
+                        let (cx, cy) = (num("cx"), num("cy"));
+                        let (rx, ry) = if name == "circle" { (num("r"), num("r")) } else { (num("rx"), num("ry")) };
+                        if rx > 0.0 && ry > 0.0 {
+                            let n = 64;
+                            let pts = (0..n).map(|k| {
+                                let a = std::f32::consts::TAU * k as f32 / n as f32;
+                                (cx + a.cos() * rx, cy + a.sin() * ry)
+                            }).collect();
+                            contours.push((pts, true));
+                        }
+                    }
+                    "line" => contours.push((vec![(num("x1"), num("y1")), (num("x2"), num("y2"))], false)),
+                    "polyline" | "polygon" => {
+                        let v = get("points").map(svg_numbers).unwrap_or_default();
+                        let pts: Vec<(f32, f32)> = v.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+                        if pts.len() >= 2 { contours.push((pts, name == "polygon")); }
+                    }
+                    _ => {}
+                }
+            }
+            if !contours.is_empty() {
+                for (pts, _) in contours.iter_mut() {
+                    for p in pts.iter_mut() { *p = (m[0] * p.0 + m[2] * p.1 + m[4], m[1] * p.0 + m[3] * p.1 + m[5]); }
+                    pts.retain(|p| p.0.is_finite() && p.1.is_finite());
+                    points += pts.len();
+                }
+                if points > MAX_SVG_POINTS { return Err("the drawing is too detailed".into()); }
+                let det = (m[0] * m[3] - m[2] * m[1]).abs().sqrt();
+                let with_alpha = |c: Option<Color>, a: f32| c.map(|c| Color::from_rgba(c.r, c.g, c.b, (a * style.opacity).clamp(0.0, 1.0)));
+                // a line has nothing to fill
+                let fill = if name == "line" { None } else { with_alpha(style.fill, style.fill_a) };
+                shape.items.push(SvgItem {
+                    contours, fill,
+                    stroke: with_alpha(style.stroke, style.stroke_a),
+                    weight: style.weight * if det.is_finite() { det } else { 1.0 },
+                });
+            }
+            if !self_closing { stack.push((m, style, drawn)); }
+            if stack.len() > 256 { return Err("nested too deeply".into()); }
+        }
+        if !seen_svg { return Err("not an SVG file".into()); }
+        if !(shape.w > 0.0 && shape.h > 0.0) {
+            // no size given: use what the drawing covers
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for item in &shape.items { for (pts, _) in &item.contours { for p in pts {
+                x0 = x0.min(p.0); y0 = y0.min(p.1); x1 = x1.max(p.0); y1 = y1.max(p.1);
+            } } }
+            if x1 > x0 && y1 > y0 { shape.x = x0; shape.y = y0; shape.w = x1 - x0; shape.h = y1 - y0; }
+            else { return Err("nothing to draw in it".into()); }
+        }
+        Ok(shape)
+    }
+
+    /// name="value" pairs of a tag. Values of style="a: b; c: d" are added as
+    /// pairs of their own, after the attributes, so they win.
+    fn svg_attrs(s: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            while i < b.len() && (b[i] as char).is_whitespace() { i += 1; }
+            let n0 = i;
+            while i < b.len() && b[i] != b'=' && !(b[i] as char).is_whitespace() { i += 1; }
+            let name = &s[n0..i];
+            while i < b.len() && (b[i] as char).is_whitespace() { i += 1; }
+            if i >= b.len() || b[i] != b'=' { if name.is_empty() { i += 1; } continue; }
+            i += 1;
+            while i < b.len() && (b[i] as char).is_whitespace() { i += 1; }
+            if i >= b.len() { break; }
+            let q = b[i];
+            if q != b'"' && q != b'\'' { continue; }
+            let v0 = i + 1;
+            let Some(len) = s[v0..].find(q as char) else { break };
+            let value = &s[v0..v0 + len];
+            i = v0 + len + 1;
+            let name = name.rsplit(':').next().unwrap_or(name);
+            if !name.is_empty() { out.push((name.to_string(), value.trim().to_string())); }
+        }
+        let style: Vec<(String, String)> = out.iter().filter(|(n, _)| n == "style").flat_map(|(_, v)| {
+            v.split(';').filter_map(|d| {
+                let (k, val) = d.split_once(':')?;
+                Some((k.trim().to_string(), val.trim().to_string()))
+            }).collect::<Vec<_>>()
+        }).collect();
+        out.extend(style);
+        out
+    }
+
+    fn svg_apply_style(style: &mut SvgStyle, attrs: &[(String, String)]) {
+        for (k, v) in attrs {
+            match k.as_str() {
+                "fill" => if let Some(c) = svg_color(v) { style.fill = c; },
+                "stroke" => if let Some(c) = svg_color(v) { style.stroke = c; },
+                "stroke-width" => if let Some(w) = svg_length(v) { if w >= 0.0 { style.weight = w; } },
+                "fill-opacity" => if let Some(a) = svg_fraction(v) { style.fill_a = a; },
+                "stroke-opacity" => if let Some(a) = svg_fraction(v) { style.stroke_a = a; },
+                // opacity applies to the element and everything in it
+                "opacity" => if let Some(a) = svg_fraction(v) { style.opacity *= a; },
+                _ => {}
+            }
+        }
+    }
+
+    fn svg_fraction(v: &str) -> Option<f32> {
+        let v = v.trim();
+        let (n, scale) = match v.strip_suffix('%') { Some(n) => (n, 0.01), None => (v, 1.0) };
+        n.trim().parse::<f32>().ok().filter(|a| a.is_finite()).map(|a| (a * scale).clamp(0.0, 1.0))
+    }
+
+    /// "12", "12px", "1.5em": the number, whatever the unit. Percentages are not lengths we can use.
+    fn svg_length(v: &str) -> Option<f32> {
+        let v = v.trim();
+        if v.ends_with('%') { return None; }
+        let end = v.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E'))
+            .unwrap_or(v.len());
+        // "1em": the e belongs to the unit
+        let mut num = &v[..end];
+        while !num.is_empty() && num.parse::<f32>().is_err() { num = &num[..num.len() - 1]; }
+        num.parse::<f32>().ok().filter(|n| n.is_finite())
+    }
+
+    /// Some(None) is "none"; None means "not a color we know", so the inherited one stays.
+    fn svg_color(v: &str) -> Option<Option<Color>> {
+        let v = v.trim().to_ascii_lowercase();
+        let rgb = |r: u32, g: u32, b: u32| Some(Some(Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)));
+        if v == "none" || v == "transparent" { return Some(None); }
+        if v.starts_with("url(") { return rgb(128, 128, 128); }     // gradient or pattern: a plain gray
+        if let Some(hex) = v.strip_prefix('#') {
+            let n = u32::from_str_radix(hex, 16).ok()?;
+            return match hex.len() {
+                3 => rgb(((n >> 8) & 0xF) * 17, ((n >> 4) & 0xF) * 17, (n & 0xF) * 17),
+                6 => rgb((n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF),
+                8 => rgb((n >> 24) & 0xFF, (n >> 16) & 0xFF, (n >> 8) & 0xFF),
+                _ => None,
+            };
+        }
+        if let Some(inner) = v.strip_prefix("rgb(").or_else(|| v.strip_prefix("rgba(")) {
+            let parts: Vec<&str> = inner.trim_end_matches(')').split(|c| c == ',' || c == ' ' || c == '/').filter(|p| !p.is_empty()).collect();
+            if parts.len() < 3 { return None; }
+            let ch = |p: &str| -> Option<u32> {
+                match p.strip_suffix('%') {
+                    Some(n) => n.trim().parse::<f32>().ok().map(|x| (x * 2.55).clamp(0.0, 255.0) as u32),
+                    None => p.trim().parse::<f32>().ok().map(|x| x.clamp(0.0, 255.0) as u32),
+                }
+            };
+            return rgb(ch(parts[0])?, ch(parts[1])?, ch(parts[2])?);
+        }
+        let (r, g, b) = match v.as_str() {
+            "black" => (0, 0, 0), "white" => (255, 255, 255), "red" => (255, 0, 0), "green" => (0, 128, 0),
+            "lime" => (0, 255, 0), "blue" => (0, 0, 255), "yellow" => (255, 255, 0), "cyan" | "aqua" => (0, 255, 255),
+            "magenta" | "fuchsia" => (255, 0, 255), "gray" | "grey" => (128, 128, 128), "silver" => (192, 192, 192),
+            "orange" => (255, 165, 0), "purple" => (128, 0, 128), "brown" => (165, 42, 42), "pink" => (255, 192, 203),
+            "navy" => (0, 0, 128), "teal" => (0, 128, 128), "maroon" => (128, 0, 0), "olive" => (128, 128, 0),
+            "gold" => (255, 215, 0), "indigo" => (75, 0, 130), "violet" => (238, 130, 238), "tomato" => (255, 99, 71),
+            "darkgray" | "darkgrey" => (169, 169, 169), "lightgray" | "lightgrey" => (211, 211, 211),
+            "currentcolor" => (0, 0, 0),
+            _ => return None,
+        };
+        rgb(r, g, b)
+    }
+
+    /// Every number in a string, however they are separated ("10,20 30-5.5.5e1").
+    fn svg_numbers(s: &str) -> Vec<f32> {
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_digit() || c == b'-' || c == b'+' || c == b'.' {
+                let start = i;
+                if c == b'-' || c == b'+' { i += 1; }
+                let mut dot = false;
+                while i < b.len() && (b[i].is_ascii_digit() || (b[i] == b'.' && !dot)) { if b[i] == b'.' { dot = true; } i += 1; }
+                if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+                    let mut j = i + 1;
+                    if j < b.len() && (b[j] == b'-' || b[j] == b'+') { j += 1; }
+                    if j < b.len() && b[j].is_ascii_digit() { i = j; while i < b.len() && b[i].is_ascii_digit() { i += 1; } }
+                }
+                if let Ok(n) = s[start..i].parse::<f32>() { if n.is_finite() { out.push(n); } }
+                if i == start { i += 1; }
+            } else { i += 1; }
+        }
+        out
+    }
+
+    fn svg_transform(s: &str) -> Mat {
+        let mut m = identity();
+        let mut rest = s;
+        while let Some(open) = rest.find('(') {
+            let name = rest[..open].trim().trim_start_matches(',').trim();
+            let Some(close) = rest[open..].find(')') else { break };
+            let v = svg_numbers(&rest[open + 1..open + close]);
+            let a = |i: usize| v.get(i).copied().unwrap_or(0.0);
+            let t: Mat = match name {
+                "translate" => [1.0, 0.0, 0.0, 1.0, a(0), a(1)],
+                "scale" => [a(0), 0.0, 0.0, if v.len() > 1 { a(1) } else { a(0) }, 0.0, 0.0],
+                "rotate" => {
+                    let (sin, cos) = a(0).to_radians().sin_cos();
+                    let r: Mat = [cos, sin, -sin, cos, 0.0, 0.0];
+                    if v.len() >= 3 {
+                        mat_mul(&mat_mul(&[1.0, 0.0, 0.0, 1.0, a(1), a(2)], &r), &[1.0, 0.0, 0.0, 1.0, -a(1), -a(2)])
+                    } else { r }
+                }
+                "skewX" => [1.0, 0.0, a(0).to_radians().tan(), 1.0, 0.0, 0.0],
+                "skewY" => [1.0, a(0).to_radians().tan(), 0.0, 1.0, 0.0, 0.0],
+                "matrix" if v.len() >= 6 => [a(0), a(1), a(2), a(3), a(4), a(5)],
+                _ => identity(),
+            };
+            m = mat_mul(&m, &t);
+            rest = &rest[open + close + 1..];
+        }
+        if m.iter().all(|x| x.is_finite()) { m } else { identity() }
+    }
+
+    /// The d="..." of a path as straight-line contours.
+    fn svg_path(d: &str) -> Vec<(Vec<(f32, f32)>, bool)> {
+        // split into commands and their numbers; an arc's two flags may be
+        // written without anything between them ("a5 5 0 01 10 10")
+        let b = d.as_bytes();
+        let mut out: Vec<(Vec<(f32, f32)>, bool)> = Vec::new();
+        let mut cur: Vec<(f32, f32)> = Vec::new();
+        let (mut x, mut y, mut sx, mut sy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let (mut ctrl_x, mut ctrl_y) = (0.0f32, 0.0f32);     // last control point, for S and T
+        let mut last = b' ';
+        let mut i = 0usize;
+        let mut total = 0usize;
+        let flush = |cur: &mut Vec<(f32, f32)>, out: &mut Vec<(Vec<(f32, f32)>, bool)>, closed: bool| {
+            if cur.len() >= 2 { out.push((std::mem::take(cur), closed)); } else { cur.clear(); }
+        };
+        while i < b.len() {
+            let c = b[i];
+            if !c.is_ascii_alphabetic() { i += 1; continue; }
+            let cmd = c;
+            let mut j = i + 1;
+            while j < b.len() && !(b[j].is_ascii_alphabetic() && b[j] != b'e' && b[j] != b'E') { j += 1; }
+            let args_text = &d[i + 1..j];
+            i = j;
+            let rel = cmd.is_ascii_lowercase();
+            let upper = cmd.to_ascii_uppercase();
+            let args: Vec<f32> = if upper == b'A' { svg_arc_numbers(args_text) } else { svg_numbers(args_text) };
+            let per = match upper { b'M' | b'L' | b'T' => 2, b'H' | b'V' => 1, b'C' => 6, b'S' | b'Q' => 4, b'A' => 7, _ => 0 };
+            if upper == b'Z' {
+                flush(&mut cur, &mut out, true);
+                x = sx; y = sy;
+                last = b'Z';
+                continue;
+            }
+            if per == 0 { continue; }
+            for (k, a) in args.chunks_exact(per).enumerate() {
+                total += 1;
+                if total > 500_000 { return out; }
+                let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
+                match upper {
+                    b'M' => {
+                        if k == 0 {
+                            flush(&mut cur, &mut out, false);
+                            x = bx + a[0]; y = by + a[1]; sx = x; sy = y;
+                            cur.push((x, y));
+                        } else {            // more pairs after a move are lines
+                            x = bx + a[0]; y = by + a[1]; cur.push((x, y));
+                        }
+                    }
+                    b'L' => { x = bx + a[0]; y = by + a[1]; cur.push((x, y)); }
+                    b'H' => { x = bx + a[0]; cur.push((x, y)); }
+                    b'V' => { y = by + a[0]; cur.push((x, y)); }
+                    b'C' | b'S' => {
+                        let (c1x, c1y, c2x, c2y, ex, ey) = if upper == b'C' {
+                            (bx + a[0], by + a[1], bx + a[2], by + a[3], bx + a[4], by + a[5])
+                        } else {
+                            // first control point mirrors the previous curve's second
+                            let (rx, ry) = if matches!(last, b'C' | b'S') { (2.0 * x - ctrl_x, 2.0 * y - ctrl_y) } else { (x, y) };
+                            (rx, ry, bx + a[0], by + a[1], bx + a[2], by + a[3])
+                        };
+                        let n = 16;
+                        for s in 1..=n {
+                            let t = s as f32 / n as f32;
+                            let u = 1.0 - t;
+                            cur.push((u * u * u * x + 3.0 * u * u * t * c1x + 3.0 * u * t * t * c2x + t * t * t * ex,
+                                      u * u * u * y + 3.0 * u * u * t * c1y + 3.0 * u * t * t * c2y + t * t * t * ey));
+                        }
+                        ctrl_x = c2x; ctrl_y = c2y; x = ex; y = ey;
+                    }
+                    b'Q' | b'T' => {
+                        let (cx, cy, ex, ey) = if upper == b'Q' {
+                            (bx + a[0], by + a[1], bx + a[2], by + a[3])
+                        } else {
+                            let (rx, ry) = if matches!(last, b'Q' | b'T') { (2.0 * x - ctrl_x, 2.0 * y - ctrl_y) } else { (x, y) };
+                            (rx, ry, bx + a[0], by + a[1])
+                        };
+                        let n = 12;
+                        for s in 1..=n {
+                            let t = s as f32 / n as f32;
+                            let u = 1.0 - t;
+                            cur.push((u * u * x + 2.0 * u * t * cx + t * t * ex, u * u * y + 2.0 * u * t * cy + t * t * ey));
+                        }
+                        ctrl_x = cx; ctrl_y = cy; x = ex; y = ey;
+                    }
+                    b'A' => {
+                        let (ex, ey) = (bx + a[5], by + a[6]);
+                        svg_arc(&mut cur, x, y, a[0], a[1], a[2], a[3] != 0.0, a[4] != 0.0, ex, ey);
+                        x = ex; y = ey;
+                    }
+                    _ => {}
+                }
+                last = upper;
+                if cur.is_empty() { cur.push((x, y)); }
+            }
+        }
+        flush(&mut cur, &mut out, false);
+        out
+    }
+
+    /// Numbers of an arc command: in each group of seven, the fourth and fifth
+    /// are single-digit flags that may be run together with what follows.
+    fn svg_arc_numbers(s: &str) -> Vec<f32> {
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let pos = out.len() % 7;
+            while i < b.len() && (b[i] == b',' || (b[i] as char).is_whitespace()) { i += 1; }
+            if i >= b.len() { break; }
+            if pos == 3 || pos == 4 {
+                if b[i] == b'0' || b[i] == b'1' { out.push((b[i] - b'0') as f32); i += 1; continue; }
+                return out;     // not a flag: malformed, stop here
+            }
+            let start = i;
+            if b[i] == b'-' || b[i] == b'+' { i += 1; }
+            let mut dot = false;
+            while i < b.len() && (b[i].is_ascii_digit() || (b[i] == b'.' && !dot)) { if b[i] == b'.' { dot = true; } i += 1; }
+            if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+                let mut j = i + 1;
+                if j < b.len() && (b[j] == b'-' || b[j] == b'+') { j += 1; }
+                if j < b.len() && b[j].is_ascii_digit() { i = j; while i < b.len() && b[i].is_ascii_digit() { i += 1; } }
+            }
+            match s[start..i].parse::<f32>() { Ok(n) if n.is_finite() => out.push(n), _ => return out }
+            if i == start { return out; }
+        }
+        out
+    }
+
+    /// An elliptical arc from (x0, y0) to (x1, y1), as points (the SVG
+    /// "endpoint to centre" conversion).
+    fn svg_arc(out: &mut Vec<(f32, f32)>, x0: f32, y0: f32, rx: f32, ry: f32, turn_deg: f32,
+               large: bool, sweep: bool, x1: f32, y1: f32) {
+        let (mut rx, mut ry) = (rx.abs(), ry.abs());
+        if rx < 1.0e-6 || ry < 1.0e-6 || ((x0 - x1).abs() < 1.0e-6 && (y0 - y1).abs() < 1.0e-6) {
+            out.push((x1, y1));
+            return;
+        }
+        let (sin, cos) = turn_deg.to_radians().sin_cos();
+        let (dx, dy) = ((x0 - x1) / 2.0, (y0 - y1) / 2.0);
+        let (xp, yp) = (cos * dx + sin * dy, -sin * dx + cos * dy);
+        let lambda = (xp * xp) / (rx * rx) + (yp * yp) / (ry * ry);
+        if lambda > 1.0 { let s = lambda.sqrt(); rx *= s; ry *= s; }      // radii too small: grow them to fit
+        let num = (rx * rx * ry * ry - rx * rx * yp * yp - ry * ry * xp * xp).max(0.0);
+        let den = rx * rx * yp * yp + ry * ry * xp * xp;
+        let mut k = if den > 0.0 { (num / den).sqrt() } else { 0.0 };
+        if large == sweep { k = -k; }
+        let (cxp, cyp) = (k * rx * yp / ry, -k * ry * xp / rx);
+        let (cx, cy) = (cos * cxp - sin * cyp + (x0 + x1) / 2.0, sin * cxp + cos * cyp + (y0 + y1) / 2.0);
+        let a0 = ((yp - cyp) / ry).atan2((xp - cxp) / rx);
+        let a1 = ((-yp - cyp) / ry).atan2((-xp - cxp) / rx);
+        let tau = std::f32::consts::TAU;
+        let mut da = a1 - a0;
+        if sweep && da < 0.0 { da += tau; }
+        if !sweep && da > 0.0 { da -= tau; }
+        let n = ((da.abs() / (tau / 48.0)).ceil() as usize).clamp(2, 64);
+        for s in 1..=n {
+            let a = a0 + da * s as f32 / n as f32;
+            let (ex, ey) = (rx * a.cos(), ry * a.sin());
+            out.push((cos * ex - sin * ey + cx, sin * ex + cos * ey + cy));
+        }
+        if let Some(lastp) = out.last_mut() { *lastp = (x1, y1); }
     }
 
     // ── createGraphics(): off-screen layers ───────────────────────────────
@@ -3022,6 +3600,24 @@ pub fn image_sized(id: u64, x: f32, y: f32, w: f32, h: f32) {
 }
 pub fn image_width(id: u64)  -> f32 { render::image_size(id).0 }
 pub fn image_height(id: u64) -> f32 { render::image_size(id).1 }
+/// loadShape("drawing.svg"): an SVG file (also looked for in data/). Returns
+/// its id, or 0 if it can't be read.
+pub fn load_shape(path: &str) -> u64 { render::load_shape(path) }
+pub fn shape_width(id: u64)  -> f32 { render::shape_size(id).0 }
+pub fn shape_height(id: u64) -> f32 { render::shape_size(id).1 }
+/// shape(s, x, y): draws it at its own size, top-left corner at (x, y).
+pub fn shape(id: u64, x: f32, y: f32) {
+    let (w, h) = render::shape_size(id);
+    render::draw_shape(id, x, y, w, h);
+}
+/// shape(s, x, y, w, h)
+pub fn shape_sized(id: u64, x: f32, y: f32, w: f32, h: f32) { render::draw_shape(id, x, y, w, h); }
+/// Draw the shape with the sketch's fill and stroke, not the file's colors.
+pub fn shape_disable_style(id: u64) { render::shape_own_style(id, false); }
+/// Back to the colors in the file.
+pub fn shape_enable_style(id: u64) { render::shape_own_style(id, true); }
+#[inline] pub fn loadShape(path: &str) -> u64 { load_shape(path) }
+
 /// createGraphics(w, h): an off-screen layer, transparent to start with.
 /// Returns its id (0 if it could not be made).
 pub fn create_graphics(w: u32, h: u32) -> u64 { render::create_graphics(w, h) }
