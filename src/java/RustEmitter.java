@@ -57,6 +57,18 @@ public class RustEmitter {
    * lib.rs could still shadow after {@code use processing::*}.  Using the
    * fully-qualified path is unambiguous in all cases.
    */
+  /**
+   * Is the next thing after this name an opening parenthesis? Inside a macro
+   * (println!, format!) the parser sees loose tokens, not calls, so
+   * {@code mouse_x()} written there looks like a bare {@code mouse_x} and
+   * would be turned into {@code mouse_x()()}.
+   */
+  private static boolean followedByParen(Node node, char[] src) {
+    int i = node.getEndByte();
+    while (i < src.length && Character.isWhitespace(src[i])) i++;
+    return i < src.length && src[i] == '(';
+  }
+
   private static final Map<String, String> GLOBAL_FN_REMAP = Map.of(
     "mousePressed",  "processing::mouse_pressed_global",
     "mouse_pressed", "processing::mouse_pressed_global",
@@ -328,7 +340,8 @@ public class RustEmitter {
 
       case "identifier" -> {
         String name = slice(node, src);
-        if (GLOBAL_FNS.contains(name) && !isCallTarget(node, parent) && !isPattern(node, parent)) {
+        if (GLOBAL_FNS.contains(name) && !isCallTarget(node, parent) && !isPattern(node, parent)
+            && !followedByParen(node, src)) {
           // Use fully-qualified form for names that may collide with a user
           // lifecycle function (e.g. mousePressed, keyPressed, mouse_pressed, key_pressed).
           String callee = GLOBAL_FN_REMAP.getOrDefault(name, name);

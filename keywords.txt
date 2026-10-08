@@ -310,6 +310,20 @@ loadFont	FUNCTION1
 textFont	FUNCTION1
 textLeading	FUNCTION1
 
+filter	FUNCTION1
+filter_param	FUNCTION1
+rect_radii	FUNCTION1
+display_width	FUNCTION1
+display_height	FUNCTION1
+BLUR	KEYWORD2
+GRAY	KEYWORD2
+INVERT	KEYWORD2
+OPAQUE	KEYWORD2
+POSTERIZE	KEYWORD2
+THRESHOLD	KEYWORD2
+ERODE	KEYWORD2
+DILATE	KEYWORD2
+
 # ── Lifecycle functions ────────────────────────────────────────────────────────
 setup	FUNCTION2
 draw	FUNCTION2

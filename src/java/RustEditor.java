@@ -172,8 +172,9 @@ public class RustEditor extends Editor {
       statusNotice("Building with cargo...");
 
       Run run = new Run();
-      java.awt.Rectangle screen = present ? screenBounds() : null;
-      Thread t = new Thread(() -> doRun(run, screen), "RustMode-run");
+      java.awt.Rectangle display = screenBounds();
+      java.awt.Rectangle screen = present ? display : null;
+      Thread t = new Thread(() -> doRun(run, screen, display), "RustMode-run");
       t.setDaemon(true);
       run.thread = t;
       current = run;
@@ -189,7 +190,7 @@ public class RustEditor extends Editor {
   }
 
   /** Runs on the run's own thread. */
-  private void doRun(Run run, java.awt.Rectangle presentOn) {
+  private void doRun(Run run, java.awt.Rectangle presentOn, java.awt.Rectangle display) {
     try {
       // Quick checks with tree-sitter before cargo gets involved.
       String source = String.join("\n",
@@ -214,7 +215,7 @@ public class RustEditor extends Editor {
       if (run.stopped) return;
 
       statusNotice("Running " + sketch.getName() + "...");
-      int exit = runBinary(run, binary, presentOn);
+      int exit = runBinary(run, binary, presentOn, display);
       if (run.stopped) return;
       if (exit == 0) {
         statusNotice("Done.");
@@ -272,7 +273,7 @@ public class RustEditor extends Editor {
   }
 
   /** Starts the sketch and waits for it. Returns its exit status. */
-  private int runBinary(Run run, File binary, java.awt.Rectangle presentOn)
+  private int runBinary(Run run, File binary, java.awt.Rectangle presentOn, java.awt.Rectangle display)
       throws IOException, InterruptedException {
     ProcessBuilder pb = new ProcessBuilder(binary.getAbsolutePath());
     File dir = sketch.getFolder();
@@ -283,6 +284,13 @@ public class RustEditor extends Editor {
     // hour(), minute(), day()... in local time
     pb.environment().put("PROCESSING_UTC_OFFSET",
       String.valueOf(java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000));
+    // the screen this editor is on: full_screen(), display_width() and display_height() need it
+    if (display != null && display.width > 0 && display.height > 0) {
+      pb.environment().put("PROCESSING_DISPLAY",
+        display.width + "," + display.height + "," + display.x + "," + display.y);
+    } else {
+      pb.environment().remove("PROCESSING_DISPLAY");
+    }
     if (presentOn != null && presentOn.width > 0 && presentOn.height > 0) {
       pb.environment().put("PROCESSING_PRESENT",
         presentOn.width + "," + presentOn.height + "," + presentOn.x + "," + presentOn.y);

@@ -1058,26 +1058,32 @@ mod render {
     }
 
     pub fn draw_rect_rounded(x: f32, y: f32, w: f32, h: f32, r: f32) {
+        draw_rect_radii(x, y, w, h, [r, r, r, r])
+    }
+    /// Radii in Processing's order: top-left, top-right, bottom-right, bottom-left.
+    pub fn draw_rect_radii(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) {
         if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) { return; }
         // a negative size means the rect extends the other way
         let (x, w) = if w < 0.0 { (x + w, -w) } else { (x, w) };
         let (y, h) = if h < 0.0 { (y + h, -h) } else { (y, h) };
-        // Clamp radius so it fits inside the rectangle.
-        let r = r.min(w * 0.5).min(h * 0.5);
-        if !(r >= 1.0) { return draw_rect(x, y, w, h); }
+        // each radius has to fit inside the rectangle
+        let fit = |r: f32| if r.is_finite() && r > 0.0 { r.min(w * 0.5).min(h * 0.5) } else { 0.0 };
+        let [tl, tr, br, bl] = radii.map(fit);
+        if !(tl >= 1.0 || tr >= 1.0 || br >= 1.0 || bl >= 1.0) { return draw_rect(x, y, w, h); }
 
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         use std::f32::consts::{PI, FRAC_PI_2};
-        // one quarter circle per corner, joined into a single outline
+        // one quarter circle per corner (or the corner itself), joined into a single outline
         let mut pts = Vec::new();
-        for (ccx, ccy, a0) in [
-            (x + r,     y + r,     PI),              // top-left
-            (x + w - r, y + r,     PI + FRAC_PI_2),  // top-right
-            (x + w - r, y + h - r, 0.0),             // bottom-right
-            (x + r,     y + h - r, FRAC_PI_2),       // bottom-left
+        for (r, ccx, ccy, a0, corner) in [
+            (tl, x + tl,     y + tl,     PI,              (x, y)),
+            (tr, x + w - tr, y + tr,     PI + FRAC_PI_2,  (x + w, y)),
+            (br, x + w - br, y + h - br, 0.0,             (x + w, y + h)),
+            (bl, x + bl,     y + h - bl, FRAC_PI_2,       (x, y + h)),
         ] {
-            pts.extend(arc_points(ccx, ccy, r, r, a0, a0 + FRAC_PI_2, true));
+            if r >= 1.0 { pts.extend(arc_points(ccx, ccy, r, r, a0, a0 + FRAC_PI_2, true)); }
+            else { pts.push(tfm(corner.0, corner.1)); }
         }
         let mut buf = pixel_buf().lock();
         if let Some(fc) = fill { fill_poly(&mut buf, cw, ch, &pts, fc); }
@@ -1664,6 +1670,94 @@ mod render {
         for (d, s) in buf.iter_mut().zip(px.iter()) { *d = s & keep; }
     }
 
+    /// filter(): changes every pixel of what is being drawn on.
+    /// 11 BLUR (param: radius in pixels, default 1), 12 GRAY, 13 INVERT,
+    /// 14 OPAQUE, 15 POSTERIZE (param: levels 2..255), 16 THRESHOLD
+    /// (param: 0..1, default 0.5), 17 ERODE, 18 DILATE. Processing's numbers.
+    pub fn filter(kind: u32, param: f32) {
+        let (cw, ch) = canvas_dims();
+        let mut buf = pixel_buf().lock();
+        if cw == 0 || ch == 0 || buf.len() < cw * ch { return; }
+        let luma = |p: u32| -> u32 {
+            (77 * ((p >> 16) & 0xFF) + 151 * ((p >> 8) & 0xFF) + 28 * (p & 0xFF)) >> 8
+        };
+        match kind {
+            12 => for p in buf.iter_mut() { let l = luma(*p); *p = (*p & 0xFF00_0000) | (l << 16) | (l << 8) | l; },
+            13 => for p in buf.iter_mut() { *p = (*p & 0xFF00_0000) | (!*p & 0x00FF_FFFF); },
+            14 => for p in buf.iter_mut() { *p |= 0xFF00_0000; },
+            15 => {
+                let levels = if param.is_finite() { param.round().clamp(2.0, 255.0) as u32 } else { 4 };
+                let step = |v: u32| -> u32 { ((v * levels) >> 8) * 255 / (levels - 1) };
+                for p in buf.iter_mut() {
+                    *p = (*p & 0xFF00_0000) | (step((*p >> 16) & 0xFF) << 16) | (step((*p >> 8) & 0xFF) << 8) | step(*p & 0xFF);
+                }
+            }
+            16 => {
+                let level = if param.is_finite() { param.clamp(0.0, 1.0) } else { 0.5 };
+                let cut = (level * 255.0) as u32;
+                for p in buf.iter_mut() {
+                    // the brightest channel decides, as in Processing
+                    let m = ((*p >> 16) & 0xFF).max((*p >> 8) & 0xFF).max(*p & 0xFF);
+                    *p = (*p & 0xFF00_0000) | if m < cut { 0 } else { 0x00FF_FFFF };
+                }
+            }
+            17 | 18 => {
+                // each pixel takes its darkest (ERODE) or brightest (DILATE) neighbour
+                let src = buf.clone();
+                let dilate = kind == 18;
+                for y in 0..ch {
+                    for x in 0..cw {
+                        let mut best = src[y * cw + x];
+                        let mut best_l = luma(best);
+                        for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                            let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                            if nx < 0 || ny < 0 || nx >= cw as i32 || ny >= ch as i32 { continue; }
+                            let q = src[ny as usize * cw + nx as usize];
+                            let l = luma(q);
+                            if (dilate && l > best_l) || (!dilate && l < best_l) { best = q; best_l = l; }
+                        }
+                        buf[y * cw + x] = best;
+                    }
+                }
+            }
+            11 => {
+                let r = if param.is_finite() && param > 0.0 { param.min(256.0) } else { 1.0 };
+                // three passes of a box blur come very close to a Gaussian
+                let radius = ((r * 0.6).round() as usize).max(1);
+                let mut tmp = vec![0u32; buf.len()];
+                for _ in 0..3 {
+                    box_blur(&buf, &mut tmp, cw, ch, radius, true);
+                    box_blur(&tmp, &mut buf, cw, ch, radius, false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One pass of a box blur along rows (or columns), all four channels,
+    /// edges repeated.
+    fn box_blur(src: &[u32], dst: &mut [u32], w: usize, h: usize, radius: usize, rows: bool) {
+        let (lines, len) = if rows { (h, w) } else { (w, h) };
+        let at = |line: usize, i: usize| -> usize { if rows { line * w + i } else { i * w + line } };
+        let window = (2 * radius + 1) as u32;
+        for line in 0..lines {
+            let mut sum = [0u32; 4];
+            let add = |sum: &mut [u32; 4], p: u32| { for c in 0..4 { sum[c] += (p >> (c * 8)) & 0xFF; } };
+            let sub = |sum: &mut [u32; 4], p: u32| { for c in 0..4 { sum[c] -= (p >> (c * 8)) & 0xFF; } };
+            for k in 0..=2 * radius {
+                let i = (k as isize - radius as isize).clamp(0, len as isize - 1) as usize;
+                add(&mut sum, src[at(line, i)]);
+            }
+            for i in 0..len {
+                dst[at(line, i)] = (0..4).fold(0u32, |p, c| p | (((sum[c] + window / 2) / window).min(255) << (c * 8)));
+                let out = (i as isize - radius as isize).clamp(0, len as isize - 1) as usize;
+                let inn = (i as isize + radius as isize + 1).clamp(0, len as isize - 1) as usize;
+                sub(&mut sum, src[at(line, out)]);
+                add(&mut sum, src[at(line, inn)]);
+            }
+        }
+    }
+
     /// set(x, y, color): one pixel, no transform, no blending.
     pub fn set_pixel(x: i32, y: i32, col: Color) {
         let (cw, ch) = canvas_dims();
@@ -1980,7 +2074,28 @@ mod glfw {
         *WANT_H.get_or_init(|| Mutex::new(h)).lock().unwrap() = h;
         resize_canvas(w, h);
     }
-    pub fn set_fullscreen(_on: bool) {} // not supported on minifb
+    /// The screen the IDE's window is on, as (width, height, x, y), when the
+    /// IDE started this sketch (it passes PROCESSING_DISPLAY). None otherwise.
+    pub fn display() -> Option<(usize, usize, isize, isize)> {
+        let v = std::env::var("PROCESSING_DISPLAY").ok()?;
+        let n: Vec<i64> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        if n.len() == 4 && n[0] > 0 && n[1] > 0 {
+            Some((n[0] as usize, n[1] as usize, n[2] as isize, n[3] as isize))
+        } else { None }
+    }
+    /// fullScreen(): the canvas becomes the size of the screen and the window
+    /// covers it, without a border. Needs to know the screen, which only the
+    /// IDE tells us; run on its own, the sketch keeps its window.
+    pub fn set_fullscreen(on: bool) {
+        if !on { return; }
+        match display() {
+            Some((w, h, x, y)) => {
+                set_size(w as u32, h as u32);
+                set_present(w, h, x, y);
+            }
+            None => eprintln!("fullScreen() only works when the sketch is started from Processing; using a window instead"),
+        }
+    }
     pub fn set_frame_rate(f: f32) {
         // NaN, zero and negatives would stall or spin the loop
         let f = if f.is_finite() { f.clamp(1.0, 1000.0) } else { 60.0 };
@@ -2154,7 +2269,7 @@ mod glfw {
                     height: CANVAS_H.load(Ordering::Relaxed),
                     frame_count, mouse_pressed,
                     key: None, key_code: 0, key_pressed: false,
-                    millis, focused: true,
+                    millis, focused: window.is_active(),
                 };
 
                 // Mouse events
@@ -2478,6 +2593,15 @@ pub fn size(w: u32, h: u32) {
 }
 pub fn full_screen() {
     #[cfg(not(feature = "wasm"))] glfw::set_fullscreen(true);
+}
+/// Width of the screen the sketch was started on (0 when not started from the IDE).
+pub fn display_width() -> f32 {
+    #[cfg(not(feature = "wasm"))] { glfw::display().map(|d| d.0 as f32).unwrap_or(0.0) }
+    #[cfg(feature = "wasm")] { 0.0 }
+}
+pub fn display_height() -> f32 {
+    #[cfg(not(feature = "wasm"))] { glfw::display().map(|d| d.1 as f32).unwrap_or(0.0) }
+    #[cfg(feature = "wasm")] { 0.0 }
 }
 #[inline] pub fn fullScreen() { full_screen() }
 
@@ -2968,6 +3092,25 @@ pub fn load_pixels() -> Vec<u32> { render::copy_pixels() }
 pub fn update_pixels(pixels: &[u32]) { render::write_pixels(pixels); }
 #[inline] pub fn loadPixels() -> Vec<u32> { load_pixels() }
 #[inline] pub fn updatePixels(pixels: &[u32]) { update_pixels(pixels) }
+
+pub const BLUR:      u32 = 11;
+pub const GRAY:      u32 = 12;
+pub const INVERT:    u32 = 13;
+pub const OPAQUE:    u32 = 14;
+pub const POSTERIZE: u32 = 15;
+pub const THRESHOLD: u32 = 16;
+pub const ERODE:     u32 = 17;
+pub const DILATE:    u32 = 18;
+/// filter(GRAY), filter(INVERT), filter(BLUR)...: changes the whole canvas
+/// (or the layer being drawn on).
+pub fn filter(kind: u32) { render::filter(kind, f32::NAN); }
+/// filter(BLUR, radius), filter(THRESHOLD, 0..1), filter(POSTERIZE, levels)
+pub fn filter_param(kind: u32, param: f32) { render::filter(kind, param); }
+/// rect with a radius per corner: top-left, top-right, bottom-right, bottom-left.
+pub fn rect_radii(x: f32, y: f32, w: f32, h: f32, tl: f32, tr: f32, br: f32, bl: f32) {
+    let (x, y, w, h) = corner_box(RECT_MODE.load(Ordering::Relaxed), x, y, w, h);
+    render::draw_rect_radii(x, y, w, h, [tl, tr, br, bl]);
+}
 
 /// Sets one canvas pixel (r, g, b each 0..255). Not affected by transforms.
 pub fn set_pixel(x: i32, y: i32, r: f32, g: f32, b: f32) {

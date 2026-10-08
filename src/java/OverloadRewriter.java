@@ -25,7 +25,8 @@ final class OverloadRewriter {
     Map.entry("stroke",      Map.of(2, "stroke_ga",     3, "stroke_rgb",     4, "stroke_rgba")),
     Map.entry("background",  Map.of(2, "background_ga", 3, "background_rgb", 4, "background_rgba")),
     Map.entry("tint",        Map.of(2, "tint_ga",       3, "tint_rgb",       4, "tint_rgba")),
-    Map.entry("rect",        Map.of(5, "rect_rounded")),
+    Map.entry("rect",        Map.of(5, "rect_rounded", 8, "rect_radii")),
+    Map.entry("filter",      Map.of(2, "filter_param")),
     Map.entry("arc",         Map.of(7, "arc_mode")),
     Map.entry("image",       Map.of(5, "image_sized")),
     Map.entry("graphics_image", Map.of(5, "graphics_image_sized")),
@@ -44,7 +45,7 @@ final class OverloadRewriter {
   /** Float functions whose first argument is an image or layer, not a number to convert. */
   private static final Set<String> FIRST_ARG_AS_IS =
     Set.of("image", "image_sized", "graphics_image", "graphics_image_sized",
-           "create_font", "text_font_size");
+           "create_font", "text_font_size", "filter_param");
 
   /** Engine functions whose numeric parameters are all f32. */
   private static final Set<String> FLOAT_ARGS = Set.of(
@@ -59,7 +60,8 @@ final class OverloadRewriter {
     "arc_mode", "bezier", "curve", "shear_x", "shear_y", "apply_matrix",
     "tint", "tint_ga", "tint_rgb", "tint_rgba", "noise3",
     "image", "image_sized", "graphics_image", "graphics_image_sized",
-    "create_font", "text_font_size", "text_leading"
+    "create_font", "text_font_size", "text_leading",
+    "rect_radii", "filter_param"
   );
 
   private OverloadRewriter() {}
