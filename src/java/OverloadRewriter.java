@@ -47,7 +47,8 @@ final class OverloadRewriter {
   private static final Set<String> FIRST_ARG_AS_IS =
     Set.of("image", "image_sized", "graphics_image", "graphics_image_sized",
            "create_font", "text_font_size", "filter_param",
-           "shape", "shape_sized");
+           "shape", "shape_sized",
+           "sound_amp", "sound_pan", "sound_rate", "sound_jump", "osc_freq", "osc_amp", "osc_pan");
 
   /** Engine functions whose numeric parameters are all f32. */
   private static final Set<String> FLOAT_ARGS = Set.of(
@@ -63,7 +64,8 @@ final class OverloadRewriter {
     "tint", "tint_ga", "tint_rgb", "tint_rgba", "noise3",
     "image", "image_sized", "graphics_image", "graphics_image_sized",
     "create_font", "text_font_size", "text_leading",
-    "rect_radii", "filter_param", "shape", "shape_sized"
+    "rect_radii", "filter_param", "shape", "shape_sized",
+    "sound_amp", "sound_pan", "sound_rate", "sound_jump", "osc_freq", "osc_amp", "osc_pan"
   );
 
   private OverloadRewriter() {}
