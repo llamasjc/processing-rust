@@ -112,6 +112,8 @@ public class RustEditor extends Editor {
     if (TsRustTokenMarker.class.getResource("/queries/rust-highlights.scm") == null) return;
     SyntaxDocument doc = getTextArea().getDocument();
     if (doc == null || markers.containsKey(doc)) return;
+    // a query that doesn't load would mean no colors at all: keep the default ones
+    if (!TsRustTokenMarker.available()) return;
 
     TsRustTokenMarker marker = new TsRustTokenMarker();
     // highlights are rebuilt off the event thread; repaint once they're ready

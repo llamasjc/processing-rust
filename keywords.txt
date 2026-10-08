@@ -300,6 +300,16 @@ graphics_height	FUNCTION1
 clear	FUNCTION1
 createGraphics	FUNCTION1
 
+create_font	FUNCTION1
+load_font	FUNCTION1
+text_font	FUNCTION1
+text_font_size	FUNCTION1
+text_leading	FUNCTION1
+createFont	FUNCTION1
+loadFont	FUNCTION1
+textFont	FUNCTION1
+textLeading	FUNCTION1
+
 # ── Lifecycle functions ────────────────────────────────────────────────────────
 setup	FUNCTION2
 draw	FUNCTION2

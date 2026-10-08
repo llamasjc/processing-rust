@@ -1349,8 +1349,145 @@ mod render {
         [0x78,0x46,0x41,0x46,0x78], // DEL placeholder
     ];
 
+    // ── TrueType / OpenType fonts ─────────────────────────────────────────
+    //
+    // Font 0 is the built-in pixel font. createFont() loads a .ttf or .otf
+    // (or finds an installed font by name) and textFont() switches to it.
+
+    struct LoadedFont { font: std::sync::Arc<fontdue::Font>, size: f32 }
+    fn fonts() -> &'static parking_lot::Mutex<Vec<LoadedFont>> {
+        static F: std::sync::OnceLock<parking_lot::Mutex<Vec<LoadedFont>>> = std::sync::OnceLock::new();
+        F.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+    }
+    thread_local! {
+        static CUR_FONT: std::cell::Cell<usize> = std::cell::Cell::new(0);
+        static LEADING: std::cell::Cell<Option<f32>> = std::cell::Cell::new(None);
+        // rasterized glyphs: (font, character, size in quarter pixels)
+        static GLYPHS: std::cell::RefCell<std::collections::HashMap<(usize, char, u32), (fontdue::Metrics, Vec<u8>)>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    const MAX_FONTS: usize = 64;
+    const MAX_FONT_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// The file for a font given by path or by name, if there is one.
+    fn find_font(name: &str) -> Option<std::path::PathBuf> {
+        let direct = std::path::Path::new(name);
+        if direct.is_file() { return Some(direct.to_path_buf()); }
+        let in_data = std::path::Path::new("data").join(name);
+        if in_data.is_file() { return Some(in_data); }
+        // Not a file: ask the system for an installed font with that name
+        // (fontconfig: Linux, and macOS when it is installed).
+        if name.contains('/') || name.contains('\\') { return None; }
+        let out = std::process::Command::new("fc-match")
+            .arg("--format=%{file}").arg(name)
+            .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .output().ok()?;
+        let path = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if path.is_file() && (ext == "ttf" || ext == "otf" || ext == "ttc") { Some(path) } else { None }
+    }
+
+    /// Loads a font. Returns its id (1 or more), or 0 if it couldn't be loaded;
+    /// text then stays in the built-in font.
+    pub fn load_font(name: &str, size: f32) -> u64 {
+        let load = || -> Result<LoadedFont, String> {
+            let path = find_font(name).ok_or("no such file, and no installed font with that name")?;
+            let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+            if len > MAX_FONT_BYTES { return Err("font file is too large".into()); }
+            let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let font = fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
+                .map_err(|e| format!("{} ({})", e, path.display()))?;
+            Ok(LoadedFont { font: std::sync::Arc::new(font), size: if size.is_finite() && size > 0.0 { size } else { 0.0 } })
+        };
+        let mut all = fonts().lock();
+        if all.len() >= MAX_FONTS {
+            eprintln!("createFont(\"{}\"): too many fonts (load them once in setup(), not every frame)", name);
+            return 0;
+        }
+        match load() {
+            Ok(f)  => { all.push(f); all.len() as u64 }
+            Err(e) => { eprintln!("createFont(\"{}\"): {} (.ttf and .otf are supported)", name, e); 0 }
+        }
+    }
+    /// textFont(font): 0 is the built-in pixel font. A font made with a size
+    /// brings that size along; `size` (when above 0) overrides it.
+    pub fn set_text_font(id: u64, size: f32) {
+        let own = fonts().lock().get((id as usize).wrapping_sub(1)).map(|f| f.size);
+        match own {
+            Some(font_size) => {
+                CUR_FONT.with(|c| c.set(id as usize));
+                if size > 0.0 { set_text_size(size) } else if font_size > 0.0 { set_text_size(font_size) }
+            }
+            None => {
+                CUR_FONT.with(|c| c.set(0));
+                if size > 0.0 { set_text_size(size) }
+            }
+        }
+    }
+    /// textLeading(pixels): distance between lines; 0 or less goes back to the font's own.
+    pub fn set_text_leading(px: f32) { LEADING.with(|l| l.set(if px > 0.0 && px.is_finite() { Some(px.min(8192.0)) } else { None })); }
+
+    fn text_px() -> f32 { TEXT_SIZE.with(|ts| *ts.borrow()) }
+    /// Runs `f` with the current TrueType font, or returns None for the built-in one.
+    fn with_font<R>(f: impl FnOnce(&fontdue::Font) -> R) -> Option<R> {
+        let cur = CUR_FONT.with(|c| c.get());
+        if cur == 0 { return None; }
+        // hand out a reference of our own and let go of the list first: `f`
+        // may well ask for the font again (drawing text measures it)
+        let font = fonts().lock().get(cur - 1).map(|lf| lf.font.clone())?;
+        Some(f(&font))
+    }
+
+    /// One line of text in the current TrueType font, top-left corner at (lx, ly)
+    /// in sketch coordinates. Follows translate and scale, like images.
+    fn draw_text_line_ttf(font: &fontdue::Font, line: &str, lx: f32, ly: f32, fc: Color) {
+        let (tx, ty) = tfm(lx, ly);
+        if !(tx.is_finite() && ty.is_finite()) { return; }
+        let scale = matrix_scale().clamp(0.01, 64.0);
+        let px = (text_px() * scale).clamp(1.0, 2048.0);
+        let ascent = font.horizontal_line_metrics(px).map(|m| m.ascent).unwrap_or(px * 0.8);
+        let baseline = ty.clamp(-FAR, FAR) + ascent;
+        let font_id = CUR_FONT.with(|c| c.get());
+        let key_px = (px * 4.0).round() as u32;
+        let (cw, ch) = canvas_dims();
+        let mut buf = pixel_buf().lock();
+        let mut pen = tx.clamp(-FAR, FAR);
+        for c in line.chars() {
+            if pen >= cw as f32 { break; }      // nothing more of this line can land on the canvas
+            let advance = GLYPHS.with(|g| {
+                let mut g = g.borrow_mut();
+                if g.len() > 4096 { g.clear(); }
+                let (m, bitmap) = g.entry((font_id, c, key_px))
+                    .or_insert_with(|| font.rasterize(c, key_px as f32 / 4.0));
+                let gx = (pen + m.xmin as f32).round() as i32;
+                let gy = (baseline - m.height as f32 - m.ymin as f32).round() as i32;
+                if gx < cw as i32 && gx + m.width as i32 > 0 && gy < ch as i32 && gy + m.height as i32 > 0 {
+                    for row in 0..m.height {
+                        let y = gy + row as i32;
+                        if y < 0 || y >= ch as i32 { continue; }
+                        for col in 0..m.width {
+                            let cov = bitmap[row * m.width + col];
+                            if cov == 0 { continue; }
+                            put(&mut buf, cw, ch, gx + col as i32, y,
+                                Color::from_rgba(fc.r, fc.g, fc.b, fc.a * cov as f32 / 255.0));
+                        }
+                    }
+                }
+                m.advance_width
+            });
+            pen += advance;
+        }
+    }
+
     pub fn draw_text(s: &str, x: f32, y: f32) {
         let fc = match with_style(|s| s.fill) { Some(c) => c, None => return };
+        let drawn = with_font(|font| {
+            for (n, line) in s.split('\n').enumerate() {
+                let (lx, ly) = text_origin(line, x, y + n as f32 * text_leading());
+                draw_text_line_ttf(font, line, lx, ly, fc);
+            }
+        });
+        if drawn.is_some() { return; }
         // Each font pixel maps to `cell` output pixels.  Round to the nearest
         // integer so pixels are square and there are no spacing gaps.
         let cell = text_cell() as i32;
@@ -1391,6 +1528,12 @@ mod render {
 
     /// Width in pixels of `s` at the current text size (the widest line).
     pub fn text_width(s: &str) -> f32 {
+        let px = text_px();
+        let ttf = with_font(|font| {
+            s.split('\n').map(|l| l.chars().map(|c| font.metrics(c, px).advance_width).sum::<f32>())
+                .fold(0.0f32, f32::max)
+        });
+        if let Some(w) = ttf { return w; }
         let cell_f = text_cell();
         s.split('\n').map(|l| l.chars().count()).max().unwrap_or(0) as f32 * 6.0 * cell_f
     }
@@ -1419,10 +1562,23 @@ mod render {
         ((TEXT_SIZE.with(|ts| *ts.borrow()) / 8.0).max(1.0).round()) as f32
     }
     /// Distance from one line of text to the next.
-    fn text_leading() -> f32 { 10.0 * text_cell() }
-    /// Glyphs are 7 rows above the baseline and 1 below.
-    pub fn text_ascent() -> f32 { 7.0 * text_cell() }
-    pub fn text_descent() -> f32 { 1.0 * text_cell() }
+    fn text_leading() -> f32 {
+        if let Some(l) = LEADING.with(|l| l.get()) { return l; }
+        let px = text_px();
+        with_font(|f| f.horizontal_line_metrics(px).map(|m| m.new_line_size).unwrap_or(px * 1.2))
+            .unwrap_or_else(|| 10.0 * text_cell())
+    }
+    /// Built-in font: glyphs are 7 rows above the baseline and 1 below.
+    pub fn text_ascent() -> f32 {
+        let px = text_px();
+        with_font(|f| f.horizontal_line_metrics(px).map(|m| m.ascent).unwrap_or(px * 0.8))
+            .unwrap_or_else(|| 7.0 * text_cell())
+    }
+    pub fn text_descent() -> f32 {
+        let px = text_px();
+        with_font(|f| f.horizontal_line_metrics(px).map(|m| -m.descent).unwrap_or(px * 0.2))
+            .unwrap_or_else(|| 1.0 * text_cell())
+    }
     fn text_origin(s: &str, x: f32, y: f32) -> (f32, f32) {
         let (h, v) = TEXT_ALIGN.with(|a| a.get());
         let w = text_width(s);
@@ -1469,30 +1625,58 @@ mod render {
     /// Load a PNG. Returns a 1-based id, or 0 if it couldn't be read.
     pub fn load_image(path: &str) -> u64 {
         let decode = || -> Result<Img, String> {
-            let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            let mut dec = png::Decoder::new(f);
-            dec.set_transformations(png::Transformations::normalize_to_color8());
-            let mut rd = dec.read_info().map_err(|e| e.to_string())?;
-            let mut buf = vec![0; rd.output_buffer_size()];
-            let info = rd.next_frame(&mut buf).map_err(|e| e.to_string())?;
-            let (w, h) = (info.width as usize, info.height as usize);
-            let ch = info.color_type.samples();
-            let px = buf[..w * h * ch].chunks(ch).map(|p| {
-                let f = |v: u8| v as f32 / 255.0;
-                match ch {
-                    1 => Color::from_gray(f(p[0])),
-                    2 => Color::from_rgba(f(p[0]), f(p[0]), f(p[0]), f(p[1])),
-                    3 => Color::from_rgb(f(p[0]), f(p[1]), f(p[2])),
-                    _ => Color::from_rgba(f(p[0]), f(p[1]), f(p[2]), f(p[3])),
-                }
-            }).collect();
-            Ok(Img { w, h, px })
+            let data = std::fs::read(path).map_err(|e| e.to_string())?;
+            // by what the file is, not what it is called
+            if data.starts_with(&[0xFF, 0xD8]) { decode_jpeg(&data) }
+            else if data.starts_with(&[0x89, b'P', b'N', b'G']) { decode_png(&data) }
+            else { Err("not a PNG or JPEG file".into()) }
         };
         match decode() {
             Ok(img) => { let mut v = images().lock(); v.push(img); v.len() as u64 }
-            Err(e)  => { eprintln!("loadImage(\"{}\"): {} (only PNG is supported)", path, e); 0 }
+            Err(e)  => { eprintln!("loadImage(\"{}\"): {} (PNG and JPEG are supported)", path, e); 0 }
         }
     }
+
+    const MAX_IMAGE_PIXELS: usize = 64 * 1024 * 1024;
+
+    fn decode_png(data: &[u8]) -> Result<Img, String> {
+        let mut dec = png::Decoder::new(std::io::Cursor::new(data));
+        dec.set_transformations(png::Transformations::normalize_to_color8());
+        let mut rd = dec.read_info().map_err(|e| e.to_string())?;
+        let mut buf = vec![0; rd.output_buffer_size()];
+        let info = rd.next_frame(&mut buf).map_err(|e| e.to_string())?;
+        let (w, h) = (info.width as usize, info.height as usize);
+        let ch = info.color_type.samples();
+        if w * h > MAX_IMAGE_PIXELS { return Err("image is too large".into()); }
+        let px = buf[..w * h * ch].chunks(ch).map(|p| {
+            let f = |v: u8| v as f32 / 255.0;
+            match ch {
+                1 => Color::from_gray(f(p[0])),
+                2 => Color::from_rgba(f(p[0]), f(p[0]), f(p[0]), f(p[1])),
+                3 => Color::from_rgb(f(p[0]), f(p[1]), f(p[2])),
+                _ => Color::from_rgba(f(p[0]), f(p[1]), f(p[2]), f(p[3])),
+            }
+        }).collect();
+        Ok(Img { w, h, px })
+    }
+
+    fn decode_jpeg(data: &[u8]) -> Result<Img, String> {
+        use zune_jpeg::zune_core::{colorspace::ColorSpace, options::DecoderOptions};
+        let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+        let mut dec = zune_jpeg::JpegDecoder::new_with_options(data, options);
+        dec.decode_headers().map_err(|e| e.to_string())?;
+        let info = dec.info().ok_or("no image information")?;
+        let (w, h) = (info.width as usize, info.height as usize);
+        if w == 0 || h == 0 { return Err("empty image".into()); }
+        if w * h > MAX_IMAGE_PIXELS { return Err("image is too large".into()); }
+        let rgb = dec.decode().map_err(|e| e.to_string())?;
+        if rgb.len() < w * h * 3 { return Err("image data is cut short".into()); }
+        let px = rgb[..w * h * 3].chunks(3)
+            .map(|p| Color::from_rgb(p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0))
+            .collect();
+        Ok(Img { w, h, px })
+    }
+
     pub fn image_size(id: u64) -> (f32, f32) {
         let v = images().lock();
         v.get((id as usize).wrapping_sub(1)).map(|i| (i.w as f32, i.h as f32)).unwrap_or((0.0, 0.0))
@@ -2303,6 +2487,22 @@ pub fn pop_style()  { render::pop_style(); }
 pub fn text(s: &str, x: f32, y: f32)  { render::draw_text(s, x, y); }
 pub fn text_size(size: f32)            { render::set_text_size(size); }
 pub fn text_width(s: &str) -> f32      { render::text_width(s) }
+/// createFont("DejaVu Sans", 32) or createFont("data/MyFont.ttf", 32): a
+/// .ttf / .otf file, or the name of an installed font. Returns 0 if it can't
+/// be loaded (text then stays in the built-in font).
+pub fn create_font(name: &str, size: f32) -> u64 { render::load_font(name, size) }
+/// loadFont("MyFont.ttf"): same as create_font without a size.
+pub fn load_font(name: &str) -> u64 { render::load_font(name, 0.0) }
+/// textFont(font): use that font from now on. 0 is the built-in pixel font.
+pub fn text_font(font: u64) { render::set_text_font(font, 0.0); }
+/// textFont(font, size)
+pub fn text_font_size(font: u64, size: f32) { render::set_text_font(font, size); }
+/// textLeading(pixels): distance from one line of text to the next.
+pub fn text_leading(pixels: f32) { render::set_text_leading(pixels); }
+#[inline] pub fn createFont(name: &str, size: f32) -> u64 { create_font(name, size) }
+#[inline] pub fn loadFont(name: &str) -> u64 { load_font(name) }
+#[inline] pub fn textFont(font: u64) { text_font(font) }
+#[inline] pub fn textLeading(pixels: f32) { text_leading(pixels) }
 #[inline] pub fn textSize(size: f32)  { text_size(size) }
 #[inline] pub fn textWidth(s: &str) -> f32 { text_width(s) }
 

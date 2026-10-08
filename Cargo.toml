@@ -12,6 +12,10 @@ parking_lot = "0.12"
 minifb = "0.27"
 # PNG decoding for loadImage()
 png = "0.17"
+# JPEG decoding for loadImage()
+zune-jpeg = "0.4"
+# TrueType / OpenType text for createFont() and textFont()
+fontdue = "0.9"
 
 [features]
 default = []

@@ -79,7 +79,7 @@ public class TsRustTokenMarker extends TokenMarker {
     // ourselves and check captured text against them. Capture name -> regexes.
     private static volatile Map<String, List<Pattern>> matchPredicates = Map.of();
     private static final Pattern MATCH_PREDICATE =
-        Pattern.compile("\\(#match\\?\\s+@([\\w.]+)\\s+\"((?:[^\"\\\\]|\\\\.)*)\"\\s*\\)");
+        Pattern.compile("\\(#match\\?\\s+@([\\w.]+)\\s+\"((?:[^\"\\\\]++|\\\\.)*+)\"\\s*\\)");
 
     public TsRustTokenMarker() {}
 
@@ -284,6 +284,19 @@ public class TsRustTokenMarker extends TokenMarker {
     }
 
     // ── Query loading ─────────────────────────────────────────────────────
+
+    /**
+     * Whether highlighting can work at all (the query loads and compiles).
+     * The editor asks before installing a marker, so that a broken query
+     * leaves Processing's own keyword colors in place instead of none.
+     */
+    static boolean available() {
+        try {
+            return ensureQuery() != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 
     private static Query ensureQuery() {
         if (tsQuery != null || queryFailed) return tsQuery;
