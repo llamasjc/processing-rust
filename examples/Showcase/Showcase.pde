@@ -45,11 +45,12 @@ fn draw() {
     arc(300, 220, 90, 90, 0, 4.5, CHORD);
     arc(410, 220, 90, 90, 0, 4.5, PIE);
 
-    // rectMode, shear, and a blend mode that brightens what is under it
+    // rectMode, a turning sheared shape, and a blend mode that brightens what is under it
     no_stroke();
     rect_mode(CENTER);
     push_matrix();
     translate(620, 90);
+    rotate(frame_count() as f32 * 0.02);
     shear_x(0.35);
     fill(200, 80, 200);
     rect(0, 0, 90, 60);
@@ -71,8 +72,12 @@ fn draw() {
     // text in a real font, with the local time
     text_font(font);
     fill(255);
+    push_matrix();
+    translate(30, 330);
+    rotate(-0.03);
     text(&format!("{:02}:{:02}:{:02}   clicks: {}   fps: {:.0}",
-                  hour(), minute(), second(), clicks, current_frame_rate()), 30, 330);
+                  hour(), minute(), second(), clicks, current_frame_rate()), 0, 0);
+    pop_matrix();
     text_font(0);
     text_size(16);
     fill(160, 170, 190);

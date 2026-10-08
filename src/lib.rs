@@ -1441,6 +1441,7 @@ mod render {
     /// One line of text in the current TrueType font, top-left corner at (lx, ly)
     /// in sketch coordinates. Follows translate and scale, like images.
     fn draw_text_line_ttf(font: &fontdue::Font, line: &str, lx: f32, ly: f32, fc: Color) {
+        if turned() { return draw_text_line_ttf_turned(font, line, lx, ly, fc); }
         let (tx, ty) = tfm(lx, ly);
         if !(tx.is_finite() && ty.is_finite()) { return; }
         let scale = matrix_scale().clamp(0.01, 64.0);
@@ -1479,6 +1480,39 @@ mod render {
         }
     }
 
+    /// The same line under rotate() or shear: every glyph is rasterized at the
+    /// size it will have on screen, then placed through the transform like a
+    /// small image.
+    fn draw_text_line_ttf_turned(font: &fontdue::Font, line: &str, lx: f32, ly: f32, fc: Color) {
+        let scale = matrix_scale().clamp(0.01, 64.0);
+        let size = text_px();
+        let px = (size * scale).clamp(1.0, 2048.0);
+        let k = size / px;                                  // glyph pixels -> sketch units
+        let ascent = font.horizontal_line_metrics(size).map(|m| m.ascent).unwrap_or(size * 0.8);
+        let baseline = ly + ascent;
+        let font_id = CUR_FONT.with(|c| c.get());
+        let key_px = (px * 4.0).round() as u32;
+        let saved_tint = TINT.with(|t| t.replace(None));    // tint is for images, not letters
+        let mut pen = lx;
+        for c in line.chars() {
+            let glyph = GLYPHS.with(|g| {
+                let mut g = g.borrow_mut();
+                if g.len() > 4096 { g.clear(); }
+                g.entry((font_id, c, key_px)).or_insert_with(|| font.rasterize(c, key_px as f32 / 4.0)).clone()
+            });
+            let (m, bitmap) = glyph;
+            if m.width > 0 && m.height > 0 {
+                let gx = pen + m.xmin as f32 * k;
+                let gy = baseline - (m.height as f32 + m.ymin as f32) * k;
+                blit(m.width, m.height,
+                     &|i| Color::from_rgba(fc.r, fc.g, fc.b, fc.a * bitmap[i] as f32 / 255.0),
+                     gx, gy, m.width as f32 * k, m.height as f32 * k);
+            }
+            pen += m.advance_width * k;
+        }
+        TINT.with(|t| t.set(saved_tint));
+    }
+
     pub fn draw_text(s: &str, x: f32, y: f32) {
         let fc = match with_style(|s| s.fill) { Some(c) => c, None => return };
         let drawn = with_font(|font| {
@@ -1493,6 +1527,33 @@ mod render {
         let cell = text_cell() as i32;
         let cell_f = cell as f32;
         let (cw, canvas_h) = canvas_dims();
+        if turned() {
+            // under rotate() or shear the cells are no longer rows of pixels:
+            // draw each run of lit cells as a four-cornered shape
+            let mut buf = pixel_buf().lock();
+            for (n, line) in s.split('\n').enumerate() {
+                let (lx, ly) = text_origin(line, x, y + n as f32 * text_leading());
+                for (i, c) in line.chars().enumerate() {
+                    let code = c as u32;
+                    if !(32..=127).contains(&code) { continue; }
+                    let glyph = &FONT5X8[(code - 32) as usize];
+                    let gx = lx + i as f32 * 6.0 * cell_f;
+                    for col in 0..5usize {
+                        let bits = glyph[col];
+                        let mut row = 0usize;
+                        while row < 8 {
+                            if bits & (1 << row) == 0 { row += 1; continue; }
+                            let start = row;
+                            while row < 8 && bits & (1 << row) != 0 { row += 1; }
+                            let (x0, x1) = (gx + col as f32 * cell_f, gx + (col + 1) as f32 * cell_f);
+                            let (y0, y1) = (ly + start as f32 * cell_f, ly + row as f32 * cell_f);
+                            fill_poly(&mut buf, cw, canvas_h, &[tfm(x0, y0), tfm(x1, y0), tfm(x1, y1), tfm(x0, y1)], fc);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let mut buf = pixel_buf().lock();
         // "\n" starts a new line; each line is aligned on its own
         for (n, line) in s.split('\n').enumerate() {
@@ -1681,39 +1742,73 @@ mod render {
         let v = images().lock();
         v.get((id as usize).wrapping_sub(1)).map(|i| (i.w as f32, i.h as f32)).unwrap_or((0.0, 0.0))
     }
-    /// Draw an image scaled into (x, y, w, h). Follows translate/scale; ignores
-    /// rotation (the box is placed at the transformed corners).
+    /// Draw an image scaled into (x, y, w, h), through the current transform.
     pub fn draw_image(id: u64, x: f32, y: f32, w: f32, h: f32) {
         let imgs = images().lock();
         let img = match imgs.get((id as usize).wrapping_sub(1)) { Some(i) => i, None => return };
         blit(img.w, img.h, &|i| img.px[i], x, y, w, h);
     }
 
+    /// Is the current transform more than moving and scaling?
+    fn turned() -> bool {
+        let m = current_matrix();
+        m[1].abs() > 1.0e-6 || m[2].abs() > 1.0e-6
+    }
+
     /// Paints a source picture of iw x ih pixels into (x, y, w, h), with the
-    /// current tint. `sample(i)` is source pixel i, row by row.
+    /// current tint. `sample(i)` is source pixel i, row by row. Follows the
+    /// whole transform, rotation and shear included: every canvas pixel in the
+    /// picture's outline is traced back to the source pixel it shows. Scaled
+    /// or turned pictures are smoothed (blended between neighbouring source
+    /// pixels) unless noSmooth() is on; one drawn at its own size and upright
+    /// is copied pixel for pixel.
     fn blit(iw: usize, ih: usize, sample: &dyn Fn(usize) -> Color, x: f32, y: f32, w: f32, h: f32) {
         if iw == 0 || ih == 0 { return; }
-        let (x0, y0) = tfm(x, y);
-        let (x1, y1) = tfm(x + w, y + h);
-        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) { return; }
-        let (lx, hx) = (x0.min(x1), x0.max(x1));
-        let (ly, hy) = (y0.min(y1), y0.max(y1));
+        if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) || w == 0.0 || h == 0.0 { return; }
+        let m = current_matrix();
+        let det = m[0] * m[3] - m[2] * m[1];
+        if !det.is_finite() || det.abs() < 1.0e-12 { return; }      // squashed flat: nothing to see
+        let corners = [tfm(x, y), tfm(x + w, y), tfm(x + w, y + h), tfm(x, y + h)];
+        if corners.iter().any(|c| !(c.0.is_finite() && c.1.is_finite())) { return; }
+        let (mut lx, mut hx, mut ly, mut hy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for c in &corners { lx = lx.min(c.0); hx = hx.max(c.0); ly = ly.min(c.1); hy = hy.max(c.1); }
         if hx - lx < 1.0 || hy - ly < 1.0 { return; }
         let tint = TINT.with(|t| t.get());
         let (cw, ch) = canvas_dims();
+        let upright = !turned();
+        let same_size = upright && ((hx - lx) - iw as f32).abs() < 0.01 && ((hy - ly) - ih as f32).abs() < 0.01;
+        let smooth = smooth_on() && !same_size;
+        // from a canvas point back to sketch coordinates
+        let (ia, ib, ic, id) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
         let mut buf = pixel_buf().lock();
         // only the part of the picture that is on the canvas
         let (py0, py1) = (ly.floor().max(0.0) as i32, hy.ceil().min(ch as f32) as i32);
         let (px0, px1) = (lx.floor().max(0.0) as i32, hx.ceil().min(cw as f32) as i32);
         for py in py0..py1 {
-            let v = (py as f32 + 0.5 - ly) / (hy - ly);
-            if !(0.0..1.0).contains(&v) { continue; }
-            let sy = ((v * ih as f32) as usize).min(ih - 1);
             for px in px0..px1 {
-                let u = (px as f32 + 0.5 - lx) / (hx - lx);
-                if !(0.0..1.0).contains(&u) { continue; }
-                let sx = ((u * iw as f32) as usize).min(iw - 1);
-                let mut c = sample(sy * iw + sx);
+                let (dx, dy) = (px as f32 + 0.5 - m[4], py as f32 + 0.5 - m[5]);
+                let u = ((ia * dx + ic * dy) - x) / w;
+                let v = ((ib * dx + id * dy) - y) / h;
+                if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) { continue; }
+                let mut c = if smooth {
+                    // between the four nearest source pixels
+                    let (fx, fy) = ((u * iw as f32 - 0.5).max(0.0), (v * ih as f32 - 0.5).max(0.0));
+                    let (x0, y0) = ((fx as usize).min(iw - 1), (fy as usize).min(ih - 1));
+                    let (x1, y1) = ((x0 + 1).min(iw - 1), (y0 + 1).min(ih - 1));
+                    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                    let (c00, c10, c01, c11) = (sample(y0 * iw + x0), sample(y0 * iw + x1), sample(y1 * iw + x0), sample(y1 * iw + x1));
+                    // weigh colors by their alpha so transparent neighbours don't darken edges
+                    let wsum = |f: fn(&Color) -> f32| -> f32 {
+                        (f(&c00) * (1.0 - tx) + f(&c10) * tx) * (1.0 - ty) + (f(&c01) * (1.0 - tx) + f(&c11) * tx) * ty
+                    };
+                    let a = wsum(|c| c.a);
+                    if a <= 0.0 { continue; }
+                    Color::from_rgba(wsum(|c| c.r * c.a) / a, wsum(|c| c.g * c.a) / a, wsum(|c| c.b * c.a) / a, a)
+                } else {
+                    let sx = ((u * iw as f32) as usize).min(iw - 1);
+                    let sy = ((v * ih as f32) as usize).min(ih - 1);
+                    sample(sy * iw + sx)
+                };
                 if let Some(t) = tint { c = Color::from_rgba(c.r * t.r, c.g * t.g, c.b * t.b, c.a * t.a); }
                 if c.a > 0.0 { put(&mut buf, cw, ch, px, py, c); }
             }
