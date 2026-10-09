@@ -1616,6 +1616,7 @@ mod render {
         static TEXT_ALIGN: std::cell::Cell<(u8, u8)> = std::cell::Cell::new((0, 0));
     }
     pub fn set_text_align(h: u8, v: u8) { TEXT_ALIGN.with(|a| a.set((h.min(2), v.min(3)))); }
+    pub fn text_align_v() -> u8 { TEXT_ALIGN.with(|a| a.get().1) }
     fn text_cell() -> f32 {
         ((TEXT_SIZE.with(|ts| *ts.borrow()) / 8.0).max(1.0).round()) as f32
     }
@@ -1648,6 +1649,58 @@ mod render {
             _ => y,
         };
         (x, y)
+    }
+
+    /// Breaks text into lines no wider than `w` at the current font and size.
+    /// Words longer than a line are split between letters; "\n" always breaks.
+    pub fn wrap_text(s: &str, w: f32) -> Vec<String> {
+        let mut out = Vec::new();
+        for para in s.split('\n') {
+            let mut line = String::new();
+            for word in para.split(' ') {
+                let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+                if text_width(&candidate) <= w || (line.is_empty() && word.is_empty()) {
+                    line = candidate;
+                    continue;
+                }
+                if !line.is_empty() { out.push(std::mem::take(&mut line)); }
+                // the word alone may still be too wide: split it by letters
+                let mut piece = String::new();
+                for c in word.chars() {
+                    piece.push(c);
+                    if text_width(&piece) > w && piece.chars().count() > 1 {
+                        piece.pop();
+                        out.push(std::mem::take(&mut piece));
+                        piece.push(c);
+                    }
+                }
+                line = piece;
+            }
+            out.push(line);
+        }
+        out
+    }
+    /// text(s, x, y, w, h): wrapped inside the box. textAlign picks left,
+    /// center or right inside it, and top, center or bottom for the block.
+    /// Lines that don't fit in the height are left out, like Processing.
+    pub fn draw_text_box(s: &str, x: f32, y: f32, w: f32, h: f32) {
+        if !(w > 0.0 && h > 0.0) { return; }
+        let lines = wrap_text(s, w);
+        let lead = text_leading();
+        let line_h = text_ascent() + text_descent();
+        // how many lines fit
+        let mut fit = 0usize;
+        while fit < lines.len() && (fit as f32) * lead + line_h <= h + 0.5 { fit += 1; }
+        if fit == 0 { return; }
+        let block = (fit - 1) as f32 * lead + line_h;
+        let (ha, va) = TEXT_ALIGN.with(|a| a.get());
+        let top = match va { 1 => y + (h - block) / 2.0, 2 => y + h - block, _ => y };
+        let ax = match ha { 1 => x + w / 2.0, 2 => x + w, _ => x };
+        TEXT_ALIGN.with(|a| a.set((ha, 0)));
+        for (i, line) in lines.iter().take(fit).enumerate() {
+            draw_text(line, ax, top + i as f32 * lead);
+        }
+        TEXT_ALIGN.with(|a| a.set((ha, va)));
     }
 
     /// The whole canvas, row by row, as 0xAARRGGBB (alpha always 255).
@@ -3674,12 +3727,32 @@ pub const ALIGN_TOP:      u8 = 0;
 pub const ALIGN_BOTTOM:   u8 = 2;
 pub const ALIGN_BASELINE: u8 = 3;
 
-/// h: ALIGN_LEFT / ALIGN_CENTER / ALIGN_RIGHT.
-/// v: ALIGN_TOP / ALIGN_CENTER / ALIGN_BOTTOM / ALIGN_BASELINE.
-pub fn text_align(h: u8, v: u8) { render::set_text_align(h, v); }
+pub const TOP:      u32 = 101;
+pub const BOTTOM:   u32 = 102;
+pub const BASELINE: u32 = 0;
+
+/// A text alignment: Processing's LEFT / CENTER / RIGHT / TOP / BOTTOM /
+/// BASELINE, or the older ALIGN_* names.
+pub trait Align: Copy { fn h(self) -> u8; fn v(self) -> u8; }
+impl Align for u8 { fn h(self) -> u8 { self.min(2) } fn v(self) -> u8 { self.min(3) } }
+impl Align for u32 {
+    fn h(self) -> u8 { match self { CENTER => 1, RIGHT => 2, _ => 0 } }
+    fn v(self) -> u8 { match self { CENTER => 1, BOTTOM => 2, BASELINE => 3, _ => 0 } }
+}
+impl Align for i32 { fn h(self) -> u8 { (self.max(0) as u32).h() } fn v(self) -> u8 { (self.max(0) as u32).v() } }
+
+/// text_align(CENTER, CENTER), text_align(RIGHT, BOTTOM)...
+/// h: LEFT / CENTER / RIGHT.  v: TOP / CENTER / BOTTOM / BASELINE.
+pub fn text_align(h: impl Align, v: impl Align) { render::set_text_align(h.h(), v.v()); }
+/// text_align(RIGHT): only the horizontal side, the vertical stays as it was.
+pub fn text_align_h(h: impl Align) { render::set_text_align(h.h(), render::text_align_v()); }
 pub fn text_ascent()  -> f32 { render::text_ascent() }
+/// text(s, x, y, w, h): the text wrapped to fit inside a box.
+pub fn text_box(s: &str, x: f32, y: f32, w: f32, h: f32) { render::draw_text_box(s, x, y, w, h) }
+/// The lines text_box would draw, for measuring or drawing them yourself.
+pub fn wrap_text(s: &str, w: f32) -> Vec<String> { render::wrap_text(s, w) }
 pub fn text_descent() -> f32 { render::text_descent() }
-#[inline] pub fn textAlign(h: u8, v: u8) { text_align(h, v) }
+#[inline] pub fn textAlign(h: impl Align, v: impl Align) { text_align(h, v) }
 #[inline] pub fn textAscent() -> f32 { text_ascent() }
 #[inline] pub fn textDescent() -> f32 { text_descent() }
 
@@ -4120,12 +4193,10 @@ pub fn load_shape(path: &str) -> u64 { render::load_shape(path) }
 pub fn shape_width(id: u64)  -> f32 { render::shape_size(id).0 }
 pub fn shape_height(id: u64) -> f32 { render::shape_size(id).1 }
 /// shape(s, x, y): draws it at its own size, top-left corner at (x, y).
-pub fn shape(id: u64, x: f32, y: f32) {
-    let (w, h) = render::shape_size(id);
-    render::draw_shape(id, x, y, w, h);
-}
+/// Works for SVGs from load_shape and shapes from create_shape (pass &shape).
+pub fn shape(s: impl ShapeRef, x: impl Num, y: impl Num) { s.draw_at(x.f(), y.f(), None) }
 /// shape(s, x, y, w, h)
-pub fn shape_sized(id: u64, x: f32, y: f32, w: f32, h: f32) { render::draw_shape(id, x, y, w, h); }
+pub fn shape_sized(s: impl ShapeRef, x: impl Num, y: impl Num, w: impl Num, h: impl Num) { s.draw_at(x.f(), y.f(), Some((w.f(), h.f()))) }
 /// Draw the shape with the sketch's fill and stroke, not the file's colors.
 pub fn shape_disable_style(id: u64) { render::shape_own_style(id, false); }
 /// Back to the colors in the file.
@@ -4697,3 +4768,23 @@ mod image_tests {
         assert_eq!(image_get(9999, 0, 0).a, 0.0);
     }
 }
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+    #[test]
+    fn wrapping() {
+        // built-in font: 6 px per letter at size 8
+        text_size(8.0);
+        assert_eq!(wrap_text("aa bb cc", 30.0), vec!["aa bb", "cc"]);
+        assert_eq!(wrap_text("abcdefghij", 30.0), vec!["abcde", "fghij"]);
+        assert_eq!(wrap_text("one\ntwo", 1000.0), vec!["one", "two"]);
+        assert_eq!(wrap_text("", 30.0), vec![""]);
+        for l in wrap_text("the quick brown fox jumps over the lazy dog", 40.0) { assert!(text_width(&l) <= 40.0, "{l}"); }
+    }
+}
+
+// createShape (see pshape.rs).
+mod pshape;
+pub use pshape::{PShape, ShapeRef, create_shape, create_shape_group, create_shape_rect, create_shape_ellipse,
+                 create_shape_line, create_shape_triangle, create_shape_quad, createShape};

@@ -497,6 +497,11 @@ public class RustEmitter {
     Map.entry("get_region", "u64"), Map.entry("image_copy", "u64"), Map.entry("image_crop", "u64"),
     Map.entry("color", "Color"), Map.entry("color_rgb", "Color"), Map.entry("color_rgba", "Color"),
     Map.entry("color_ga", "Color"), Map.entry("hex_color", "Color"), Map.entry("lerp_color", "Color"),
+    Map.entry("create_shape", "PShape"), Map.entry("createShape", "PShape"),
+    Map.entry("create_shape_group", "PShape"), Map.entry("create_shape_rect", "PShape"),
+    Map.entry("create_shape_ellipse", "PShape"), Map.entry("create_shape_line", "PShape"),
+    Map.entry("create_shape_triangle", "PShape"), Map.entry("create_shape_quad", "PShape"),
+    Map.entry("wrap_text", "Vec<String>"),
     Map.entry("random", "f32"), Map.entry("noise", "f32"), Map.entry("millis", "u64"));
 
   static String inferType(String init) {

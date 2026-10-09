@@ -42,8 +42,14 @@ final class OverloadRewriter {
     Map.entry("color_mode",  Map.of(2, "color_mode_range", 4, "color_mode3", 5, "color_mode_max")),
     Map.entry("colorMode",   Map.of(2, "color_mode_range", 4, "color_mode3", 5, "color_mode_max")),
     Map.entry("nf",          Map.of(3, "nf_float")),
-    Map.entry("nfc",         Map.of(2, "nfc_float"))
+    Map.entry("nfc",         Map.of(2, "nfc_float")),
+    Map.entry("text",        Map.of(5, "text_box")),
+    Map.entry("text_align",  Map.of(1, "text_align_h")),
+    Map.entry("textAlign",   Map.of(1, "text_align_h"))
   );
+
+  /** Method names rewritten like the free functions, for PShape. */
+  private static final Set<String> METHOD_OVERLOADS = Set.of("fill", "stroke", "begin_shape", "end_shape", "scale");
 
   /** Float functions whose last argument is a constant (PIE, CHORD...), not a number to convert. */
   private static final Set<String> LAST_ARG_AS_IS = Set.of("arc_mode");
@@ -74,7 +80,7 @@ final class OverloadRewriter {
     "sound_amp", "sound_pan", "sound_rate", "sound_jump", "osc_freq", "osc_amp", "osc_pan",
     "color", "color_ga", "color_rgb", "color_rgba",
     "color_mode_range", "color_mode3", "color_mode_max",
-    "sq", "norm", "bezier_point", "bezier_tangent", "curve_point", "curve_tangent"
+    "text_box", "sq", "norm", "bezier_point", "bezier_tangent", "curve_point", "curve_tangent"
   );
 
   private OverloadRewriter() {}
@@ -86,6 +92,33 @@ final class OverloadRewriter {
       char c = src.charAt(i);
       int skip = skipNonCode(src, i);
       if (skip > i) { out.append(src, i, skip); i = skip; continue; }
+      // shape.fill(255, 200, 0) -> shape.fill_rgb(...): PShape has the same
+      // overloads as the drawing functions. Arguments take any number type there.
+      if (Character.isJavaIdentifierStart(c) && i > 0 && src.charAt(i - 1) == '.'
+          && (i < 2 || src.charAt(i - 2) != '.')) {
+        int j = i;
+        while (j < n && Character.isJavaIdentifierPart(src.charAt(j))) j++;
+        String name = src.substring(i, j);
+        int k = j;
+        while (k < n && (src.charAt(k) == ' ' || src.charAt(k) == '\t')) k++;
+        if (METHOD_OVERLOADS.contains(name) && k < n && src.charAt(k) == '(') {
+          int close = matchParen(src, k);
+          if (close > 0) {
+            List<String> args = splitArgs(src.substring(k + 1, close));
+            boolean empty = args.size() == 1 && args.get(0).isBlank();
+            int count = empty ? 0 : args.size();
+            String target = OVERLOADS.getOrDefault(name, Map.of()).getOrDefault(count, name);
+            List<String> fixed = new ArrayList<>();
+            for (String a : args) fixed.add(rewrite(a));
+            out.append(target).append(src, j, k + 1).append(String.join(",", fixed)).append(')');
+            i = close + 1;
+            continue;
+          }
+        }
+        out.append(name);
+        i = j;
+        continue;
+      }
       if (Character.isJavaIdentifierStart(c) && (i == 0 || !isIdentOrPath(src.charAt(i - 1)))) {
         int j = i;
         while (j < n && Character.isJavaIdentifierPart(src.charAt(j))) j++;

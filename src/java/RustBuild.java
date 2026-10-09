@@ -253,6 +253,18 @@ public class RustBuild {
       "codegen-units = 1\n";
 
     writeFile(new File(root, "Cargo.toml"), cargoToml);
+    // Start from the engine's own Cargo.lock: the same dependency versions
+    // the mode was tested with (and ones that build on Rust 1.82), and no
+    // index lookup on the first build.
+    File lock = new File(root, "Cargo.lock");
+    File modeLock = new File(mode.getFolder(), "Cargo.lock");
+    if (!lock.exists() && modeLock.isFile()) {
+      try {
+        Files.copy(modeLock.toPath(), lock.toPath());
+      } catch (IOException e) {
+        // cargo will make its own
+      }
+    }
 
     // ── processing/ ───────────────────────────────────────────────────────────
     // The crate source lives in RustMode/src/lib.rs and RustMode/Cargo.toml.
