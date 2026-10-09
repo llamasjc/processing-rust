@@ -93,7 +93,7 @@ public class RustBuild {
 
   /** Shared cargo target dir: dependencies are compiled once for all sketches. */
   private static File sharedTarget() {
-    return new File(Base.getSketchbookFolder(), "rust-build-cache/.shared-target");
+    return new File(Compat.sketchbookFolder(null), "rust-build-cache/.shared-target");
   }
 
   // ── Construction ────────────────────────────────────────────────────────────
@@ -182,7 +182,7 @@ public class RustBuild {
    * </pre>
    */
   private File ensureCacheProject() throws IOException {
-    File cacheRoot = new File(Base.getSketchbookFolder(),
+    File cacheRoot = new File(Compat.sketchbookFolder(null),
                               "rust-build-cache/" + sanitiseName(sketch.getName()));
     cacheRoot.mkdirs();
 
@@ -480,7 +480,7 @@ public class RustBuild {
 
       File sharedDeps = new File(sharedTarget(), "debug/deps");
 
-      File stamp = new File(Base.getSketchbookFolder(),
+      File stamp = new File(Compat.sketchbookFolder(null),
         "rust-build-cache/.prebuilt-stamp-" + platform);
 
       // Re-extract if bundle is newer than stamp

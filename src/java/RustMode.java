@@ -149,7 +149,7 @@ public class RustMode extends Mode {
 
   /** Send a line of cargo output to every open RustMode editor. */
   public void statusMessage(String msg) {
-    for (Editor ed : base.getEditors()) {
+    for (Editor ed : Compat.editors(base)) {
       if (ed instanceof RustEditor re) {
         re.statusMessage(msg);
       }
