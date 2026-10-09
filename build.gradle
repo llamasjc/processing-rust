@@ -1,10 +1,10 @@
 // RustMode build.gradle
 //
-// Standalone build — does not require the processing4 source tree.
+// Standalone build. Finds the installed Processing on its own (see below).
 //
 // Usage (run from RustMode/):
 //   gradle jar                       # build RustMode.jar
-//   gradle jar -Pcore=/path/core.jar # explicit core.jar path
+//   PROCESSING_DIR=/usr/lib/processing gradle jar   # if it cannot find it
 //
 // Or from the processing4 root if you have the full checkout:
 //   ./gradlew :RustMode:jar
@@ -23,82 +23,55 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
-// ── Locate Processing core.jar ────────────────────────────────────────────────
+// ── Locate Processing ────────────────────────────────────────────────────────
 //
-// Search order:
-//   1. -Pcore=<path>  (explicit override)
-//   2. $PROCESSING4_CORE env var
-//   3. ~/processing-4/core/library/core.jar   (Linux installer default)
-//   4. /opt/processing/core/library/core.jar
-//   5. /usr/local/lib/processing/core/library/core.jar
-//   6. macOS app bundle: /Applications/Processing.app/…/core.jar
-//   7. Gradle cache (if core was previously resolved via the processing4 build)
-//
-// If none of these exist at configure time the build still succeeds if you
-// set the `core` property — it is only checked when compileJava runs.
-
-def coreJar = null
-
-if (project.hasProperty('core')) {
-    coreJar = file(project.property('core'))
-} else if (System.getenv('PROCESSING4_CORE')) {
-    coreJar = file(System.getenv('PROCESSING4_CORE'))
-} else {
-    def candidates = [
-        "${System.getProperty('user.home')}/processing-4/core/library/core.jar",
-        "${System.getProperty('user.home')}/processing4/core/library/core.jar",
-        "/opt/processing/core/library/core.jar",
-        "/opt/processing4/core/library/core.jar",
-        "/usr/local/lib/processing/core/library/core.jar",
-        "/Applications/Processing.app/Contents/Java/core/library/core.jar",
-    ]
-    for (candidate in candidates) {
-        def f = file(candidate)
-        if (f.exists()) { coreJar = f; break }
-    }
-}
-
-if (coreJar == null) {
-    logger.warn("""
-WARNING: Processing core.jar not found. Build will fail at compile time.
-Fix options:
-  gradle jar -Pcore=/path/to/core.jar
-  export PROCESSING4_CORE=/path/to/core.jar
-  Install Processing 4 to ~/processing-4/ (Linux) or /Applications/ (macOS)
-""")
-    // Use a placeholder so configure phase succeeds.
-    coreJar = file("${System.getProperty('user.home')}/processing-4/core/library/core.jar")
-} else {
-    logger.info("Using core.jar: ${coreJar}")
-}
-
-// ── Dependencies ──────────────────────────────────────────────────────────────
+// Same search as LuaMode: PROCESSING_DIR (or -Pprocessing=...), then the
+// usual install folders, then the folder of the `processing` launcher on PATH.
+// Jars are matched by pattern so 4.3 and 4.5.x layouts both work:
+//   4.5.x: lib/app/*.jar, lib/app/resources/core/library/core*.jar
+//   4.3:   lib/pde.jar,   core/library/core.jar
+// -Pcore=... and -Papp=... still add specific jars on top.
 
 repositories {}
 
-def appJar = null
-if (project.hasProperty('app')) {
-    appJar = new File(project.property('app').toString())
-} else {
-    def appCandidates = [
-        "${System.getProperty('user.home')}/Projects/processing4/app/build/libs/app.jar",
-        "${System.getProperty('user.home')}/processing-4/lib/app.jar",
-        "/opt/processing4/lib/app.jar",
-    ]
-    for (candidate in appCandidates) {
-        def f = new File(candidate)
-        if (f.exists()) { appJar = f; break }
+def hasJars = { File d ->
+    new File(d, 'lib/pde.jar').isFile() || new File(d, 'core/library/core.jar').isFile() ||
+        (new File(d, 'lib/app').listFiles()?.any { it.name.endsWith('.jar') } ?: false)
+}
+def findProcessing = {
+    def given = System.getenv('PROCESSING_DIR') ?: project.findProperty('processing')
+    if (given) return file(given)
+    def home = System.getProperty('user.home')
+    def tries = ['/usr/lib/processing', '/usr/share/processing', '/opt/processing', '/opt/processing4',
+                 "$home/processing-4", "$home/processing", "$home/processing4", "$home/.local/share/processing",
+                 '/usr/local/lib/processing'].collect { new File(it) }
+    System.getenv('PATH')?.split(File.pathSeparator)?.each { dir ->
+        def launcher = new File(dir, 'processing')
+        if (launcher.exists()) {
+            def d = launcher.canonicalFile.parentFile
+            for (int i = 0; i < 3 && d != null; i++) { tries << d; d = d.parentFile }
+        }
     }
+    ['/opt', home].each { root ->
+        new File(root).listFiles()?.findAll { it.isDirectory() && it.name.toLowerCase().startsWith('processing') }?.each { tries << it }
+    }
+    tries.find { it.isDirectory() && hasJars(it) }
 }
+def processingDir = findProcessing()
+def extraJars = []
+if (project.hasProperty('core')) extraJars << file(project.property('core'))
+else if (System.getenv('PROCESSING4_CORE')) extraJars << file(System.getenv('PROCESSING4_CORE'))
+if (project.hasProperty('app')) extraJars << file(project.property('app'))
 
-def compileJars = [coreJar]
-println "DEBUG appJar=${appJar}"
-if (appJar != null) {
-    compileJars << appJar
-    println "DEBUG app.jar exists=${appJar.exists()}"
-} else {
-    println "DEBUG app.jar not found"
+if (processingDir == null && extraJars.isEmpty()) {
+    throw new GradleException("Processing not found. Run with PROCESSING_DIR=/path/to/processing " +
+        "(the folder that has lib/ in it), or -Pcore=... -Papp=...")
 }
+def processingJars = processingDir == null ? files() : fileTree(processingDir) {
+    include 'lib/app/*.jar', 'lib/app/resources/core/library/core*.jar'
+    include 'lib/pde.jar', 'core/library/core.jar'
+}
+println "Processing: ${processingDir ?: 'not searched'}${extraJars ? ' + ' + extraJars.join(', ') : ''}"
 
 repositories {
     mavenCentral()
@@ -106,7 +79,8 @@ repositories {
 
 dependencies {
     // Processing 4 core + app — provided by the installed IDE at runtime; not bundled.
-    compileOnly files(compileJars)
+    compileOnly processingJars
+    compileOnly files(extraJars)
 
     // java-tree-sitter binding — vendored directly in lib/.
     // Get it once: clone https://github.com/serenadeai/java-tree-sitter and
