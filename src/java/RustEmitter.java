@@ -321,21 +321,24 @@ public class RustEmitter {
 
     switch (type) {
       case "let_declaration" -> {
-        // Shadow ALL bound names (handles tuple/struct destructuring like
-        // `let (x, y) = f()` — only the pattern child is in pattern position).
+        // `let x1 = r1;`: only what comes before `=` is the pattern. The value
+        // is walked first, with the old names, so `let x = x + 1` still reads
+        // the sketch variable; then the new names hide sketch variables.
+        Node pattern = null;
+        boolean afterEq = false;
         for (int i = 0; i < node.getChildCount(); i++) {
           Node c = node.getChild(i);
           String ct = c.getType();
-          if ("identifier".equals(ct) || "tuple_pattern".equals(ct)
-              || "struct_pattern".equals(ct) || "identifier_pattern".equals(ct)
-              || "ref_pattern".equals(ct) || "captured_pattern".equals(ct)
-              || "mut_pattern".equals(ct)) {
-            collectPatternIdents(c, src, shadowed);
+          if ("=".equals(ct)) { afterEq = true; continue; }
+          if (!afterEq && pattern == null && !"let".equals(ct) && !"mutable_specifier".equals(ct)
+              && !":".equals(ct) && !";".equals(ct)) {
+            pattern = c;
+            continue;
           }
+          // The value (and `else` block): a bare name directly here is a use, not a binding.
+          if (afterEq) walkBlock(c, null, src, rewrites, shadowed);
         }
-        // Still walk the initialiser so we can rewrite refs inside it.
-        for (int i = 0; i < node.getChildCount(); i++)
-          walkBlock(node.getChild(i), node, src, rewrites, shadowed);
+        if (pattern != null) collectPatternIdents(pattern, src, shadowed);
       }
 
       case "identifier" -> {
@@ -490,6 +493,10 @@ public class RustEmitter {
     Map.entry("create_graphics", "u64"), Map.entry("createGraphics", "u64"),
     Map.entry("sin_osc", "u64"), Map.entry("sqr_osc", "u64"), Map.entry("saw_osc", "u64"),
     Map.entry("tri_osc", "u64"), Map.entry("white_noise", "u64"),
+    Map.entry("create_image", "u64"), Map.entry("createImage", "u64"),
+    Map.entry("get_region", "u64"), Map.entry("image_copy", "u64"), Map.entry("image_crop", "u64"),
+    Map.entry("color", "Color"), Map.entry("color_rgb", "Color"), Map.entry("color_rgba", "Color"),
+    Map.entry("color_ga", "Color"), Map.entry("hex_color", "Color"), Map.entry("lerp_color", "Color"),
     Map.entry("random", "f32"), Map.entry("noise", "f32"), Map.entry("millis", "u64"));
 
   static String inferType(String init) {

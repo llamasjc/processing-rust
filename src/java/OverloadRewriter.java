@@ -37,7 +37,12 @@ final class OverloadRewriter {
     Map.entry("random",      Map.of(2, "random_range")),
     Map.entry("noise",       Map.of(2, "noise2", 3, "noise3")),
     Map.entry("begin_shape", Map.of(1, "begin_shape_kind")),
-    Map.entry("end_shape",   Map.of(1, "end_shape_mode"))
+    Map.entry("end_shape",   Map.of(1, "end_shape_mode")),
+    Map.entry("color",       Map.of(2, "color_ga", 3, "color_rgb", 4, "color_rgba")),
+    Map.entry("color_mode",  Map.of(2, "color_mode_range", 4, "color_mode3", 5, "color_mode_max")),
+    Map.entry("colorMode",   Map.of(2, "color_mode_range", 4, "color_mode3", 5, "color_mode_max")),
+    Map.entry("nf",          Map.of(3, "nf_float")),
+    Map.entry("nfc",         Map.of(2, "nfc_float"))
   );
 
   /** Float functions whose last argument is a constant (PIE, CHORD...), not a number to convert. */
@@ -48,7 +53,8 @@ final class OverloadRewriter {
     Set.of("image", "image_sized", "graphics_image", "graphics_image_sized",
            "create_font", "text_font_size", "filter_param",
            "shape", "shape_sized",
-           "sound_amp", "sound_pan", "sound_rate", "sound_jump", "osc_freq", "osc_amp", "osc_pan");
+           "sound_amp", "sound_pan", "sound_rate", "sound_jump", "osc_freq", "osc_amp", "osc_pan",
+           "color_mode_range", "color_mode3", "color_mode_max", "nf_float", "nfc_float");
 
   /** Engine functions whose numeric parameters are all f32. */
   private static final Set<String> FLOAT_ARGS = Set.of(
@@ -65,7 +71,10 @@ final class OverloadRewriter {
     "image", "image_sized", "graphics_image", "graphics_image_sized",
     "create_font", "text_font_size", "text_leading",
     "rect_radii", "filter_param", "shape", "shape_sized",
-    "sound_amp", "sound_pan", "sound_rate", "sound_jump", "osc_freq", "osc_amp", "osc_pan"
+    "sound_amp", "sound_pan", "sound_rate", "sound_jump", "osc_freq", "osc_amp", "osc_pan",
+    "color", "color_ga", "color_rgb", "color_rgba",
+    "color_mode_range", "color_mode3", "color_mode_max",
+    "sq", "norm", "bezier_point", "bezier_tangent", "curve_point", "curve_tangent"
   );
 
   private OverloadRewriter() {}

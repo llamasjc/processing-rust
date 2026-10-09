@@ -981,6 +981,7 @@ mod render {
     pub fn end_draw()   { end_all_graphics(); }
     pub fn present()    {}
 
+    #[allow(dead_code)]
     pub fn background_gray(v: f32) {
         let col = Color::from_gray(v);
         let p = solid(col);
@@ -1002,21 +1003,11 @@ mod render {
         let mut buf = pixel_buf().lock();
         for p in buf.iter_mut() { *p = blend(*p, col); }
     }
-    pub fn background_color(c: Color) {
-        let p = solid(c);
-        let mut buf = pixel_buf().lock();
-        buf.fill(p);
-    }
+    pub fn background_color(c: Color) { background_rgba(c.r, c.g, c.b, c.a); }
 
-    pub fn set_fill_gray(v: f32)                    { with_style_mut(|s| s.fill = Some(Color::from_gray(v))); }
-    pub fn set_fill_rgb(r: f32, g: f32, b: f32)     { with_style_mut(|s| s.fill = Some(Color::from_rgb(r,g,b))); }
-    pub fn set_fill_rgba(r: f32, g: f32, b: f32, a: f32) { with_style_mut(|s| s.fill = Some(Color::from_rgba(r,g,b,a))); }
     pub fn set_fill_none()                           { with_style_mut(|s| s.fill = None); }
     pub fn set_fill_color(c: Color)                  { with_style_mut(|s| s.fill = Some(c)); }
 
-    pub fn set_stroke_gray(v: f32)                   { with_style_mut(|s| s.stroke = Some(Color::from_gray(v))); }
-    pub fn set_stroke_rgb(r: f32, g: f32, b: f32)    { with_style_mut(|s| s.stroke = Some(Color::from_rgb(r,g,b))); }
-    pub fn set_stroke_rgba(r: f32, g: f32, b: f32, a: f32) { with_style_mut(|s| s.stroke = Some(Color::from_rgba(r,g,b,a))); }
     pub fn set_stroke_none()                          { with_style_mut(|s| s.stroke = None); }
     pub fn set_stroke_color(c: Color)                 { with_style_mut(|s| s.stroke = Some(c)); }
     /// 0 ROUND, 1 SQUARE, 2 PROJECT
@@ -1835,6 +1826,114 @@ mod render {
     pub fn image_size(id: u64) -> (f32, f32) {
         let v = images().lock();
         v.get((id as usize).wrapping_sub(1)).map(|i| (i.w as f32, i.h as f32)).unwrap_or((0.0, 0.0))
+    }
+    fn push_image(img: Img) -> u64 { let mut v = images().lock(); v.push(img); v.len() as u64 }
+    fn with_img<R>(id: u64, f: impl FnOnce(&mut Img) -> R) -> Option<R> {
+        let mut v = images().lock();
+        v.get_mut((id as usize).wrapping_sub(1)).map(f)
+    }
+    /// A blank, fully transparent image.
+    pub fn create_image(w: usize, h: usize) -> u64 {
+        if w == 0 || h == 0 || w * h > MAX_IMAGE_PIXELS { eprintln!("createImage: {w} x {h} is not a usable size"); return 0; }
+        push_image(Img { w, h, px: vec![Color::from_rgba(0.0, 0.0, 0.0, 0.0); w * h] })
+    }
+    pub fn image_get(id: u64, x: i64, y: i64) -> Color {
+        with_img(id, |i| if x >= 0 && y >= 0 && (x as usize) < i.w && (y as usize) < i.h { i.px[y as usize * i.w + x as usize] }
+                        else { Color::from_rgba(0.0, 0.0, 0.0, 0.0) })
+            .unwrap_or(Color::from_rgba(0.0, 0.0, 0.0, 0.0))
+    }
+    pub fn image_set(id: u64, x: i64, y: i64, c: Color) {
+        with_img(id, |i| if x >= 0 && y >= 0 && (x as usize) < i.w && (y as usize) < i.h { i.px[y as usize * i.w + x as usize] = c; });
+    }
+    pub fn image_pixels(id: u64) -> Vec<Color> { with_img(id, |i| i.px.clone()).unwrap_or_default() }
+    pub fn image_set_pixels(id: u64, px: &[Color]) {
+        with_img(id, |i| for (d, s) in i.px.iter_mut().zip(px) { *d = *s; });
+    }
+    /// A new image cut out of another one (parts outside are transparent).
+    pub fn image_crop(id: u64, x: i64, y: i64, w: usize, h: usize) -> u64 {
+        if w == 0 || h == 0 || w * h > MAX_IMAGE_PIXELS { return 0; }
+        let px = with_img(id, |i| {
+            let mut out = Vec::with_capacity(w * h);
+            for yy in 0..h as i64 { for xx in 0..w as i64 {
+                let (sx, sy) = (x + xx, y + yy);
+                out.push(if sx >= 0 && sy >= 0 && (sx as usize) < i.w && (sy as usize) < i.h { i.px[sy as usize * i.w + sx as usize] }
+                         else { Color::from_rgba(0.0, 0.0, 0.0, 0.0) });
+            } }
+            out
+        });
+        px.map(|px| push_image(Img { w, h, px })).unwrap_or(0)
+    }
+    pub fn image_copy(id: u64) -> u64 {
+        let img = with_img(id, |i| Img { w: i.w, h: i.h, px: i.px.clone() });
+        img.map(push_image).unwrap_or(0)
+    }
+    /// Resizes in place with bilinear sampling. A 0 keeps the aspect ratio.
+    pub fn image_resize(id: u64, w: usize, h: usize) {
+        with_img(id, |i| {
+            let (w, h) = match (w, h) {
+                (0, 0) => return,
+                (0, h) => (((i.w * h) as f32 / i.h as f32).round().max(1.0) as usize, h),
+                (w, 0) => (w, ((i.h * w) as f32 / i.w as f32).round().max(1.0) as usize),
+                wh => wh,
+            };
+            if w * h > MAX_IMAGE_PIXELS { return; }
+            let mut out = Vec::with_capacity(w * h);
+            let at = |x: usize, y: usize| i.px[y.min(i.h - 1) * i.w + x.min(i.w - 1)];
+            for y in 0..h { for x in 0..w {
+                let fx = ((x as f32 + 0.5) * i.w as f32 / w as f32 - 0.5).max(0.0);
+                let fy = ((y as f32 + 0.5) * i.h as f32 / h as f32 - 0.5).max(0.0);
+                let (x0, y0) = (fx as usize, fy as usize);
+                let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                let l = |a: Color, b: Color, t: f32| super::core::lerp_color(a, b, t);
+                out.push(l(l(at(x0, y0), at(x0 + 1, y0), tx), l(at(x0, y0 + 1), at(x0 + 1, y0 + 1), tx), ty));
+            } }
+            i.w = w; i.h = h; i.px = out;
+        });
+    }
+    /// mask(): the mask's brightness becomes this image's alpha (sizes must match).
+    pub fn image_mask(id: u64, mask: u64) -> bool {
+        let m = match with_img(mask, |m| (m.w, m.h, m.px.clone())) { Some(m) => m, None => return false };
+        with_img(id, |i| {
+            if (i.w, i.h) != (m.0, m.1) { eprintln!("mask: the mask must be the same size as the image"); return false; }
+            for (p, q) in i.px.iter_mut().zip(m.2.iter()) { p.a *= (q.r + q.g + q.b) / 3.0 * q.a; }
+            true
+        }).unwrap_or(false)
+    }
+    /// get(x, y, w, h): a copy of part of the canvas (or the layer being drawn) as a new image.
+    pub fn canvas_region(x: i64, y: i64, w: usize, h: usize) -> u64 {
+        if w == 0 || h == 0 || w * h > MAX_IMAGE_PIXELS { return 0; }
+        let (cw, ch) = canvas_dims();
+        let buf = pixel_buf().lock();
+        let layer = alpha_target();
+        let mut px = Vec::with_capacity(w * h);
+        for yy in 0..h as i64 { for xx in 0..w as i64 {
+            let (sx, sy) = (x + xx, y + yy);
+            px.push(if sx >= 0 && sy >= 0 && (sx as usize) < cw && (sy as usize) < ch {
+                let p = buf.get(sy as usize * cw + sx as usize).copied().unwrap_or(0);
+                let a = if layer { ((p >> 24) & 0xFF) as f32 / 255.0 } else { 1.0 };
+                Color::from_rgba(((p >> 16) & 0xFF) as f32 / 255.0, ((p >> 8) & 0xFF) as f32 / 255.0, (p & 0xFF) as f32 / 255.0, a)
+            } else { Color::from_rgba(0.0, 0.0, 0.0, 0.0) });
+        } }
+        drop(buf);
+        push_image(Img { w, h, px })
+    }
+    /// Saves as PNG (with alpha).
+    pub fn save_image(id: u64, path: &str) -> bool {
+        let Some((w, h, rgba)) = with_img(id, |i| (i.w, i.h, i.px.iter().flat_map(|c| {
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            [b(c.r), b(c.g), b(c.b), b(c.a)]
+        }).collect::<Vec<u8>>())) else { eprintln!("saveImage: no such image"); return false };
+        let write = || -> Result<(), Box<dyn std::error::Error>> {
+            let p = std::path::Path::new(path);
+            if let Some(d) = p.parent() { if !d.as_os_str().is_empty() { std::fs::create_dir_all(d)?; } }
+            let f = std::io::BufWriter::new(std::fs::File::create(p)?);
+            let mut enc = png::Encoder::new(f, w as u32, h as u32);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header()?.write_image_data(&rgba)?;
+            Ok(())
+        };
+        match write() { Ok(_) => true, Err(e) => { eprintln!("saveImage(\"{path}\"): {e}"); false } }
     }
     /// Draw an image scaled into (x, y, w, h), through the current transform.
     pub fn draw_image(id: u64, x: f32, y: f32, w: f32, h: f32) {
@@ -3191,21 +3290,21 @@ pub fn frame_rate(fps: f32) {
 
 // ──────────────────────────── Background / color ─────────────────────────────
 
-pub fn background(gray: f32)                              { render::background_gray(gray / 255.0); }
-pub fn background_rgb(r: f32, g: f32, b: f32)            { render::background_rgb(r/255.0, g/255.0, b/255.0); }
-pub fn background_rgba(r: f32, g: f32, b: f32, a: f32)   { render::background_rgba(r/255.0, g/255.0, b/255.0, a/255.0); }
+pub fn background(v: impl Paint) { render::background_color(v.paint()); }
+pub fn background_rgb(r: impl Num, g: impl Num, b: impl Num)            { let r = r.f(); let g = g.f(); let b = b.f(); render::background_color(cm(r, g, b, None)); }
+pub fn background_rgba(r: impl Num, g: impl Num, b: impl Num, a: impl Num)   { let r = r.f(); let g = g.f(); let b = b.f(); let a = a.f(); render::background_color(cm(r, g, b, Some(a))); }
 pub fn background_color(c: Color)                         { render::background_color(c); }
 
-pub fn fill(gray: f32)                                    { render::set_fill_gray(gray / 255.0); }
-pub fn fill_rgb(r: f32, g: f32, b: f32)                  { render::set_fill_rgb(r/255.0, g/255.0, b/255.0); }
-pub fn fill_rgba(r: f32, g: f32, b: f32, a: f32)         { render::set_fill_rgba(r/255.0, g/255.0, b/255.0, a/255.0); }
+pub fn fill(v: impl Paint) { render::set_fill_color(v.paint()); }
+pub fn fill_rgb(r: impl Num, g: impl Num, b: impl Num)                  { let r = r.f(); let g = g.f(); let b = b.f(); render::set_fill_color(cm(r, g, b, None)); }
+pub fn fill_rgba(r: impl Num, g: impl Num, b: impl Num, a: impl Num)         { let r = r.f(); let g = g.f(); let b = b.f(); let a = a.f(); render::set_fill_color(cm(r, g, b, Some(a))); }
 pub fn fill_color(c: Color)                               { render::set_fill_color(c); }
 pub fn no_fill()                                          { render::set_fill_none(); }
 #[inline] pub fn noFill() { no_fill() }
 
-pub fn stroke(gray: f32)                                  { render::set_stroke_gray(gray / 255.0); }
-pub fn stroke_rgb(r: f32, g: f32, b: f32)                { render::set_stroke_rgb(r/255.0, g/255.0, b/255.0); }
-pub fn stroke_rgba(r: f32, g: f32, b: f32, a: f32)       { render::set_stroke_rgba(r/255.0, g/255.0, b/255.0, a/255.0); }
+pub fn stroke(v: impl Paint) { render::set_stroke_color(v.paint()); }
+pub fn stroke_rgb(r: impl Num, g: impl Num, b: impl Num)                { let r = r.f(); let g = g.f(); let b = b.f(); render::set_stroke_color(cm(r, g, b, None)); }
+pub fn stroke_rgba(r: impl Num, g: impl Num, b: impl Num, a: impl Num)       { let r = r.f(); let g = g.f(); let b = b.f(); let a = a.f(); render::set_stroke_color(cm(r, g, b, Some(a))); }
 pub fn stroke_color(c: Color)                             { render::set_stroke_color(c); }
 pub fn no_stroke()                                        { render::set_stroke_none(); }
 #[inline] pub fn noStroke() { no_stroke() }
@@ -3376,9 +3475,9 @@ pub fn random_seed(seed: u64) { core::random_seed(seed); }
 
 // ─────────────────────────── Color constructors ───────────────────────────────
 
-#[inline] pub fn color(gray: f32) -> Color { Color::from_gray(gray / 255.0) }
-#[inline] pub fn color_rgb(r: f32, g: f32, b: f32) -> Color { Color::from_rgb(r/255.0, g/255.0, b/255.0) }
-#[inline] pub fn color_rgba(r: f32, g: f32, b: f32, a: f32) -> Color { Color::from_rgba(r/255.0, g/255.0, b/255.0, a/255.0) }
+#[inline] pub fn color(gray: impl Num) -> Color { let gray = gray.f(); cm_gray(gray, None) }
+#[inline] pub fn color_rgb(r: impl Num, g: impl Num, b: impl Num) -> Color { let r = r.f(); let g = g.f(); let b = b.f(); cm(r, g, b, None) }
+#[inline] pub fn color_rgba(r: impl Num, g: impl Num, b: impl Num, a: impl Num) -> Color { let r = r.f(); let g = g.f(); let b = b.f(); let a = a.f(); cm(r, g, b, Some(a)) }
 pub fn lerp_color(c1: Color, c2: Color, t: f32) -> Color { core::lerp_color(c1, c2, t) }
 #[inline] pub fn lerpColor(c1: Color, c2: Color, t: f32) -> Color { lerp_color(c1, c2, t) }
 
@@ -4294,9 +4393,9 @@ impl<S: 'static> App<S> {
 }
 
 // Gray + alpha, used by OverloadRewriter for fill(gray, alpha) etc.
-pub fn fill_ga(gray: f32, alpha: f32)       { fill_rgba(gray, gray, gray, alpha); }
-pub fn stroke_ga(gray: f32, alpha: f32)     { stroke_rgba(gray, gray, gray, alpha); }
-pub fn background_ga(gray: f32, alpha: f32) { background_rgba(gray, gray, gray, alpha); }
+pub fn fill_ga(gray: impl Num, alpha: impl Num)       { let gray = gray.f(); let alpha = alpha.f(); render::set_fill_color(cm_gray(gray, Some(alpha))); }
+pub fn stroke_ga(gray: impl Num, alpha: impl Num)     { let gray = gray.f(); let alpha = alpha.f(); render::set_stroke_color(cm_gray(gray, Some(alpha))); }
+pub fn background_ga(gray: impl Num, alpha: impl Num) { let gray = gray.f(); let alpha = alpha.f(); render::background_color(cm_gray(gray, Some(alpha))); }
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
 pub const POINTS: u8 = 1;
@@ -4343,3 +4442,258 @@ pub use data::{load_strings, load_text, load_bytes, save_strings, save_text, sav
 #[inline] pub fn parseJSONObject(s: &str) -> Json { parse_json(s).unwrap_or_default() }
 #[inline] pub fn loadTable(path: &str, options: &str) -> Table { load_table(path, options) }
 #[inline] pub fn saveTable(t: &Table, path: &str) -> bool { save_table(t, path) }
+
+/// Any number type works where the API wants a number: 3, 3.0, x as usize...
+pub trait Num: Copy { fn f(self) -> f32; }
+macro_rules! num_impl { ($($t:ty),*) => { $(impl Num for $t { #[inline] fn f(self) -> f32 { self as f32 } })* } }
+num_impl!(f32, f64, i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+/// fill(), stroke() and background() take a gray level or a Color.
+pub trait Paint { fn paint(self) -> Color; }
+impl<T: Num> Paint for T { fn paint(self) -> Color { cm_gray(self.f(), None) } }
+impl Paint for Color { fn paint(self) -> Color { self } }
+
+// ──────────────────────────── Color mode ─────────────────────────────────────
+
+pub const RGB: u32 = 1;
+pub const HSB: u32 = 3;
+
+#[derive(Clone, Copy)]
+struct ColorMode { hsb: bool, max: [f32; 4] }
+static COLOR_MODE: RwLock<ColorMode> = RwLock::new(ColorMode { hsb: false, max: [255.0; 4] });
+
+/// colorMode(HSB): hue, saturation and brightness, each 0..255.
+/// color_mode_max(HSB, 360, 100, 100) gives the usual ranges.
+pub fn color_mode(mode: u32) { let m = COLOR_MODE.read().max[0]; color_mode_max(mode, m, m, m, m); }
+/// color_mode_range(RGB, 1.0): every channel 0..1.
+pub fn color_mode_range(mode: u32, max: f32) { color_mode_max(mode, max, max, max, max); }
+pub fn color_mode_max(mode: u32, max1: f32, max2: f32, max3: f32, max_a: f32) {
+    let fix = |v: f32| if v.is_finite() && v > 0.0 { v } else { 255.0 };
+    *COLOR_MODE.write() = ColorMode { hsb: mode == HSB, max: [fix(max1), fix(max2), fix(max3), fix(max_a)] };
+}
+pub fn color_mode3(mode: u32, max1: f32, max2: f32, max3: f32) {
+    let a = COLOR_MODE.read().max[3];
+    color_mode_max(mode, max1, max2, max3, a);
+}
+#[inline] pub fn colorMode(mode: u32) { color_mode(mode) }
+
+fn hsb_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    if s <= 0.0 { return (v, v, v); }
+    let h = (h.rem_euclid(1.0)) * 6.0;
+    let i = h.floor();
+    let f = h - i;
+    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
+    match i as i32 { 0 => (v, t, p), 1 => (q, v, p), 2 => (p, v, t), 3 => (p, q, v), 4 => (t, p, v), _ => (v, p, q) }
+}
+fn rgb_to_hsb(c: Color) -> (f32, f32, f32) {
+    let (r, g, b) = (c.r.clamp(0.0, 1.0), c.g.clamp(0.0, 1.0), c.b.clamp(0.0, 1.0));
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let s = if max > 0.0 { d / max } else { 0.0 };
+    let h = if d <= 0.0 { 0.0 }
+        else if max == r { ((g - b) / d).rem_euclid(6.0) / 6.0 }
+        else if max == g { ((b - r) / d + 2.0) / 6.0 }
+        else { ((r - g) / d + 4.0) / 6.0 };
+    (h, s, max)
+}
+
+/// Three channels (and maybe alpha) in the current color mode, as a Color.
+fn cm(a: f32, b: f32, c: f32, alpha: Option<f32>) -> Color {
+    let m = *COLOR_MODE.read();
+    let n = |v: f32, i: usize| (v / m.max[i]).clamp(0.0, 1.0);
+    let al = alpha.map(|v| n(v, 3)).unwrap_or(1.0);
+    if m.hsb {
+        let hue = (a / m.max[0]).rem_euclid(1.0);
+        let hue = if a >= m.max[0] && a > 0.0 && hue == 0.0 { 0.0 } else { hue };
+        let (r, g, bl) = hsb_to_rgb(hue, n(b, 1), n(c, 2));
+        Color::from_rgba(r, g, bl, al)
+    } else {
+        Color::from_rgba(n(a, 0), n(b, 1), n(c, 2), al)
+    }
+}
+/// Gray in the current range (the first channel's maximum, like Processing).
+fn cm_gray(v: f32, alpha: Option<f32>) -> Color {
+    let m = *COLOR_MODE.read();
+    let g = (v / if m.hsb { m.max[2] } else { m.max[0] }).clamp(0.0, 1.0);
+    Color::from_rgba(g, g, g, alpha.map(|a| (a / m.max[3]).clamp(0.0, 1.0)).unwrap_or(1.0))
+}
+
+/// red(c), green(c), blue(c), alpha(c): 0..255 (or the range set with color_mode).
+pub fn red(c: Color) -> f32 { c.r * COLOR_MODE.read().max[0] }
+pub fn green(c: Color) -> f32 { c.g * COLOR_MODE.read().max[1] }
+pub fn blue(c: Color) -> f32 { c.b * COLOR_MODE.read().max[2] }
+pub fn alpha(c: Color) -> f32 { c.a * COLOR_MODE.read().max[3] }
+pub fn hue(c: Color) -> f32 { rgb_to_hsb(c).0 * COLOR_MODE.read().max[0] }
+pub fn saturation(c: Color) -> f32 { rgb_to_hsb(c).1 * COLOR_MODE.read().max[1] }
+pub fn brightness(c: Color) -> f32 { rgb_to_hsb(c).2 * COLOR_MODE.read().max[2] }
+/// A color from a hex code: hex_color("#ff8800") or hex_color("ff880080").
+pub fn hex_color(s: &str) -> Color {
+    let t = s.trim().trim_start_matches('#').trim_start_matches("0x");
+    let v = u32::from_str_radix(t, 16).unwrap_or(0);
+    let byte = |sh: u32| ((v >> sh) & 0xFF) as f32 / 255.0;
+    match t.len() {
+        8 => Color::from_rgba(byte(24), byte(16), byte(8), byte(0)),
+        3 => { let n = |sh: u32| ((v >> sh) & 0xF) as f32 / 15.0; Color::from_rgb(n(8), n(4), n(0)) }
+        _ => Color::from_rgb(byte(16), byte(8), byte(0)),
+    }
+}
+
+// ──────────────────────────── Number formatting and math ─────────────────────
+
+fn group(digits: &str) -> String {
+    let b = digits.as_bytes();
+    let mut out = String::new();
+    for (i, c) in b.iter().enumerate() {
+        if i > 0 && (b.len() - i) % 3 == 0 { out.push(','); }
+        out.push(*c as char);
+    }
+    out
+}
+/// nf(7, 3) is "007": pad the whole part with zeros to at least `digits`.
+pub fn nf(n: impl Into<i64>, digits: usize) -> String {
+    let n: i64 = n.into();
+    let s = format!("{:0w$}", n.unsigned_abs(), w = digits);
+    if n < 0 { format!("-{s}") } else { s }
+}
+/// nf_float(3.14159, 2, 2) is "03.14": left digits, then digits after the point.
+pub fn nf_float(n: f32, left: usize, right: usize) -> String {
+    let s = format!("{:.*}", right, n.abs());
+    let (whole, frac) = s.split_once('.').map(|(a, b)| (a.to_string(), Some(b.to_string()))).unwrap_or((s.clone(), None));
+    let whole = format!("{:0>w$}", whole, w = left);
+    let body = match frac { Some(f) => format!("{whole}.{f}"), None => whole };
+    if n < 0.0 && body.chars().any(|c| c != '0' && c != '.') { format!("-{body}") } else { body }
+}
+/// nfc(1234567) is "1,234,567".
+pub fn nfc(n: impl Into<i64>) -> String {
+    let n: i64 = n.into();
+    let g = group(&n.unsigned_abs().to_string());
+    if n < 0 { format!("-{g}") } else { g }
+}
+/// nfc_float(1234.5, 2) is "1,234.50".
+pub fn nfc_float(n: f32, right: usize) -> String {
+    let s = format!("{:.*}", right, n.abs());
+    let (whole, frac) = s.split_once('.').map(|(a, b)| (a, Some(b))).unwrap_or((&s, None));
+    let g = group(whole);
+    let body = match frac { Some(f) => format!("{g}.{f}"), None => g };
+    if n < 0.0 { format!("-{body}") } else { body }
+}
+/// nfs: like nf, with a space where a minus sign would go, so columns line up.
+pub fn nfs(n: impl Into<i64>, digits: usize) -> String { let n: i64 = n.into(); if n < 0 { nf(n, digits) } else { format!(" {}", nf(n, digits)) } }
+/// nfp: like nf, with a + on positive numbers.
+pub fn nfp(n: impl Into<i64>, digits: usize) -> String { let n: i64 = n.into(); if n < 0 { nf(n, digits) } else { format!("+{}", nf(n, digits)) } }
+
+/// A gray color with alpha.
+pub fn color_ga(gray: impl Num, a: impl Num) -> Color { let gray = gray.f(); let a = a.f(); cm_gray(gray, Some(a)) }
+pub fn sq(x: f32) -> f32 { x * x }
+/// norm(v, low, high): where v sits between low and high, 0..1.
+pub fn norm(v: f32, low: f32, high: f32) -> f32 { if high == low { 0.0 } else { (v - low) / (high - low) } }
+/// A point along a bezier curve: bezier_point(a, b, c, d, t), once for x and once for y.
+pub fn bezier_point(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+    let u = 1.0 - t;
+    a * u * u * u + 3.0 * b * t * u * u + 3.0 * c * t * t * u + d * t * t * t
+}
+pub fn bezier_tangent(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+    3.0 * t * t * (-a + 3.0 * b - 3.0 * c + d) + 6.0 * t * (a - 2.0 * b + c) + 3.0 * (-a + b)
+}
+/// A point along a Catmull-Rom curve (what curve() draws).
+pub fn curve_point(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+    let (t2, t3) = (t * t, t * t * t);
+    0.5 * ((2.0 * b) + (-a + c) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (-a + 3.0 * b - 3.0 * c + d) * t3)
+}
+pub fn curve_tangent(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+    0.5 * ((-a + c) + 2.0 * (2.0 * a - 5.0 * b + 4.0 * c - d) * t + 3.0 * (-a + 3.0 * b - 3.0 * c + d) * t * t)
+}
+/// delay(ms): pauses the sketch. Mostly useful in setup; in draw it stalls the window.
+pub fn delay(ms: u32) { std::thread::sleep(std::time::Duration::from_millis(ms as u64)); }
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+    #[test]
+    fn modes_and_formatting() {
+        let c = cm(255.0, 0.0, 0.0, None);
+        assert_eq!((c.r, c.g, c.b), (1.0, 0.0, 0.0));
+        color_mode_max(HSB, 360.0, 100.0, 100.0, 1.0);
+        let c = cm(120.0, 100.0, 100.0, Some(0.5));
+        assert!((c.g - 1.0).abs() < 1e-4 && c.r.abs() < 1e-4 && (c.a - 0.5).abs() < 1e-4);
+        assert!((hue(c) - 120.0).abs() < 0.01 && (saturation(c) - 100.0).abs() < 0.01);
+        let c = cm(360.0, 100.0, 100.0, None); // hue wraps to red
+        assert!((c.r - 1.0).abs() < 1e-4 && c.g.abs() < 1e-4);
+        color_mode_max(RGB, 1.0, 1.0, 1.0, 1.0);
+        assert!((cm_gray(0.5, None).r - 0.5).abs() < 1e-6);
+        assert!((red(hex_color("#ff8000")) - 1.0).abs() < 1e-6);
+        color_mode_max(RGB, 255.0, 255.0, 255.0, 255.0);
+        assert!((green(hex_color("#ff8000")) - 128.0).abs() < 1.0);
+        assert_eq!(nf(7, 3), "007");
+        assert_eq!(nf(-7, 3), "-007");
+        assert_eq!(nf_float(3.14159, 2, 2), "03.14");
+        assert_eq!(nf_float(-0.001, 1, 2), "0.00");
+        assert_eq!(nfc(1234567), "1,234,567");
+        assert_eq!(nfc(-1000), "-1,000");
+        assert_eq!(nfc(999), "999");
+        assert_eq!(nfc_float(1234.5, 2), "1,234.50");
+        assert_eq!(nfs(5, 2), " 05");
+        assert_eq!(nfp(5, 1), "+5");
+        assert_eq!(bezier_point(0.0, 0.0, 10.0, 10.0, 0.5), 5.0);
+        assert_eq!(curve_point(0.0, 0.0, 10.0, 10.0, 0.0), 0.0);
+        assert_eq!(norm(5.0, 0.0, 10.0), 0.5);
+    }
+}
+
+// ──────────────────────────── Image editing ──────────────────────────────────
+
+/// createImage(w, h): a blank transparent image to draw pixels into.
+pub fn create_image(w: u32, h: u32) -> u64 { render::create_image(w as usize, h as usize) }
+#[inline] pub fn createImage(w: u32, h: u32) -> u64 { create_image(w, h) }
+/// img.get(x, y): the color of one pixel (transparent outside the image).
+pub fn image_get(id: u64, x: i32, y: i32) -> Color { render::image_get(id, x as i64, y as i64) }
+pub fn image_set(id: u64, x: i32, y: i32, c: Color) { render::image_set(id, x as i64, y as i64, c) }
+/// Every pixel, row by row. Change them and hand them back with image_set_pixels.
+pub fn image_pixels(id: u64) -> Vec<Color> { render::image_pixels(id) }
+pub fn image_set_pixels(id: u64, px: &[Color]) { render::image_set_pixels(id, px) }
+/// img.get(x, y, w, h): part of an image, as a new image.
+pub fn image_crop(id: u64, x: i32, y: i32, w: u32, h: u32) -> u64 { render::image_crop(id, x as i64, y as i64, w as usize, h as usize) }
+pub fn image_copy(id: u64) -> u64 { render::image_copy(id) }
+/// img.resize(w, h). Use 0 for one side to keep the proportions.
+pub fn image_resize(id: u64, w: u32, h: u32) { render::image_resize(id, w as usize, h as usize) }
+/// img.mask(other): the other image's brightness becomes this one's transparency.
+pub fn image_mask(id: u64, mask: u64) -> bool { render::image_mask(id, mask) }
+pub fn save_image(id: u64, path: &str) -> bool { render::save_image(id, path) }
+/// get(x, y, w, h): a piece of the canvas as a new image.
+pub fn get_region(x: i32, y: i32, w: u32, h: u32) -> u64 { render::canvas_region(x as i64, y as i64, w as usize, h as usize) }
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    #[test]
+    fn edit_images() {
+        let a = create_image(4, 2);
+        assert!(a > 0);
+        image_set(a, 1, 1, Color::from_rgb(1.0, 0.0, 0.0));
+        assert_eq!(image_get(a, 1, 1).r, 1.0);
+        assert_eq!(image_get(a, 9, 9).a, 0.0);
+        let c = image_crop(a, 1, 1, 2, 2);
+        assert_eq!(image_get(c, 0, 0).r, 1.0);
+        assert_eq!(image_get(c, 0, 1).a, 0.0);
+        image_resize(a, 8, 0);
+        assert_eq!(render::image_size(a), (8.0, 4.0));
+        let m = create_image(8, 4);
+        let mut px = image_pixels(m);
+        for p in px.iter_mut() { *p = Color::from_rgba(0.5, 0.5, 0.5, 1.0); }
+        image_set_pixels(m, &px);
+        let b = image_copy(a);
+        for p in image_pixels(b).iter() { assert!(p.a <= 1.0); }
+        image_set(b, 0, 0, Color::from_rgb(0.0, 1.0, 0.0));
+        assert!(image_mask(b, m));
+        assert!((image_get(b, 0, 0).a - 0.5).abs() < 1e-4);
+        assert!(!image_mask(b, c));
+        let path = std::env::temp_dir().join(format!("rm-img-{}.png", std::process::id()));
+        assert!(save_image(b, path.to_str().unwrap()));
+        let back = load_image(path.to_str().unwrap());
+        assert_eq!(render::image_size(back), (8.0, 4.0));
+        assert!((image_get(back, 0, 0).g - 1.0).abs() < 0.01);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(create_image(0, 5), 0);
+        assert_eq!(image_get(9999, 0, 0).a, 0.0);
+    }
+}
