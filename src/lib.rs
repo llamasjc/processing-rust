@@ -4325,3 +4325,21 @@ pub fn random_gaussian() -> f32 {
     let u2 = random(1.0);
     (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
 }
+
+// Files, JSON and tables (see data.rs).
+mod data;
+pub use data::{load_strings, load_text, load_bytes, save_strings, save_text, save_bytes,
+               split_tokens, split, join, trim, Json, parse_json, load_json, save_json,
+               Table, Col, load_table, save_table};
+#[inline] pub fn loadStrings(path: &str) -> Vec<String> { load_strings(path) }
+#[inline] pub fn saveStrings<S: AsRef<str>>(path: &str, lines: &[S]) -> bool { save_strings(path, lines) }
+#[inline] pub fn loadBytes(path: &str) -> Vec<u8> { load_bytes(path) }
+#[inline] pub fn saveBytes(path: &str, b: &[u8]) -> bool { save_bytes(path, b) }
+#[inline] pub fn splitTokens(s: &str, d: &str) -> Vec<String> { split_tokens(s, d) }
+#[inline] pub fn loadJSONObject(path: &str) -> Json { load_json(path) }
+#[inline] pub fn loadJSONArray(path: &str) -> Json { load_json(path) }
+#[inline] pub fn saveJSONObject(v: &Json, path: &str) -> bool { save_json(path, v) }
+#[inline] pub fn saveJSONArray(v: &Json, path: &str) -> bool { save_json(path, v) }
+#[inline] pub fn parseJSONObject(s: &str) -> Json { parse_json(s).unwrap_or_default() }
+#[inline] pub fn loadTable(path: &str, options: &str) -> Table { load_table(path, options) }
+#[inline] pub fn saveTable(t: &Table, path: &str) -> bool { save_table(t, path) }

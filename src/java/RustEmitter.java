@@ -390,8 +390,11 @@ public class RustEmitter {
 
   private static boolean isFieldAccess(Node node, Node parent) {
     if (parent == null) return false;
-    return "field_expression".equals(parent.getType())
-        || "scoped_identifier".equals(parent.getType());
+    // In `cfg.set(..)` or `ball.x` the name on the left is the receiver and
+    // still a sketch variable; only a name to the right of the dot is a field.
+    if ("field_expression".equals(parent.getType()))
+      return parent.getChildCount() == 0 || parent.getChild(0).getStartByte() != node.getStartByte();
+    return "scoped_identifier".equals(parent.getType());
   }
 
   private static boolean isPattern(Node node, Node parent) {
@@ -473,6 +476,22 @@ public class RustEmitter {
     int n = 0; for (int i = 0; i < s.length(); i++) if (s.charAt(i) == '\n') n++; return n;
   }
 
+  private static final Map<String, String> KNOWN_RESULT = Map.ofEntries(
+    Map.entry("loadJSONObject", "Json"), Map.entry("loadJSONArray", "Json"),
+    Map.entry("parseJSONObject", "Json"), Map.entry("load_json", "Json"),
+    Map.entry("loadTable", "Table"), Map.entry("load_table", "Table"),
+    Map.entry("loadStrings", "Vec<String>"), Map.entry("load_strings", "Vec<String>"),
+    Map.entry("load_text", "String"), Map.entry("loadBytes", "Vec<u8>"),
+    Map.entry("load_bytes", "Vec<u8>"),
+    Map.entry("load_image", "u64"), Map.entry("loadImage", "u64"),
+    Map.entry("load_shape", "u64"), Map.entry("loadShape", "u64"),
+    Map.entry("load_sound", "u64"), Map.entry("load_font", "u64"),
+    Map.entry("create_font", "u64"), Map.entry("createFont", "u64"),
+    Map.entry("create_graphics", "u64"), Map.entry("createGraphics", "u64"),
+    Map.entry("sin_osc", "u64"), Map.entry("sqr_osc", "u64"), Map.entry("saw_osc", "u64"),
+    Map.entry("tri_osc", "u64"), Map.entry("white_noise", "u64"),
+    Map.entry("random", "f32"), Map.entry("noise", "f32"), Map.entry("millis", "u64"));
+
   static String inferType(String init) {
     if (init == null) return null;
     init = init.trim();
@@ -502,6 +521,17 @@ public class RustEmitter {
     // Vec
     if (init.equals("Vec::new()"))               return "Vec<_>";
     if (init.matches("vec!\\[.*\\]"))            return "Vec<_>";
+    // Engine calls with a known result type.
+    String call = init.replaceAll("\\s+", "");
+    int paren = call.indexOf('(');
+    String fn = paren > 0 ? call.substring(0, paren) : call;
+    String known = KNOWN_RESULT.get(fn);
+    if (known != null && paren > 0 && call.endsWith(")")) return known;
+    // Type::new(..), Type::Variant, Type::from(..): the type is the path head.
+    java.util.regex.Matcher m = java.util.regex.Pattern
+        .compile("([A-Z][A-Za-z0-9_]*)::[a-zA-Z_][A-Za-z0-9_]*(\\(.*\\))?").matcher(call);
+    if (m.matches() && !m.group(1).equals("Vec") && !m.group(1).equals("String")
+        && !m.group(1).equals("Self")) return m.group(1);
     return null;
   }
 

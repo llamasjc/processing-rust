@@ -9,14 +9,14 @@ name: check-engine
 on:
   push:
     paths:
-      - 'src/lib.rs'
+      - 'src/*.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'examples/**'
       - '.github/workflows/check-engine.yml'
   pull_request:
     paths:
-      - 'src/lib.rs'
+      - 'src/*.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'examples/**'

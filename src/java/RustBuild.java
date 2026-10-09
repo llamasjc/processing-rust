@@ -202,7 +202,7 @@ public class RustBuild {
     // The engine itself changed (a mode update, or work on src/lib.rs): every
     // sketch must pick it up, not keep compiling against its old copy.
     if (!needsScaffold) {
-      for (String f : new String[] { "src/lib.rs", "Cargo.toml" }) {
+      for (String f : engineFiles(mode.getFolder())) {
         File ours   = new File(mode.getFolder(), f);
         File theirs = new File(cacheRoot, "processing/" + f);
         if (!theirs.exists() || ours.length() != theirs.length()
@@ -265,9 +265,25 @@ public class RustBuild {
     Files.copy(new File(modeRoot, "Cargo.toml").toPath(),
                new File(destCrate, "Cargo.toml").toPath(),
                StandardCopyOption.REPLACE_EXISTING);
-    Files.copy(new File(modeRoot, "src/lib.rs").toPath(),
-               new File(destCrate, "src/lib.rs").toPath(),
-               StandardCopyOption.REPLACE_EXISTING);
+    // lib.rs plus its module files (data.rs and friends).
+    for (String f : engineFiles(modeRoot)) {
+      if (!f.endsWith(".rs")) continue;
+      Files.copy(new File(modeRoot, f).toPath(), new File(destCrate, f).toPath(),
+                 StandardCopyOption.REPLACE_EXISTING);
+    }
+  }
+
+  /** Cargo.toml and every .rs file directly in the mode's src/ folder. */
+  static java.util.List<String> engineFiles(File modeRoot) {
+    java.util.List<String> out = new java.util.ArrayList<>();
+    out.add("Cargo.toml");
+    out.add("src/lib.rs");
+    File[] rs = new File(modeRoot, "src").listFiles((d, n) -> n.endsWith(".rs") && !n.equals("lib.rs"));
+    if (rs != null) {
+      java.util.Arrays.sort(rs);
+      for (File f : rs) out.add("src/" + f.getName());
+    }
+    return out;
   }
 
   // ── Step 6 – cargo build ────────────────────────────────────────────────────
