@@ -14,7 +14,7 @@
 # statically with hidden visibility, so it can't clash with the system
 # libtree-sitter or with CppMode/RustMode's copies.
 #
-# Usage: native/build.sh [grammar]   default grammar: lua
+# Usage: native/build.sh [grammar]   default grammar: rust
 #   e.g. native/build.sh rust, native/build.sh scheme
 #   LIB_PLATFORM=linux-x86-64 native/build.sh rust   (override lib/<dir> name)
 # Work dir: native/.build, safe to delete.
@@ -25,7 +25,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
 WORK=${WORK:-$HERE/.build}
 JTS_REPO=https://github.com/seart-group/java-tree-sitter
-GRAMMAR=${1:-lua}
+GRAMMAR=${1:-rust}   # this copy lives in RustMode
 GRAMMAR_REPO=tree-sitter-$GRAMMAR
 GRAMMAR_MACRO=TS_LANGUAGE_$(echo "$GRAMMAR" | tr 'a-z-' 'A-Z_')
 GRAMMAR_JNI=Java_ch_usi_si_seart_treesitter_Language_$(echo "$GRAMMAR" | sed -E 's/-(.)/\U\1/g')
@@ -44,6 +44,8 @@ esac
 JAVA_HOME=${JAVA_HOME:-$(dirname "$(dirname "$(readlink -f "$(which java)")")")}
 [ -f "$JAVA_HOME/include/jni.h" ] || { echo "no jni.h under $JAVA_HOME (need a JDK)" >&2; exit 1; }
 
+# RustMode.java looks in lib/linux-x86-64, lib/linux-arm64 (dashes)
+case "$PLATFORM" in linux-x86_64) PLATFORM=linux-x86-64 ;; linux-aarch64) PLATFORM=linux-arm64 ;; esac
 PLATFORM=${LIB_PLATFORM:-$PLATFORM}
 echo "java-tree-sitter $JTS_TAG + $GRAMMAR_REPO -> lib/$PLATFORM"
 
@@ -115,4 +117,4 @@ install -m 755 "$OUT" "$DEST/libjava-tree-sitter.so"
 rm -f "$DEST/libtree-sitter-$GRAMMAR.so"   # grammar now lives inside libjava-tree-sitter
 
 ls -la "$DEST/libjava-tree-sitter.so"
-echo "done. now: SKIP_RUNNER=1 gradle modeJar"
+echo "done. now: gradle jar"
