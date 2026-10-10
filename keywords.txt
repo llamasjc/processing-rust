@@ -462,3 +462,12 @@ TOP	KEYWORD2
 BOTTOM	KEYWORD2
 BASELINE	KEYWORD2
 text_align_h	FUNCTION1
+mic_start	FUNCTION1
+mic_stop	FUNCTION1
+mic_level	FUNCTION1
+mic_waveform	FUNCTION1
+mic_spectrum	FUNCTION1
+mic_sample_rate	FUNCTION1
+sound_level	FUNCTION1
+sound_spectrum	FUNCTION1
+sound_waveform	FUNCTION1

@@ -143,7 +143,7 @@ public class RustEmitter {
       if (t != null) {
         line(sb, "    " + b.name() + ": " + t + ",");
       } else {
-        line(sb, "    // TODO: add type annotation — let " + b.name() + ": YourType = …;");
+        line(sb, "    // TODO: give it a type, like: let " + b.name() + ": YourType = ...;");
         line(sb, "    " + b.name() + ": (),");
       }
     }
@@ -502,7 +502,22 @@ public class RustEmitter {
     Map.entry("create_shape_ellipse", "PShape"), Map.entry("create_shape_line", "PShape"),
     Map.entry("create_shape_triangle", "PShape"), Map.entry("create_shape_quad", "PShape"),
     Map.entry("wrap_text", "Vec<String>"),
+    Map.entry("mic_spectrum", "Vec<f32>"), Map.entry("mic_waveform", "Vec<f32>"),
+    Map.entry("sound_spectrum", "Vec<f32>"), Map.entry("sound_waveform", "Vec<f32>"),
+    Map.entry("mic_level", "f32"), Map.entry("sound_level", "f32"),
     Map.entry("random", "f32"), Map.entry("noise", "f32"), Map.entry("millis", "u64"));
+
+  /** Index of c outside brackets and parentheses, or -1. */
+  private static int topLevel(String s, char c) {
+    int depth = 0;
+    for (int i = 0; i < s.length(); i++) {
+      char ch = s.charAt(i);
+      if (ch == '(' || ch == '[' || ch == '{') depth++;
+      else if (ch == ')' || ch == ']' || ch == '}') depth--;
+      else if (ch == c && depth == 0) return i;
+    }
+    return -1;
+  }
 
   static String inferType(String init) {
     if (init == null) return null;
@@ -531,8 +546,22 @@ public class RustEmitter {
         || init.equals("String::new()"))         return "String";
     if (init.startsWith("'") && init.length() == 3)  return "char";
     // Vec
+    // 0.0f32, 3u8, 2_i64: a literal with its type written on it
+    java.util.regex.Matcher lit = java.util.regex.Pattern
+        .compile("-?[\\d_]*\\.?[\\d_]*_?(f32|f64|i8|i16|i32|i64|isize|u8|u16|u32|u64|usize)").matcher(init);
+    if (lit.matches() && init.matches("-?\\d.*")) return lit.group(1);
+    // Vec::<f32>::new(), vec![0.0; 64], vec![1, 2, 3]: the element type when it can be told
+    java.util.regex.Matcher turbo = java.util.regex.Pattern.compile("Vec::<(.+)>::(new|with_capacity)\\(.*\\)").matcher(init);
+    if (turbo.matches()) return "Vec<" + turbo.group(1) + ">";
+    if (init.startsWith("vec![") && init.endsWith("]")) {
+      String inner = init.substring(5, init.length() - 1).trim();
+      int semi = topLevel(inner, ';');
+      String first = semi >= 0 ? inner.substring(0, semi) : inner.split(",")[0];
+      String et = inferType(first.trim());
+      if (et != null && !et.contains("_")) return "Vec<" + et + ">";
+      return "Vec<_>";
+    }
     if (init.equals("Vec::new()"))               return "Vec<_>";
-    if (init.matches("vec!\\[.*\\]"))            return "Vec<_>";
     // Engine calls with a known result type.
     String call = init.replaceAll("\\s+", "");
     int paren = call.indexOf('(');

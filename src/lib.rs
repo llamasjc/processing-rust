@@ -4019,6 +4019,22 @@ mod audio {
             _ => 0.0,
         }
     }
+    /// The n mono samples of a playing file just before where it is now, with
+    /// its volume applied (silence when it isn't playing). For analysis.
+    pub fn window(id: u64, n: usize) -> Vec<f32> {
+        let Some(v) = voice(id) else { return vec![0.0; n] };
+        let Kind::File { data, channels, frames, .. } = &v.kind else { return vec![0.0; n] };
+        if !v.ctl.playing.load(Ordering::Relaxed) || *frames == 0 { return vec![0.0; n]; }
+        let pos = f64::from_bits(v.ctl.pos.load(Ordering::Relaxed)) as usize;
+        let amp = Controls::f(&v.ctl.amp);
+        let ch = (*channels).max(1);
+        (0..n).map(|i| {
+            let f = pos as i64 - n as i64 + i as i64;
+            if f < 0 || f as usize >= *frames { return 0.0; }
+            let base = f as usize * ch;
+            data[base..base + ch].iter().sum::<f32>() / ch as f32 * amp
+        }).collect()
+    }
     /// Moves a sound file to a time in seconds.
     pub fn jump(id: u64, seconds: f32) {
         if let Some(v) = voice(id) {
@@ -4788,3 +4804,22 @@ mod text_tests {
 mod pshape;
 pub use pshape::{PShape, ShapeRef, create_shape, create_shape_group, create_shape_rect, create_shape_ellipse,
                  create_shape_line, create_shape_triangle, create_shape_quad, createShape};
+
+// Microphone and sound analysis (see mic.rs).
+mod mic;
+pub use mic::{mic_start, mic_stop, mic_level, mic_waveform, mic_spectrum, mic_sample_rate};
+/// How loud a playing sound file is right now, 0..1.
+pub fn sound_level(id: u64) -> f32 {
+    #[cfg(not(feature = "wasm"))] { mic::rms(&audio::window(id, 1024)) }
+    #[cfg(feature = "wasm")] { let _ = id; 0.0 }
+}
+/// The spectrum of a playing sound file: `bands` values, low to high, about 0..1.
+pub fn sound_spectrum(id: u64, bands: usize) -> Vec<f32> {
+    #[cfg(not(feature = "wasm"))] { let n = (bands.max(1) * 2).next_power_of_two().max(1024); mic::spectrum(&audio::window(id, n), bands) }
+    #[cfg(feature = "wasm")] { let _ = id; vec![0.0; bands] }
+}
+/// The waveform of a playing sound file: the last n samples, -1..1.
+pub fn sound_waveform(id: u64, n: usize) -> Vec<f32> {
+    #[cfg(not(feature = "wasm"))] { audio::window(id, n.max(1)) }
+    #[cfg(feature = "wasm")] { let _ = id; vec![0.0; n] }
+}
