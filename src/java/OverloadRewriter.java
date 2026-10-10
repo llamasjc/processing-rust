@@ -44,6 +44,11 @@ final class OverloadRewriter {
     Map.entry("nf",          Map.of(3, "nf_float")),
     Map.entry("nfc",         Map.of(2, "nfc_float")),
     Map.entry("text",        Map.of(5, "text_box")),
+    Map.entry("box",         Map.of(1, "box_cube", 3, "box_3d")),
+    Map.entry("size",        Map.of(3, "size_renderer")),
+    Map.entry("sphere_detail", Map.of(2, "sphere_detail_uv")),
+    Map.entry("camera",      Map.of(9, "camera_look")),
+    Map.entry("perspective", Map.of(0, "perspective_default")),
     Map.entry("text_align",  Map.of(1, "text_align_h")),
     Map.entry("textAlign",   Map.of(1, "text_align_h"))
   );

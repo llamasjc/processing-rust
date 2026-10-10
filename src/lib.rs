@@ -419,6 +419,11 @@ mod render {
     static ALPHA_TARGET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     #[inline]
     fn alpha_target() -> bool { ALPHA_TARGET.load(Ordering::Relaxed) }
+    pub(crate) fn alpha_target_pub() -> bool { alpha_target() }
+    /// fill, stroke and stroke weight, for the 3D renderer.
+    pub(crate) fn style_pub() -> (Option<Color>, Option<Color>, f32) {
+        with_style(|s| (s.fill, s.stroke, s.stroke_weight))
+    }
     /// A fully opaque pixel for the current target.
     #[inline]
     fn solid(col: Color) -> u32 { col.to_u32() | if alpha_target() { 0xFF00_0000 } else { 0 } }
@@ -970,6 +975,7 @@ mod render {
     /// missing pop can't grow them forever.
     pub fn begin_draw() {
         end_all_graphics();
+        crate::three::on_begin_frame();
         MATRIX_STACK.with(|s| { let mut st = s.borrow_mut(); st.clear(); st.push(identity()); });
         STYLE_STACK.with(|s| {
             let mut st = s.borrow_mut();
@@ -1182,15 +1188,18 @@ mod render {
     // ── Transforms ────────────────────────────────────────────────────────────
 
     pub fn push_matrix() {
+        crate::three::on_push();
         MATRIX_STACK.with(|s| {
             let top = *s.borrow().last().unwrap();
             s.borrow_mut().push(top);
         });
     }
     pub fn pop_matrix() {
+        crate::three::on_pop();
         MATRIX_STACK.with(|s| { let mut st = s.borrow_mut(); if st.len() > 1 { st.pop(); } });
     }
-    pub fn translate(tx: f32, ty: f32, _tz: f32) {
+    pub fn translate(tx: f32, ty: f32, tz: f32) {
+        crate::three::on_translate(tx, ty, tz);
         MATRIX_STACK.with(|s| {
             let mut st = s.borrow_mut();
             let top = st.last_mut().unwrap();
@@ -1199,6 +1208,7 @@ mod render {
         });
     }
     pub fn rotate_z(angle: f32) {
+        crate::three::on_rotate_z(angle);
         MATRIX_STACK.with(|s| {
             let mut st = s.borrow_mut();
             let top = st.last_mut().unwrap();
@@ -1218,7 +1228,8 @@ mod render {
     }
     pub fn shear_x(angle: f32) { apply_matrix(1.0, 0.0, angle.tan(), 1.0, 0.0, 0.0); }
     pub fn shear_y(angle: f32) { apply_matrix(1.0, angle.tan(), 0.0, 1.0, 0.0, 0.0); }
-    pub fn scale(sx: f32, sy: f32, _sz: f32) {
+    pub fn scale(sx: f32, sy: f32, sz: f32) {
+        crate::three::on_scale(sx, sy, sz);
         MATRIX_STACK.with(|s| {
             let mut st = s.borrow_mut();
             let top = st.last_mut().unwrap();
@@ -1605,6 +1616,7 @@ mod render {
     pub fn set_smooth(on: bool) { SMOOTH.store(on, Ordering::Relaxed); }
 
     pub fn reset_matrix() {
+        crate::three::on_reset();
         MATRIX_STACK.with(|s| *s.borrow_mut().last_mut().unwrap() = identity());
     }
 
@@ -4823,3 +4835,21 @@ pub fn sound_waveform(id: u64, n: usize) -> Vec<f32> {
     #[cfg(not(feature = "wasm"))] { audio::window(id, n.max(1)) }
     #[cfg(feature = "wasm")] { let _ = id; vec![0.0; n] }
 }
+
+// 3D (see three.rs).
+mod three;
+pub use three::{rotate_x, rotate_y, camera, camera_look, perspective, perspective_default, ortho,
+                lights, no_lights, ambient_light, directional_light, point_light,
+                box_3d, box_cube, sphere, sphere_detail, sphere_detail_uv, line_3d, point_3d, triangle_3d,
+                screen_x, screen_y};
+pub const P2D: u32 = 2;
+pub const P3D: u32 = 3;
+/// size(w, h, P3D): every sketch can draw 3D already, so the renderer is only noted.
+pub fn size_renderer(w: u32, h: u32, _renderer: u32) { size(w, h) }
+#[inline] pub fn rotateX(a: f32) { rotate_x(a) }
+#[inline] pub fn rotateY(a: f32) { rotate_y(a) }
+pub fn rotate_z(a: f32) { rotate(a) }
+#[inline] pub fn rotateZ(a: f32) { rotate(a) }
+pub fn scale_3d(x: f32, y: f32, z: f32) { render::scale(x, y, z); }
+#[inline] pub fn noLights() { no_lights() }
+#[inline] pub fn sphereDetail(n: f32) { sphere_detail(n) }
