@@ -16,8 +16,6 @@ png = "0.17"
 zune-jpeg = "0.4"
 # TrueType / OpenType text for createFont() and textFont()
 fontdue = "0.9"
-# Sound output and decoding for loadSound() and the oscillators
-rodio = { version = "0.20", default-features = false, features = ["wav", "vorbis", "flac", "symphonia-mp3"] }
 
 [features]
 default = []

@@ -64,7 +64,6 @@ final class OverloadRewriter {
     Set.of("image", "image_sized", "graphics_image", "graphics_image_sized",
            "create_font", "text_font_size", "filter_param",
            "shape", "shape_sized",
-           "sound_amp", "sound_pan", "sound_rate", "sound_jump", "osc_freq", "osc_amp", "osc_pan",
            "color_mode_range", "color_mode3", "color_mode_max", "nf_float", "nfc_float");
 
   /** Engine functions whose numeric parameters are all f32. */
@@ -82,7 +81,6 @@ final class OverloadRewriter {
     "image", "image_sized", "graphics_image", "graphics_image_sized",
     "create_font", "text_font_size", "text_leading",
     "rect_radii", "filter_param", "shape", "shape_sized",
-    "sound_amp", "sound_pan", "sound_rate", "sound_jump", "osc_freq", "osc_amp", "osc_pan",
     "color", "color_ga", "color_rgb", "color_rgba",
     "color_mode_range", "color_mode3", "color_mode_max",
     "text_box", "sq", "norm", "bezier_point", "bezier_tangent", "curve_point", "curve_tangent"

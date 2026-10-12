@@ -488,11 +488,9 @@ public class RustEmitter {
     Map.entry("load_bytes", "Vec<u8>"),
     Map.entry("load_image", "u64"), Map.entry("loadImage", "u64"),
     Map.entry("load_shape", "u64"), Map.entry("loadShape", "u64"),
-    Map.entry("load_sound", "u64"), Map.entry("load_font", "u64"),
+    Map.entry("load_font", "u64"),
     Map.entry("create_font", "u64"), Map.entry("createFont", "u64"),
     Map.entry("create_graphics", "u64"), Map.entry("createGraphics", "u64"),
-    Map.entry("sin_osc", "u64"), Map.entry("sqr_osc", "u64"), Map.entry("saw_osc", "u64"),
-    Map.entry("tri_osc", "u64"), Map.entry("white_noise", "u64"),
     Map.entry("create_image", "u64"), Map.entry("createImage", "u64"),
     Map.entry("get_region", "u64"), Map.entry("image_copy", "u64"), Map.entry("image_crop", "u64"),
     Map.entry("color", "Color"), Map.entry("color_rgb", "Color"), Map.entry("color_rgba", "Color"),
@@ -502,9 +500,6 @@ public class RustEmitter {
     Map.entry("create_shape_ellipse", "PShape"), Map.entry("create_shape_line", "PShape"),
     Map.entry("create_shape_triangle", "PShape"), Map.entry("create_shape_quad", "PShape"),
     Map.entry("wrap_text", "Vec<String>"),
-    Map.entry("mic_spectrum", "Vec<f32>"), Map.entry("mic_waveform", "Vec<f32>"),
-    Map.entry("sound_spectrum", "Vec<f32>"), Map.entry("sound_waveform", "Vec<f32>"),
-    Map.entry("mic_level", "f32"), Map.entry("sound_level", "f32"),
     Map.entry("random", "f32"), Map.entry("noise", "f32"), Map.entry("millis", "u64"));
 
   /** Index of c outside brackets and parentheses, or -1. */

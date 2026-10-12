@@ -333,28 +333,6 @@ shape_height	FUNCTION1
 shape_disable_style	FUNCTION1
 shape_enable_style	FUNCTION1
 
-load_sound	FUNCTION1
-sound_play	FUNCTION1
-sound_loop	FUNCTION1
-sound_pause	FUNCTION1
-sound_stop	FUNCTION1
-sound_is_playing	FUNCTION1
-sound_amp	FUNCTION1
-sound_pan	FUNCTION1
-sound_rate	FUNCTION1
-sound_jump	FUNCTION1
-sound_duration	FUNCTION1
-sound_position	FUNCTION1
-sin_osc	FUNCTION1
-sqr_osc	FUNCTION1
-saw_osc	FUNCTION1
-tri_osc	FUNCTION1
-white_noise	FUNCTION1
-osc_play	FUNCTION1
-osc_stop	FUNCTION1
-osc_freq	FUNCTION1
-osc_amp	FUNCTION1
-osc_pan	FUNCTION1
 
 # ── Lifecycle functions ────────────────────────────────────────────────────────
 setup	FUNCTION2
@@ -462,15 +440,6 @@ TOP	KEYWORD2
 BOTTOM	KEYWORD2
 BASELINE	KEYWORD2
 text_align_h	FUNCTION1
-mic_start	FUNCTION1
-mic_stop	FUNCTION1
-mic_level	FUNCTION1
-mic_waveform	FUNCTION1
-mic_spectrum	FUNCTION1
-mic_sample_rate	FUNCTION1
-sound_level	FUNCTION1
-sound_spectrum	FUNCTION1
-sound_waveform	FUNCTION1
 rotate_x	FUNCTION1
 rotate_y	FUNCTION1
 rotate_z	FUNCTION1
