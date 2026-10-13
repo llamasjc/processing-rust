@@ -281,6 +281,9 @@ public class RustEditor extends Editor {
     // The sketch's stdin stays open and unused: if the IDE dies without a
     // chance to clean up, the pipe closes and the sketch closes with it.
     pb.environment().put("PROCESSING_WATCH_STDIN", "1");
+    // the sketch was built for this renderer (RustBuild adds the feature)
+    if (Renderer.libprocessing()) pb.environment().put("PROCESSING_RENDERER", "libprocessing");
+    else pb.environment().remove("PROCESSING_RENDERER");
     // hour(), minute(), day()... in local time
     pb.environment().put("PROCESSING_UTC_OFFSET",
       String.valueOf(java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000));
@@ -437,6 +440,11 @@ public class RustEditor extends Editor {
       // mode 0 = Run, 1 = Present
       @Override public void handleRun(int mode) { RustEditor.this.startRun(mode == 1); }
       @Override public void handleStop()        { RustEditor.this.handleStop(); }
+      // the renderer menu, left of the mode selector
+      @Override public void addModeButtons(javax.swing.Box box, javax.swing.JLabel label) {
+        box.add(Renderer.menu());
+        addGap(box);
+      }
     };
   }
 

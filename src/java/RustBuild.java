@@ -47,7 +47,7 @@ public class RustBuild {
 
   /** Version stamp written to {@code .rustmode-version} in the cache project.
    *  Bump this to force a full project re-scaffold when the template changes. */
-  private static final String RUSTMODE_VERSION = "0.1.0";
+  private static final String RUSTMODE_VERSION = "0.2.0";
 
   /** Matches rustc error lines, e.g.
    *  {@code error[E0308]: --> src/main.rs:42:5} or the short form
@@ -92,6 +92,13 @@ public class RustBuild {
   }
 
   /** Shared cargo target dir: dependencies are compiled once for all sketches. */
+  /** Where this build's binaries go: libprocessing builds have their own. */
+  private static File targetDir() {
+    return Renderer.libprocessing()
+      ? new File(sharedTarget().getParentFile(), ".shared-target-libprocessing")
+      : sharedTarget();
+  }
+
   private static File sharedTarget() {
     return new File(Compat.sketchbookFolder(null), "rust-build-cache/.shared-target");
   }
@@ -217,10 +224,63 @@ public class RustBuild {
       writeFile(versionStamp, RUSTMODE_VERSION);
     }
 
+    // The local libprocessing fork can appear (or move) after the scaffold:
+    // keep the sketch's Cargo.toml pointing at it.
+    if (!needsScaffold) {
+      File toml = new File(cacheRoot, "Cargo.toml");
+      String have = toml.exists() ? readFile(toml) : "";
+      String patch = localForkPatch();
+      int at = have.indexOf(FORK_MARK);
+      int end = at < 0 ? -1 : have.indexOf(FORK_END, at);
+      String current = at < 0 || end < 0 ? "" : have.substring(at, end + FORK_END.length());
+      if (!current.equals(patch)) {
+        String base = at < 0 || end < 0 ? have : have.substring(0, at) + have.substring(end + FORK_END.length());
+        int prof = base.indexOf("[profile.dev]");
+        String next = prof < 0 ? base + patch : base.substring(0, prof) + patch + base.substring(prof);
+        writeFile(toml, next);
+      }
+    }
+
     // Always ensure src/ exists (target/ is cargo's responsibility).
     new File(cacheRoot, "src").mkdirs();
 
     return cacheRoot;
+  }
+
+  private static final String FORK_MARK = "# local libprocessing (begin)\n";
+  private static final String FORK_END  = "# local libprocessing (end)\n";
+
+  /**
+   * Your own libprocessing checkout, when there is one: LIBPROCESSING_DIR, or
+   * the folder named in the rust.libprocessing preference, or
+   * sketchbook/libprocessing. null when none of them has the crates.
+   */
+  static File localFork() {
+    java.util.List<String> tries = new java.util.ArrayList<>();
+    String env = System.getenv("LIBPROCESSING_DIR");
+    if (env != null && !env.isBlank()) tries.add(env);
+    String pref = java.util.prefs.Preferences.userRoot().node("processing/rustmode").get("rust.libprocessing", "");
+    if (!pref.isBlank()) tries.add(pref);
+    tries.add(new File(Compat.sketchbookFolder(null), "libprocessing").getPath());
+    for (String t : tries) {
+      File d = new File(t);
+      if (new File(d, "crates/processing_render/Cargo.toml").isFile()) return d;
+    }
+    return null;
+  }
+
+  /** The [patch] that swaps the pinned libprocessing for your checkout ("" when there is none). */
+  static String localForkPatch() {
+    File d = localFork();
+    if (d == null) return "";
+    StringBuilder sb = new StringBuilder(FORK_MARK);
+    sb.append("[patch.\"https://github.com/processing/libprocessing\"]\n");
+    for (String c : new String[] { "processing_core", "processing_render", "processing_input", "processing_glfw" }) {
+      String path = new File(d, "crates/" + c).getAbsolutePath().replace("\\", "/");
+      sb.append(c).append(" = { path = \"").append(path).append("\" }\n");
+    }
+    sb.append(FORK_END).append("\n");
+    return sb.toString();
   }
 
   /** Create or replace the non-source scaffolding. */
@@ -243,7 +303,14 @@ public class RustBuild {
       "# Build for browser: cargo build --target wasm32-unknown-unknown\\\n" +
       "#   --features wasm --no-default-features\n" +
       "wasm = [\"processing/wasm\"]\n" +
+      "# The libprocessing renderer (Bevy + wgpu), picked in the toolbar\n" +
+      "libprocessing = [\"processing/libprocessing\"]\n" +
       "\n" +
+      "# libprocessing's Bevy fork stands in for upstream Bevy (as in libprocessing itself)\n" +
+      "[patch.\"https://github.com/bevyengine/bevy\"]\n" +
+      "bevy = { git = \"https://github.com/processing/bevy\", branch = \"main\" }\n" +
+      "\n" +
+      localForkPatch() +
       "[profile.dev]\n" +
       "opt-level = 1\n" +
       "\n" +
@@ -254,17 +321,19 @@ public class RustBuild {
 
     writeFile(new File(root, "Cargo.toml"), cargoToml);
     // Start from the engine's own Cargo.lock: the same dependency versions
-    // the mode was tested with (and ones that build on Rust 1.82), and no
+    // the mode was tested with, and no
     // index lookup on the first build.
     File lock = new File(root, "Cargo.lock");
     File modeLock = new File(mode.getFolder(), "Cargo.lock");
-    if (!lock.exists() && modeLock.isFile()) {
+    // (re)made with the scaffold, so a mode update brings its tested versions
+    if (modeLock.isFile()) {
       try {
-        Files.copy(modeLock.toPath(), lock.toPath());
+        Files.copy(modeLock.toPath(), lock.toPath(), StandardCopyOption.REPLACE_EXISTING);
       } catch (IOException e) {
         // cargo will make its own
       }
     }
+
 
     // ── processing/ ───────────────────────────────────────────────────────────
     // The crate source lives in RustMode/src/lib.rs and RustMode/Cargo.toml.
@@ -315,6 +384,14 @@ public class RustBuild {
     cmd.add("build");
     if (release) cmd.add("--release");
     cmd.add("--message-format=short");
+    boolean lp = Renderer.libprocessing();
+    if (lp) {
+      cmd.add("--features");
+      cmd.add("libprocessing");
+      File fork = localFork();
+      mode.statusMessage("Building for libprocessing" + (fork != null ? " from " + fork : " (pinned upstream)")
+        + ". The first build compiles Bevy and takes several minutes.");
+    }
 
     ProcessBuilder pb = new ProcessBuilder(cmd);
     pb.directory(projectDir);
@@ -326,7 +403,8 @@ public class RustBuild {
       System.getenv().getOrDefault("RUSTFLAGS", "") + " -C incremental=true");
 
     // Point all sketches at a shared target dir so deps are compiled once.
-    pb.environment().put("CARGO_TARGET_DIR", sharedTarget().getAbsolutePath());
+    // (libprocessing builds get their own, so switching back and forth doesn't rebuild everything)
+    pb.environment().put("CARGO_TARGET_DIR", targetDir().getAbsolutePath());
 
     if (cancelled) throw new InterruptedException("build cancelled");
     Process proc = pb.start();
@@ -383,7 +461,7 @@ public class RustBuild {
     String profile   = release ? "release" : "debug";
     String sketchBin = sanitiseName(sketch.getName());
     String binaryName = isWindows() ? sketchBin + ".exe" : sketchBin;
-    File binary = new File(sharedTarget(), profile + "/" + binaryName);
+    File binary = new File(targetDir(), profile + "/" + binaryName);
 
     if (!binary.exists()) {
       throw new IOException("Build succeeded but binary not found: " + binary);

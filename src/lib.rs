@@ -192,25 +192,53 @@ mod core {
 // Software rasterizer
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// In a build with the libprocessing renderer, hands a call to it when it is
+/// the one running (see lp.rs). Compiles to nothing otherwise.
+macro_rules! lp_route {
+    ($($body:tt)*) => {
+        #[cfg(feature = "libprocessing")]
+        { if crate::lp::on() { $($body)* } }
+    };
+}
+
 mod render {
     // ── begin_shape / vertex / end_shape (inserted by shapes patch) ─────────
     // Vertices are stored untransformed; fills go through tfm + fill_tri,
     // strokes through draw_line, so both follow the current matrix and style.
-    struct ShapeState { kind: u8, pts: Vec<(f32, f32)>, curve: Vec<(f32, f32)>, active: bool }
+    struct ShapeState { kind: u8, pts: Vec<(f32, f32)>, curve: Vec<(f32, f32)>, active: bool,
+                        holes: Vec<Vec<(f32, f32)>>, outer: Option<Vec<(f32, f32)>> }
     fn shape_state() -> &'static parking_lot::Mutex<ShapeState> {
         static S: std::sync::OnceLock<parking_lot::Mutex<ShapeState>> = std::sync::OnceLock::new();
-        S.get_or_init(|| parking_lot::Mutex::new(ShapeState { kind: 0, pts: Vec::new(), curve: Vec::new(), active: false }))
+        S.get_or_init(|| parking_lot::Mutex::new(ShapeState { kind: 0, pts: Vec::new(), curve: Vec::new(), active: false,
+                                                               holes: Vec::new(), outer: None }))
     }
-    pub fn shape_begin(kind: u8) {
+    pub fn shape_begin(kind: u8) { lp_route! { crate::lp::begin_shape(kind); return; }
         let mut s = shape_state().lock();
         s.kind = kind; s.pts.clear(); s.curve.clear(); s.active = true;
+        s.holes.clear(); s.outer = None;
     }
-    pub fn shape_vertex(x: f32, y: f32) {
+    /// begin_contour / end_contour: a hole in the shape. Its points should go
+    /// round the other way from the outside, like in Processing.
+    pub fn shape_begin_contour() { lp_route! { crate::lp::begin_contour(); return; }
+        let mut s = shape_state().lock();
+        if !s.active || s.outer.is_some() { return; }
+        let outer = std::mem::take(&mut s.pts);
+        s.outer = Some(outer);
+        s.curve.clear();
+    }
+    pub fn shape_end_contour() { lp_route! { crate::lp::end_contour(); return; }
+        let mut s = shape_state().lock();
+        let Some(outer) = s.outer.take() else { return };
+        let hole = std::mem::replace(&mut s.pts, outer);
+        if hole.len() >= 3 { s.holes.push(hole); }
+        s.curve.clear();
+    }
+    pub fn shape_vertex(x: f32, y: f32) { lp_route! { crate::lp::vertex(x, y); return; }
         let mut s = shape_state().lock();
         s.curve.clear();
         s.pts.push((x, y));
     }
-    pub fn shape_bezier_vertex(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) {
+    pub fn shape_bezier_vertex(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) { lp_route! { crate::lp::bezier_vertex(cx1, cy1, cx2, cy2, x, y); return; }
         let mut s = shape_state().lock();
         let (x0, y0) = match s.pts.last() { Some(p) => *p, None => { s.pts.push((x, y)); return; } };
         for i in 1..=24 {
@@ -220,7 +248,7 @@ mod render {
             s.pts.push((px, py));
         }
     }
-    pub fn shape_quadratic_vertex(cx: f32, cy: f32, x: f32, y: f32) {
+    pub fn shape_quadratic_vertex(cx: f32, cy: f32, x: f32, y: f32) { lp_route! { crate::lp::quadratic_vertex(cx, cy, x, y); return; }
         let mut s = shape_state().lock();
         let (x0, y0) = match s.pts.last() { Some(p) => *p, None => { s.pts.push((x, y)); return; } };
         for i in 1..=16 {
@@ -229,7 +257,7 @@ mod render {
         }
     }
     /// Catmull-Rom, like Processing: the first and last curve_vertex are control points only.
-    pub fn shape_curve_vertex(x: f32, y: f32) {
+    pub fn shape_curve_vertex(x: f32, y: f32) { lp_route! { crate::lp::curve_vertex(x, y); return; }
         let mut s = shape_state().lock();
         s.curve.push((x, y));
         let n = s.curve.len();
@@ -243,12 +271,24 @@ mod render {
             s.pts.push(pt);
         }
     }
-    pub fn shape_end(close: bool) {
+    pub fn shape_end(close: bool) { lp_route! { crate::lp::end_shape(close); return; }
         let (kind, pts) = {
             let mut s = shape_state().lock();
             if !s.active { return; }
             s.active = false;
             s.curve.clear();
+            // a contour left open: end it here
+            if let Some(outer) = s.outer.take() {
+                let hole = std::mem::replace(&mut s.pts, outer);
+                if hole.len() >= 3 { s.holes.push(hole); }
+            }
+            let holes = std::mem::take(&mut s.holes);
+            if !holes.is_empty() && s.kind == 0 && s.pts.len() >= 3 {
+                let outer = std::mem::take(&mut s.pts);
+                drop(s);
+                shape_with_holes(&outer, &holes, close);
+                return;
+            }
             (s.kind, std::mem::take(&mut s.pts))
         };
         let (has_fill, has_stroke) = with_style(|s| (s.fill.is_some(), s.stroke.is_some()));
@@ -264,6 +304,29 @@ mod render {
                      poly(&[pts[i-3], pts[i-2], pts[i], pts[i-1]], true);
                  },
             _ => poly(&pts, close),                                              // polygon
+        }
+    }
+    /// A polygon with holes: filled as one shape (each hole joined to the
+    /// outside by a seam with no width), each ring outlined on its own.
+    fn shape_with_holes(outer: &[(f32, f32)], holes: &[Vec<(f32, f32)>], close: bool) {
+        let (fill, has_stroke) = with_style(|s| (s.fill, s.stroke.is_some()));
+        if let Some(fc) = fill {
+            let mut all: Vec<(f32, f32)> = outer.to_vec();
+            let anchor = outer[0];
+            for h in holes {
+                all.push(anchor);
+                all.extend_from_slice(h);
+                all.push(h[0]);
+                all.push(anchor);
+            }
+            let (cw, ch) = canvas_dims();
+            let screen: Vec<(f32, f32)> = all.iter().map(|p| tfm(p.0, p.1)).collect();
+            let mut buf = pixel_buf().lock();
+            fill_poly(&mut buf, cw, ch, &screen, fc);
+        }
+        if has_stroke {
+            shape_polygon(outer, close, false, true);
+            for h in holes { shape_polygon(h, true, false, true); }
         }
     }
     /// Fill a polygon of any shape (see fill_poly), then stroke its outline.
@@ -409,7 +472,7 @@ mod render {
     // 0 BLEND (default), 1 ADD, 2 SUBTRACT, 3 DARKEST, 4 LIGHTEST,
     // 5 DIFFERENCE, 6 EXCLUSION, 7 MULTIPLY, 8 SCREEN, 9 REPLACE
     static BLEND_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    pub fn set_blend_mode(mode: u8) { BLEND_MODE.store(if mode <= 9 { mode } else { 0 }, Ordering::Relaxed); }
+    pub fn set_blend_mode(mode: u8) { lp_route! { crate::lp::blend_mode(if mode <= 9 { mode } else { 0 }); } BLEND_MODE.store(if mode <= 9 { mode } else { 0 }, Ordering::Relaxed); }
     #[inline]
     fn blend_mode() -> u8 { BLEND_MODE.load(Ordering::Relaxed) }
 
@@ -988,13 +1051,13 @@ mod render {
     pub fn present()    {}
 
     #[allow(dead_code)]
-    pub fn background_gray(v: f32) {
+    pub fn background_gray(v: f32) { lp_route! { crate::lp::background(Color::from_gray(v)); return; }
         let col = Color::from_gray(v);
         let p = solid(col);
         let mut buf = pixel_buf().lock();
         buf.fill(p);
     }
-    pub fn background_rgb(r: f32, g: f32, b: f32) {
+    pub fn background_rgb(r: f32, g: f32, b: f32) { lp_route! { crate::lp::background(Color::from_rgb(r, g, b)); return; }
         let col = Color::from_rgb(r, g, b);
         let p = solid(col);
         let mut buf = pixel_buf().lock();
@@ -1002,7 +1065,7 @@ mod render {
     }
     /// A translucent background blends over what is already there (the usual
     /// way to leave trails).
-    pub fn background_rgba(r: f32, g: f32, b: f32, a: f32) {
+    pub fn background_rgba(r: f32, g: f32, b: f32, a: f32) { lp_route! { crate::lp::background(Color::from_rgba(r, g, b, a)); return; }
         if a >= 1.0 || a.is_nan() { return background_rgb(r, g, b); }
         if a <= 0.0 { return; }
         let col = Color::from_rgba(r, g, b, a);
@@ -1011,16 +1074,16 @@ mod render {
     }
     pub fn background_color(c: Color) { background_rgba(c.r, c.g, c.b, c.a); }
 
-    pub fn set_fill_none()                           { with_style_mut(|s| s.fill = None); }
-    pub fn set_fill_color(c: Color)                  { with_style_mut(|s| s.fill = Some(c)); }
+    pub fn set_fill_none()                           { lp_route! { crate::lp::fill(None); } with_style_mut(|s| s.fill = None); }
+    pub fn set_fill_color(c: Color)                  { lp_route! { crate::lp::fill(Some(c)); } with_style_mut(|s| s.fill = Some(c)); }
 
-    pub fn set_stroke_none()                          { with_style_mut(|s| s.stroke = None); }
-    pub fn set_stroke_color(c: Color)                 { with_style_mut(|s| s.stroke = Some(c)); }
+    pub fn set_stroke_none()                          { lp_route! { crate::lp::stroke(None); } with_style_mut(|s| s.stroke = None); }
+    pub fn set_stroke_color(c: Color)                 { lp_route! { crate::lp::stroke(Some(c)); } with_style_mut(|s| s.stroke = Some(c)); }
     /// 0 ROUND, 1 SQUARE, 2 PROJECT
-    pub fn set_stroke_cap(cap: u8)   { with_style_mut(|s| s.cap  = if cap  <= 2 { cap }  else { 0 }); }
+    pub fn set_stroke_cap(cap: u8)   { lp_route! { crate::lp::stroke_cap(cap); } with_style_mut(|s| s.cap  = if cap  <= 2 { cap }  else { 0 }); }
     /// 0 MITER, 1 BEVEL, 2 ROUND
-    pub fn set_stroke_join(join: u8) { with_style_mut(|s| s.join = if join <= 2 { join } else { 0 }); }
-    pub fn set_stroke_weight(w: f32) {
+    pub fn set_stroke_join(join: u8) { lp_route! { crate::lp::stroke_join(join); } with_style_mut(|s| s.join = if join <= 2 { join } else { 0 }); }
+    pub fn set_stroke_weight(w: f32) { lp_route! { crate::lp::stroke_weight(w); }
         // NaN and negatives fall back to a hairline
         with_style_mut(|s| s.stroke_weight = if w > 0.0 { w.min(4096.0) } else { 1.0 });
     }
@@ -1034,7 +1097,7 @@ mod render {
         (m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5])
     }
 
-    pub fn draw_ellipse(cx: f32, cy: f32, w: f32, h: f32) {
+    pub fn draw_ellipse(cx: f32, cy: f32, w: f32, h: f32) { lp_route! { crate::lp::ellipse(cx, cy, w, h); return; }
         if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()) { return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
@@ -1044,7 +1107,7 @@ mod render {
         if let Some(sc) = stroke { stroke_path(&mut buf, cw, ch, &pts, true, sw, sc); }
     }
 
-    pub fn draw_rect(x: f32, y: f32, w: f32, h: f32) {
+    pub fn draw_rect(x: f32, y: f32, w: f32, h: f32) { lp_route! { crate::lp::rect(x, y, w, h, [0.0; 4]); return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         // Transform all four corners so rotation/scale in the matrix stack work correctly.
@@ -1054,11 +1117,11 @@ mod render {
         if let Some(sc) = stroke { outline(&mut buf, cw, ch, &c, sw, sc); }
     }
 
-    pub fn draw_rect_rounded(x: f32, y: f32, w: f32, h: f32, r: f32) {
+    pub fn draw_rect_rounded(x: f32, y: f32, w: f32, h: f32, r: f32) { lp_route! { crate::lp::rect(x, y, w, h, [r; 4]); return; }
         draw_rect_radii(x, y, w, h, [r, r, r, r])
     }
     /// Radii in Processing's order: top-left, top-right, bottom-right, bottom-left.
-    pub fn draw_rect_radii(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) {
+    pub fn draw_rect_radii(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) { lp_route! { crate::lp::rect(x, y, w, h, radii); return; }
         if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) { return; }
         // a negative size means the rect extends the other way
         let (x, w) = if w < 0.0 { (x + w, -w) } else { (x, w) };
@@ -1087,7 +1150,7 @@ mod render {
         if let Some(sc) = stroke { stroke_path(&mut buf, cw, ch, &pts, true, sw, sc); }
     }
 
-    pub fn draw_triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
+    pub fn draw_triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) { lp_route! { crate::lp::triangle(x1, y1, x2, y2, x3, y3); return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         let c = [tfm(x1, y1), tfm(x2, y2), tfm(x3, y3)];
@@ -1096,7 +1159,7 @@ mod render {
         if let Some(sc) = stroke { outline(&mut buf, cw, ch, &c, sw, sc); }
     }
 
-    pub fn draw_line(x1: f32, y1: f32, x2: f32, y2: f32) {
+    pub fn draw_line(x1: f32, y1: f32, x2: f32, y2: f32) { lp_route! { crate::lp::line(x1, y1, x2, y2); return; }
         let (cw, ch) = canvas_dims();
         let (sc, sw) = with_style(|s| (s.stroke, s.stroke_weight));
         if let Some(c) = sc {
@@ -1106,7 +1169,7 @@ mod render {
         }
     }
 
-    pub fn draw_point(x: f32, y: f32) {
+    pub fn draw_point(x: f32, y: f32) { lp_route! { crate::lp::point(x, y); return; }
         let (cw, ch) = canvas_dims();
         let (sc, sw) = with_style(|s| (s.stroke, s.stroke_weight));
         if let Some(c) = sc {
@@ -1129,7 +1192,7 @@ mod render {
     }
 
     pub fn draw_quad(x1: f32, y1: f32, x2: f32, y2: f32,
-                     x3: f32, y3: f32, x4: f32, y4: f32) {
+                     x3: f32, y3: f32, x4: f32, y4: f32) { lp_route! { crate::lp::quad(x1, y1, x2, y2, x3, y3, x4, y4); return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         let c = [tfm(x1, y1), tfm(x2, y2), tfm(x3, y3), tfm(x4, y4)];
@@ -1143,7 +1206,7 @@ mod render {
     }
     /// mode: 0 default (filled as a pie, only the curve stroked), 1 OPEN,
     /// 2 CHORD, 3 PIE, as in Processing.
-    pub fn draw_arc_mode(cx: f32, cy: f32, w: f32, h: f32, start: f32, stop: f32, mode: u8) {
+    pub fn draw_arc_mode(cx: f32, cy: f32, w: f32, h: f32, start: f32, stop: f32, mode: u8) { lp_route! { crate::lp::arc(cx, cy, w, h, start, stop, mode); return; }
         if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()
              && start.is_finite() && stop.is_finite()) { return; }
         let (cw, ch) = canvas_dims();
@@ -1187,18 +1250,18 @@ mod render {
 
     // ── Transforms ────────────────────────────────────────────────────────────
 
-    pub fn push_matrix() {
+    pub fn push_matrix() { lp_route! { crate::lp::push_matrix(); }
         crate::three::on_push();
         MATRIX_STACK.with(|s| {
             let top = *s.borrow().last().unwrap();
             s.borrow_mut().push(top);
         });
     }
-    pub fn pop_matrix() {
+    pub fn pop_matrix() { lp_route! { crate::lp::pop_matrix(); }
         crate::three::on_pop();
         MATRIX_STACK.with(|s| { let mut st = s.borrow_mut(); if st.len() > 1 { st.pop(); } });
     }
-    pub fn translate(tx: f32, ty: f32, tz: f32) {
+    pub fn translate(tx: f32, ty: f32, tz: f32) { lp_route! { crate::lp::translate(tx, ty, tz); }
         crate::three::on_translate(tx, ty, tz);
         MATRIX_STACK.with(|s| {
             let mut st = s.borrow_mut();
@@ -1207,7 +1270,7 @@ mod render {
             *top = mat_mul(top, &t);
         });
     }
-    pub fn rotate_z(angle: f32) {
+    pub fn rotate_z(angle: f32) { lp_route! { crate::lp::rotate(angle, bevy::math::Vec3::Z); }
         crate::three::on_rotate_z(angle);
         MATRIX_STACK.with(|s| {
             let mut st = s.borrow_mut();
@@ -1218,7 +1281,7 @@ mod render {
         });
     }
     /// Multiplies the current matrix by [a c e; b d f].
-    pub fn apply_matrix(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) {
+    pub fn apply_matrix(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) { lp_route! { crate::lp::apply_matrix(a, b, c, d, e, f); }
         if ![a, b, c, d, e, f].iter().all(|v| v.is_finite()) { return; }
         MATRIX_STACK.with(|s| {
             let mut st = s.borrow_mut();
@@ -1226,9 +1289,9 @@ mod render {
             *top = mat_mul(top, &[a, b, c, d, e, f]);
         });
     }
-    pub fn shear_x(angle: f32) { apply_matrix(1.0, 0.0, angle.tan(), 1.0, 0.0, 0.0); }
-    pub fn shear_y(angle: f32) { apply_matrix(1.0, angle.tan(), 0.0, 1.0, 0.0, 0.0); }
-    pub fn scale(sx: f32, sy: f32, sz: f32) {
+    pub fn shear_x(angle: f32) { lp_route! { crate::lp::shear_x(angle); return; } apply_matrix(1.0, 0.0, angle.tan(), 1.0, 0.0, 0.0); }
+    pub fn shear_y(angle: f32) { lp_route! { crate::lp::shear_y(angle); return; } apply_matrix(1.0, angle.tan(), 0.0, 1.0, 0.0, 0.0); }
+    pub fn scale(sx: f32, sy: f32, sz: f32) { lp_route! { crate::lp::scale(sx, sy, sz); }
         crate::three::on_scale(sx, sy, sz);
         MATRIX_STACK.with(|s| {
             let mut st = s.borrow_mut();
@@ -1240,13 +1303,13 @@ mod render {
 
     // ── Style stack ───────────────────────────────────────────────────────────
 
-    pub fn push_style() {
+    pub fn push_style() { lp_route! { crate::lp::push_style(); }
         STYLE_STACK.with(|s| {
             let top = s.borrow().last().unwrap().clone();
             s.borrow_mut().push(top);
         });
     }
-    pub fn pop_style() {
+    pub fn pop_style() { lp_route! { crate::lp::pop_style(); }
         STYLE_STACK.with(|s| { let mut st = s.borrow_mut(); if st.len() > 1 { st.pop(); } });
     }
 
@@ -1413,13 +1476,18 @@ mod render {
             return 0;
         }
         match load() {
-            Ok(f)  => { all.push(f); all.len() as u64 }
+            Ok(f)  => {
+                all.push(f);
+                let id = all.len() as u64;
+                lp_route! { if let Some(p) = find_font(name) { crate::lp::font_loaded(id, &p); } }
+                id
+            }
             Err(e) => { eprintln!("createFont(\"{}\"): {} (.ttf and .otf are supported)", name, e); 0 }
         }
     }
     /// textFont(font): 0 is the built-in pixel font. A font made with a size
     /// brings that size along; `size` (when above 0) overrides it.
-    pub fn set_text_font(id: u64, size: f32) {
+    pub fn set_text_font(id: u64, size: f32) { lp_route! { crate::lp::text_font(id, size); }
         let own = fonts().lock().get((id as usize).wrapping_sub(1)).map(|f| f.size);
         match own {
             Some(font_size) => {
@@ -1433,7 +1501,7 @@ mod render {
         }
     }
     /// textLeading(pixels): distance between lines; 0 or less goes back to the font's own.
-    pub fn set_text_leading(px: f32) { LEADING.with(|l| l.set(if px > 0.0 && px.is_finite() { Some(px.min(8192.0)) } else { None })); }
+    pub fn set_text_leading(px: f32) { lp_route! { crate::lp::text_leading(px); } LEADING.with(|l| l.set(if px > 0.0 && px.is_finite() { Some(px.min(8192.0)) } else { None })); }
 
     fn text_px() -> f32 { TEXT_SIZE.with(|ts| *ts.borrow()) }
     /// Runs `f` with the current TrueType font, or returns None for the built-in one.
@@ -1521,7 +1589,7 @@ mod render {
         TINT.with(|t| t.set(saved_tint));
     }
 
-    pub fn draw_text(s: &str, x: f32, y: f32) {
+    pub fn draw_text(s: &str, x: f32, y: f32) { lp_route! { crate::lp::text(s, x, y); return; }
         let fc = match with_style(|s| s.fill) { Some(c) => c, None => return };
         let drawn = with_font(|font| {
             for (n, line) in s.split('\n').enumerate() {
@@ -1596,7 +1664,7 @@ mod render {
     }
 
     /// Width in pixels of `s` at the current text size (the widest line).
-    pub fn text_width(s: &str) -> f32 {
+    pub fn text_width(s: &str) -> f32 { lp_route! { return crate::lp::text_width(s); }
         let px = text_px();
         let ttf = with_font(|font| {
             s.split('\n').map(|l| l.chars().map(|c| font.metrics(c, px).advance_width).sum::<f32>())
@@ -1607,7 +1675,7 @@ mod render {
         s.split('\n').map(|l| l.chars().count()).max().unwrap_or(0) as f32 * 6.0 * cell_f
     }
 
-    pub fn set_text_size(size: f32) {
+    pub fn set_text_size(size: f32) { lp_route! { crate::lp::text_size(if size.is_finite() { size.clamp(1.0, 2048.0) } else { 12.0 }); }
         // NaN, zero and negatives would make every glyph loop misbehave
         let size = if size.is_finite() { size.clamp(1.0, 2048.0) } else { 12.0 };
         TEXT_SIZE.with(|s| *s.borrow_mut() = size);
@@ -1615,7 +1683,7 @@ mod render {
 
     pub fn set_smooth(on: bool) { SMOOTH.store(on, Ordering::Relaxed); }
 
-    pub fn reset_matrix() {
+    pub fn reset_matrix() { lp_route! { crate::lp::reset_matrix(); }
         crate::three::on_reset();
         MATRIX_STACK.with(|s| *s.borrow_mut().last_mut().unwrap() = identity());
     }
@@ -1627,8 +1695,14 @@ mod render {
     thread_local! {
         static TEXT_ALIGN: std::cell::Cell<(u8, u8)> = std::cell::Cell::new((0, 0));
     }
-    pub fn set_text_align(h: u8, v: u8) { TEXT_ALIGN.with(|a| a.set((h.min(2), v.min(3)))); }
+    pub fn set_text_align(h: u8, v: u8) { lp_route! { crate::lp::text_align(h.min(2), v.min(3)); } TEXT_ALIGN.with(|a| a.set((h.min(2), v.min(3)))); }
     pub fn text_align_v() -> u8 { TEXT_ALIGN.with(|a| a.get().1) }
+    /// Alignment and size, for the libprocessing renderer to start in step.
+    #[allow(dead_code)]
+    pub(crate) fn text_state() -> (u8, u8, f32) {
+        let (h, v) = TEXT_ALIGN.with(|a| a.get());
+        (h, v, TEXT_SIZE.with(|ts| *ts.borrow()))
+    }
     fn text_cell() -> f32 {
         ((TEXT_SIZE.with(|ts| *ts.borrow()) / 8.0).max(1.0).round()) as f32
     }
@@ -1640,12 +1714,12 @@ mod render {
             .unwrap_or_else(|| 10.0 * text_cell())
     }
     /// Built-in font: glyphs are 7 rows above the baseline and 1 below.
-    pub fn text_ascent() -> f32 {
+    pub fn text_ascent() -> f32 { lp_route! { return crate::lp::text_ascent(); }
         let px = text_px();
         with_font(|f| f.horizontal_line_metrics(px).map(|m| m.ascent).unwrap_or(px * 0.8))
             .unwrap_or_else(|| 7.0 * text_cell())
     }
-    pub fn text_descent() -> f32 {
+    pub fn text_descent() -> f32 { lp_route! { return crate::lp::text_descent(); }
         let px = text_px();
         with_font(|f| f.horizontal_line_metrics(px).map(|m| -m.descent).unwrap_or(px * 0.2))
             .unwrap_or_else(|| 1.0 * text_cell())
@@ -1697,6 +1771,7 @@ mod render {
     /// Lines that don't fit in the height are left out, like Processing.
     pub fn draw_text_box(s: &str, x: f32, y: f32, w: f32, h: f32) {
         if !(w > 0.0 && h > 0.0) { return; }
+        lp_route! { crate::lp::text_box(s, x, y, w, h); return; }
         let lines = wrap_text(s, w);
         let lead = text_leading();
         let line_h = text_ascent() + text_descent();
@@ -1716,11 +1791,12 @@ mod render {
     }
 
     /// The whole canvas, row by row, as 0xAARRGGBB (alpha always 255).
-    pub fn copy_pixels() -> Vec<u32> {
+    pub fn copy_pixels() -> Vec<u32> { lp_route! { crate::lp::pull(); }
         pixel_buf().lock().iter().map(|p| 0xFF00_0000 | (p & 0x00FF_FFFF)).collect()
     }
     /// Writes pixels back, as many as fit. Alpha is ignored: the canvas is opaque.
     pub fn write_pixels(px: &[u32]) {
+        lp_route! { let (cw, ch) = canvas_dims(); crate::lp::write_pixels(px, cw, ch); }
         let mut buf = pixel_buf().lock();
         let keep = if alpha_target() { 0xFFFF_FFFF } else { 0x00FF_FFFF };
         for (d, s) in buf.iter_mut().zip(px.iter()) { *d = s & keep; }
@@ -1731,6 +1807,23 @@ mod render {
     /// 14 OPAQUE, 15 POSTERIZE (param: levels 2..255), 16 THRESHOLD
     /// (param: 0..1, default 0.5), 17 ERODE, 18 DILATE. Processing's numbers.
     pub fn filter(kind: u32, param: f32) {
+        lp_route! {
+            crate::lp::pull();
+            filter_cpu(kind, param);
+            let (cw, ch) = canvas_dims();
+            let px = copy_pixels_cpu();
+            crate::lp::write_pixels(&px, cw, ch);
+            return;
+        }
+        filter_cpu(kind, param);
+    }
+    #[allow(dead_code)]
+    /// The pixels as they are, transparency included on a layer.
+    fn copy_pixels_cpu() -> Vec<u32> {
+        let layer = alpha_target();
+        pixel_buf().lock().iter().map(|p| if layer { *p } else { 0xFF00_0000 | (p & 0x00FF_FFFF) }).collect()
+    }
+    fn filter_cpu(kind: u32, param: f32) {
         let (cw, ch) = canvas_dims();
         let mut buf = pixel_buf().lock();
         if cw == 0 || ch == 0 || buf.len() < cw * ch { return; }
@@ -1816,6 +1909,7 @@ mod render {
 
     /// set(x, y, color): one pixel, no transform, no blending.
     pub fn set_pixel(x: i32, y: i32, col: Color) {
+        lp_route! { crate::lp::set_pixel(x, y, col); }
         let (cw, ch) = canvas_dims();
         if x < 0 || y < 0 || x >= cw as i32 || y >= ch as i32 { return; }
         let mut buf = pixel_buf().lock();
@@ -1824,6 +1918,12 @@ mod render {
 
     // ── Images ────────────────────────────────────────────────────────────
     struct Img { w: usize, h: usize, px: Vec<Color> }
+    /// Bumped when an image's pixels change, so the libprocessing renderer
+    /// knows to upload it again.
+    #[allow(dead_code)]
+    fn img_version(id: u64) -> u64 { IMG_VER.lock().get(&id).copied().unwrap_or(0) }
+    fn img_edited(id: u64) { *IMG_VER.lock().entry(id).or_insert(0) += 1; }
+    static IMG_VER: parking_lot::Mutex<std::collections::BTreeMap<u64, u64>> = parking_lot::Mutex::new(std::collections::BTreeMap::new());
     fn images() -> &'static parking_lot::Mutex<Vec<Img>> {
         static I: std::sync::OnceLock<parking_lot::Mutex<Vec<Img>>> = std::sync::OnceLock::new();
         I.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
@@ -1831,7 +1931,7 @@ mod render {
     thread_local! {
         static TINT: std::cell::Cell<Option<Color>> = std::cell::Cell::new(None);
     }
-    pub fn set_tint(c: Option<Color>) { TINT.with(|t| t.set(c)); }
+    pub fn set_tint(c: Option<Color>) { lp_route! { crate::lp::tint(c); } TINT.with(|t| t.set(c)); }
 
     /// Load a PNG. Returns a 1-based id, or 0 if it couldn't be read.
     pub fn load_image(path: &str) -> u64 {
@@ -1908,10 +2008,12 @@ mod render {
             .unwrap_or(Color::from_rgba(0.0, 0.0, 0.0, 0.0))
     }
     pub fn image_set(id: u64, x: i64, y: i64, c: Color) {
+        img_edited(id);
         with_img(id, |i| if x >= 0 && y >= 0 && (x as usize) < i.w && (y as usize) < i.h { i.px[y as usize * i.w + x as usize] = c; });
     }
     pub fn image_pixels(id: u64) -> Vec<Color> { with_img(id, |i| i.px.clone()).unwrap_or_default() }
     pub fn image_set_pixels(id: u64, px: &[Color]) {
+        img_edited(id);
         with_img(id, |i| for (d, s) in i.px.iter_mut().zip(px) { *d = *s; });
     }
     /// A new image cut out of another one (parts outside are transparent).
@@ -1934,6 +2036,7 @@ mod render {
     }
     /// Resizes in place with bilinear sampling. A 0 keeps the aspect ratio.
     pub fn image_resize(id: u64, w: usize, h: usize) {
+        img_edited(id);
         with_img(id, |i| {
             let (w, h) = match (w, h) {
                 (0, 0) => return,
@@ -1957,6 +2060,7 @@ mod render {
     }
     /// mask(): the mask's brightness becomes this image's alpha (sizes must match).
     pub fn image_mask(id: u64, mask: u64) -> bool {
+        img_edited(id);
         let m = match with_img(mask, |m| (m.w, m.h, m.px.clone())) { Some(m) => m, None => return false };
         with_img(id, |i| {
             if (i.w, i.h) != (m.0, m.1) { eprintln!("mask: the mask must be the same size as the image"); return false; }
@@ -1965,7 +2069,7 @@ mod render {
         }).unwrap_or(false)
     }
     /// get(x, y, w, h): a copy of part of the canvas (or the layer being drawn) as a new image.
-    pub fn canvas_region(x: i64, y: i64, w: usize, h: usize) -> u64 {
+    pub fn canvas_region(x: i64, y: i64, w: usize, h: usize) -> u64 { lp_route! { crate::lp::pull(); }
         if w == 0 || h == 0 || w * h > MAX_IMAGE_PIXELS { return 0; }
         let (cw, ch) = canvas_dims();
         let buf = pixel_buf().lock();
@@ -2004,6 +2108,15 @@ mod render {
     pub fn draw_image(id: u64, x: f32, y: f32, w: f32, h: f32) {
         let imgs = images().lock();
         let img = match imgs.get((id as usize).wrapping_sub(1)) { Some(i) => i, None => return };
+        lp_route! {
+            let e = crate::lp::image_entity(id, img_version(id), img.w, img.h, || img.px.iter().flat_map(|c| {
+                let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                [b(c.r), b(c.g), b(c.b), b(c.a)]
+            }).collect());
+            let has_alpha = img.px.iter().any(|c| c.a < 0.999);
+            if let Some(e) = e { crate::lp::image_alpha(e, x, y, w, h, has_alpha); }
+            return;
+        }
         blit(img.w, img.h, &|i| img.px[i], x, y, w, h);
     }
 
@@ -2150,6 +2263,46 @@ mod render {
         let Some(shape) = all.get((id as usize).wrapping_sub(1)) else { return };
         if !(shape.w > 0.0 && shape.h > 0.0) || !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) { return; }
         let (sx, sy) = (w / shape.w, h / shape.h);
+        // libprocessing: the same outlines, as shapes with contours for holes
+        lp_route! {
+            let place = |p: &(f32, f32)| (x + (p.0 - shape.x) * sx, y + (p.1 - shape.y) * sy);
+            let grow = (sx.abs() * sy.abs()).sqrt();
+            for item in &shape.items {
+                crate::lp::push_style();
+                if shape.own_style {
+                    crate::lp::fill(item.fill);
+                    crate::lp::stroke(item.stroke);
+                    crate::lp::stroke_weight((item.weight * grow).max(0.0));
+                }
+                let (has_fill, has_stroke) = if shape.own_style { (item.fill.is_some(), item.stroke.is_some()) }
+                    else { with_style(|s| (s.fill.is_some(), s.stroke.is_some())) };
+                if has_fill {
+                    crate::lp::stroke(None);
+                    let mut first = true;
+                    crate::lp::begin_shape(0);
+                    for (pts, _) in &item.contours {
+                        if pts.len() < 3 { continue; }
+                        if !first { crate::lp::begin_contour(); }
+                        for p in pts { let (px, py) = place(p); crate::lp::vertex(px, py); }
+                        if !first { crate::lp::end_contour(); }
+                        first = false;
+                    }
+                    crate::lp::end_shape(true);
+                }
+                if has_stroke {
+                    if shape.own_style { crate::lp::stroke(item.stroke); }
+                    else { crate::lp::stroke(with_style(|s| s.stroke)); }
+                    crate::lp::fill(None);
+                    for (pts, closed) in &item.contours {
+                        crate::lp::begin_shape(0);
+                        for p in pts { let (px, py) = place(p); crate::lp::vertex(px, py); }
+                        crate::lp::end_shape(*closed);
+                    }
+                }
+                crate::lp::pop_style();
+            }
+            return;
+        }
         let place = |p: &(f32, f32)| tfm(x + (p.0 - shape.x) * sx, y + (p.1 - shape.y) * sy);
         let grow = matrix_scale() * (sx.abs() * sy.abs()).sqrt();
         let (cw, ch) = canvas_dims();
@@ -2680,14 +2833,16 @@ mod render {
             return 0;
         }
         all.push(Layer { w, h, px: vec![0u32; w as usize * h as usize], style: Style::default(), active: false });
-        all.len() as u64
+        let id = all.len() as u64;
+        lp_route! { if !crate::lp::create_layer(id, w, h) { return 0; } }
+        id
     }
     pub fn graphics_size(id: u64) -> (u32, u32) {
         layers().lock().get((id as usize).wrapping_sub(1)).map(|l| (l.w, l.h)).unwrap_or((0, 0))
     }
     /// From here on, drawing goes to the layer. Returns false for a bad id or
     /// a layer that is already being drawn to.
-    pub fn begin_graphics(id: u64) -> bool {
+    pub fn begin_graphics(id: u64) -> bool { lp_route! { if !crate::lp::begin_layer(id) { return false; } }
         let idx = (id as usize).wrapping_sub(1);
         let mut all = layers().lock();
         let Some(layer) = all.get_mut(idx) else { return false };
@@ -2704,7 +2859,7 @@ mod render {
         true
     }
     /// Back to whatever was the target before the last begin_graphics().
-    pub fn end_graphics() {
+    pub fn end_graphics() { lp_route! { crate::lp::end_layer(); }
         let Some(saved) = TARGETS.with(|t| t.borrow_mut().pop()) else { return };
         let mut all = layers().lock();
         if let Some(layer) = all.get_mut(saved.layer) {
@@ -2724,13 +2879,13 @@ mod render {
     }
 
     /// clear(): a layer becomes fully transparent again; the canvas goes black.
-    pub fn clear() {
+    pub fn clear() { lp_route! { crate::lp::background(Color::from_rgba(0.0, 0.0, 0.0, 0.0)); return; }
         pixel_buf().lock().fill(0);
     }
 
     /// Draws a layer like an image. A layer can't be drawn while it is itself
     /// the target.
-    pub fn draw_graphics(id: u64, x: f32, y: f32, w: f32, h: f32) {
+    pub fn draw_graphics(id: u64, x: f32, y: f32, w: f32, h: f32) { lp_route! { crate::lp::draw_layer(id, x, y, w, h); return; }
         let all = layers().lock();
         let Some(layer) = all.get((id as usize).wrapping_sub(1)) else { return };
         if layer.active { return; }
@@ -2799,6 +2954,12 @@ mod glfw {
     // (i3, sway, Hyprland, bspwm) float the window instead of tiling it.
     static RESIZABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pub fn set_resizable(on: bool) { RESIZABLE.store(on, Ordering::Relaxed); }
+    /// What the window should be like, for the libprocessing renderer:
+    /// (resizable, cursor shown, present / full screen area).
+    #[allow(dead_code)]
+    pub(crate) fn window_wants() -> (bool, bool, Option<(usize, usize, isize, isize)>) {
+        (RESIZABLE.load(Ordering::Relaxed), CURSOR_VISIBLE.load(Ordering::Relaxed), *PRESENT.lock().unwrap())
+    }
     // Present mode: a borderless window that covers one screen, with the
     // sketch centered on a plain background. (width, height, x, y) of the screen.
     static PRESENT: Mutex<Option<(usize, usize, isize, isize)>> = Mutex::new(None);
@@ -2833,6 +2994,7 @@ mod glfw {
         match display() {
             Some((w, h, x, y)) => {
                 set_size(w as u32, h as u32);
+                lp_route! { crate::lp::size(w as u32, h as u32); }
                 set_present(w, h, x, y);
             }
             None => eprintln!("fullScreen() only works when the sketch is started from Processing; using a window instead"),
@@ -2851,12 +3013,14 @@ mod glfw {
     pub fn request_redraw()       { REDRAW.store(true, Ordering::Relaxed); }
     pub fn exit_sketch()          {
         use std::io::Write;
+        lp_route! { crate::lp::shutdown(); }
         let _ = std::io::stdout().flush();
         std::process::exit(0);
     }
     /// Frames per second actually reached (smoothed), like Processing's frameRate.
     pub fn measured_frame_rate() -> f32 { f32::from_bits(MEASURED_FPS.load(Ordering::Relaxed)) }
     pub fn set_window_title(t: &str) {
+        lp_route! { crate::lp::set_title(t); }
         *WANT_TITLE.get_or_init(|| Mutex::new(t.to_owned())).lock().unwrap() = t.to_owned();
     }
     pub static MOUSE_BUTTON:   std::sync::atomic::AtomicU32  = std::sync::atomic::AtomicU32::new(0);
@@ -2864,6 +3028,11 @@ mod glfw {
     pub fn set_cursor_visible(v: bool) { CURSOR_VISIBLE.store(v, Ordering::Relaxed); }
     pub fn current_frame_rate() -> f32 { measured_frame_rate() }
     pub fn is_looping() -> bool { looping() }
+    /// For the libprocessing renderer's own frame loop.
+    #[allow(dead_code)]
+    pub(crate) fn take_redraw() -> bool { REDRAW.swap(false, Ordering::Relaxed) }
+    #[allow(dead_code)]
+    pub(crate) fn current_frame_rate_target() -> f32 { fps() }
 
     pub struct Runner { title: String }
     impl Runner {
@@ -3330,6 +3499,12 @@ pub fn __set_wheel_delta(d: f32) { *wheel_cell().lock() = d; }
 // ──────────────────────────── Canvas / window ────────────────────────────────
 
 pub fn size(w: u32, h: u32) {
+    lp_route! {
+        let (w, h) = (w.clamp(1, MAX_CANVAS), h.clamp(1, MAX_CANVAS));
+        glfw::set_size(w, h);
+        crate::lp::size(w, h);
+        return;
+    }
     #[cfg(not(feature = "wasm"))] glfw::set_size(w, h);
     #[cfg(feature = "wasm")]      wasm::set_size(w, h);
 }
@@ -3569,6 +3744,19 @@ pub fn r#loop() {
 pub fn redraw() {
     #[cfg(not(feature = "wasm"))] glfw::request_redraw();
     #[cfg(feature = "wasm")]      wasm::request_redraw();
+}
+
+/// Ends the program with an exit status, closing the renderer properly first
+/// (the libprocessing one crashes on the way out otherwise).
+pub fn exit_with(code: i32) -> ! {
+    // (not from inside a panic: a second one there would abort)
+    lp_route! {
+        if !std::thread::panicking() { let _ = std::panic::catch_unwind(|| crate::lp::shutdown()); }
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code)
 }
 
 pub fn exit() {
@@ -3899,6 +4087,7 @@ pub fn set_pixel(x: i32, y: i32, r: f32, g: f32, b: f32) {
 
 /// Color of one canvas pixel as (r, g, b), each 0..255. Black outside the canvas.
 pub fn get_pixel(x: i32, y: i32) -> (u8, u8, u8) {
+    lp_route! { crate::lp::pull(); }
     let (w, h) = (CANVAS_W.load(Ordering::Relaxed) as i32, CANVAS_H.load(Ordering::Relaxed) as i32);
     if x < 0 || y < 0 || x >= w || y >= h { return (0, 0, 0); }
     let buf = pixel_buf().lock();
@@ -3913,6 +4102,7 @@ pub fn get_pixel(x: i32, y: i32) -> (u8, u8, u8) {
 /// Save the current canvas as a PNG. "#" runs in the name become the
 /// zero-padded frame number, like Processing: save_frame("out-####.png").
 pub fn save_frame(name: &str) {
+    lp_route! { crate::lp::pull(); }
     let path = match name.find('#') {
         Some(i) => {
             let n = name[i..].chars().take_while(|c| *c == '#').count();
@@ -3977,6 +4167,8 @@ impl<S: 'static> App<S> {
     pub fn key_typed(mut self, f: fn(&mut S)) -> Self      { self.key_typed_fn      = Some(f); self }
 
     pub fn run(mut self) {
+        #[cfg(feature = "libprocessing")]
+        if crate::lp::on() { return crate::lp::run(self); }
         #[cfg(not(feature = "wasm"))]
         {
             let runner = glfw::Runner::new().title(&self.title);
@@ -4086,6 +4278,11 @@ pub fn bezier_vertex(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) {
 pub fn quadratic_vertex(cx: f32, cy: f32, x: f32, y: f32) { render::shape_quadratic_vertex(cx, cy, x, y); }
 pub fn curve_vertex(x: f32, y: f32)   { render::shape_curve_vertex(x, y); }
 pub fn end_shape()                    { render::shape_end(false); }
+/// begin_contour() / end_contour(): cut a hole in the shape being made.
+pub fn begin_contour()                { render::shape_begin_contour(); }
+pub fn end_contour()                  { render::shape_end_contour(); }
+#[inline] pub fn beginContour()       { begin_contour() }
+#[inline] pub fn endContour()         { end_contour() }
 pub fn end_shape_mode(mode: u8)       { render::shape_end(mode == CLOSE); }
 
 /// Gaussian random number, mean 0 and standard deviation 1 (Box-Muller).
@@ -4398,7 +4595,18 @@ pub use three::{rotate_x, rotate_y, camera, camera_look, perspective, perspectiv
 pub const P2D: u32 = 2;
 pub const P3D: u32 = 3;
 /// size(w, h, P3D): every sketch can draw 3D already, so the renderer is only noted.
-pub fn size_renderer(w: u32, h: u32, _renderer: u32) { size(w, h) }
+pub fn size_renderer(w: u32, h: u32, renderer: u32) {
+    lp_route! {
+        if renderer == P3D {
+            let (w, h) = (w.clamp(1, MAX_CANVAS), h.clamp(1, MAX_CANVAS));
+            glfw::set_size(w, h);
+            crate::lp::size_3d(w, h);
+            return;
+        }
+    }
+    let _ = renderer;
+    size(w, h)
+}
 #[inline] pub fn rotateX(a: f32) { rotate_x(a) }
 #[inline] pub fn rotateY(a: f32) { rotate_y(a) }
 pub fn rotate_z(a: f32) { rotate(a) }
@@ -4406,3 +4614,29 @@ pub fn rotate_z(a: f32) { rotate(a) }
 pub fn scale_3d(x: f32, y: f32, z: f32) { render::scale(x, y, z); }
 #[inline] pub fn noLights() { no_lights() }
 #[inline] pub fn sphereDetail(n: f32) { sphere_detail(n) }
+
+// The libprocessing renderer (see lp.rs).
+#[cfg(feature = "libprocessing")]
+mod lp;
+
+#[cfg(test)]
+mod contour_tests {
+    use super::*;
+    #[test]
+    fn hole_stays_empty() {
+        resize_canvas(40, 40);
+        render::background_rgb(0.0, 0.0, 0.0);
+        no_stroke();
+        fill_rgb(255, 255, 255);
+        begin_shape();
+        vertex(5.0, 5.0); vertex(35.0, 5.0); vertex(35.0, 35.0); vertex(5.0, 35.0);
+        begin_contour();
+        vertex(15.0, 15.0); vertex(15.0, 25.0); vertex(25.0, 25.0); vertex(25.0, 15.0);
+        end_contour();
+        end_shape_mode(CLOSE);
+        let at = |x: usize, y: usize| pixel_buf().lock()[y * 40 + x] & 0xFF;
+        assert_eq!(at(10, 10), 0xFF, "outside the hole is filled");
+        assert_eq!(at(20, 20), 0, "the hole is empty");
+        assert_eq!(at(2, 2), 0, "outside the shape is empty");
+    }
+}

@@ -2,7 +2,6 @@
 name = "processing"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
 description = "Processing-style API for RustMode sketches"
 
 [dependencies]
@@ -17,9 +16,19 @@ zune-jpeg = "0.4"
 # TrueType / OpenType text for createFont() and textFont()
 fontdue = "0.9"
 
+# The libprocessing renderer (Bevy + wgpu). Off by default: it is a large
+# build and needs a newer Rust (edition 2024). RustMode turns it on when the
+# toolbar's renderer menu says libprocessing.
+bevy              = { git = "https://github.com/processing/bevy", branch = "main", default-features = false, optional = true }
+processing_core   = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true }
+processing_render = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true, features = ["x11", "wayland"] }
+processing_input  = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true }
+processing_glfw   = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true, features = ["x11", "wayland"] }
+
 [features]
 default = []
 wasm    = []
+libprocessing = ["dep:bevy", "dep:processing_core", "dep:processing_render", "dep:processing_input", "dep:processing_glfw"]
 
 [profile.dev]
 opt-level = 1   # slightly faster dev builds; incremental still on
@@ -28,3 +37,9 @@ opt-level = 1   # slightly faster dev builds; incremental still on
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# libprocessing builds against its own fork of Bevy; one of its dependencies
+# asks for upstream Bevy, so point that at the fork too (libprocessing does
+# the same in its own workspace). Only matters with the libprocessing feature.
+[patch."https://github.com/bevyengine/bevy"]
+bevy = { git = "https://github.com/processing/bevy", branch = "main" }

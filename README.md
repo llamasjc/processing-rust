@@ -13,23 +13,11 @@ Rendering uses a self-contained software rasterizer backed by [minifb](https://g
 ~/.../sketchbook/modes/RustMode/
 ```
 
-### 2 — Build the tree-sitter-rust native grammar
+### 2 - Build the tree-sitter-rust native grammar
 
 ```bash
-git clone https://github.com/tree-sitter/tree-sitter-rust /tmp/ts-rust
-cd /tmp/ts-rust
-
-# Linux
-gcc -shared -fPIC -o libtree-sitter-rust.so \
-    src/parser.c src/scanner.c -I./src
-cp libtree-sitter-rust.so \
-    ~/path/to/sketchbook/modes/RustMode/lib/linux-x86-64/
-
-# macOS (arm64)
-gcc -shared -fPIC -o libtree-sitter-rust.dylib \
-    src/parser.c src/scanner.c -I./src
-cp libtree-sitter-rust.dylib \
-    ~/path/to/sketchbook/modes/RustMode/lib/macos-arm64/
+cd ~/sketchbook/modes/RustMode
+bash native/build.sh        # builds lib/<platform>/libjava-tree-sitter.so with the Rust grammar
 ```
 
 ### 3 — Build the jar
@@ -151,6 +139,42 @@ Key modules inside `lib.rs`:
 | `render` | Software rasterizer — Bresenham lines, scan-line triangles, ellipses, affine transform stack, style stack |
 | `glfw` (native) | minifb event loop, mouse/keyboard event dispatch, frame timing |
 | `wasm` | Stub (future browser export path, gated by `--features wasm`) |
+
+### Two renderers
+
+The menu left of the mode selector in the toolbar picks where sketches draw:
+
+- **Software** (default): the rasterizer above. Small build, works anywhere.
+- **libprocessing**: the Processing Foundation's [libprocessing](https://github.com/processing/libprocessing)
+  (Bevy + wgpu, on the GPU). The engine is built with the `libprocessing` cargo
+  feature and the sketch runs with `PROCESSING_RENDERER=libprocessing`; every
+  drawing call is handed to `src/lp.rs`, which records it as a libprocessing
+  draw command. The first build compiles Bevy and takes several minutes.
+
+What libprocessing doesn't have yet is filled in by `lp.rs`: `get()`,
+`loadPixels()`, `filter()` and `saveFrame()` read the canvas back and work on
+it here; images made or edited in code are uploaded when drawn; layers
+(`create_graphics`) are offscreen libprocessing graphics; SVG files become
+libprocessing shapes; 3D lines, points and triangles are small meshes; lights
+are remade only when a frame asks for different ones.
+
+Needs Rust stable (libprocessing uses the 2024 edition) and GLFW 3.4
+(`pacman -S glfw` on Arch). There is no sound for now.
+
+Known differences on libprocessing, for now:
+
+- Colors blend in linear light, so half-transparent colors and `ADD` come out
+  a little different from the software renderer.
+- `shear_x` / `shear_y` turn shapes instead of slanting them (libprocessing
+  keeps transforms as position, rotation and scale).
+- Edges are always smooth; `no_smooth()` does nothing.
+- Lights apply to the whole frame: `no_lights()` makes the shapes after it
+  flat again, but the lights stay for the shapes drawn before.
+
+Sketches build against your own libprocessing checkout when there is one:
+`LIBPROCESSING_DIR`, the `rust.libprocessing` preference, or
+`~/sketchbook/libprocessing`. Otherwise against the commit pinned in
+`Cargo.toml`. The build status line says which one it used.
 
 ---
 

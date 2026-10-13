@@ -90,11 +90,13 @@ pub(crate) fn on_begin_frame() {
 }
 
 pub fn rotate_x(a: impl Num) {
-    let a = a.f(); let (c, s) = (a.cos(), a.sin());
+    let a = a.f();
+    lp_route! { crate::lp::rotate(a, bevy::math::Vec3::X); } let (c, s) = (a.cos(), a.sin());
     let mut m = IDENT; m[5] = c; m[6] = s; m[9] = -s; m[10] = c; post(m);
 }
 pub fn rotate_y(a: impl Num) {
-    let a = a.f(); let (c, s) = (a.cos(), a.sin());
+    let a = a.f();
+    lp_route! { crate::lp::rotate(a, bevy::math::Vec3::Y); } let (c, s) = (a.cos(), a.sin());
     let mut m = IDENT; m[0] = c; m[2] = -s; m[8] = s; m[10] = c; post(m);
 }
 
@@ -123,12 +125,17 @@ fn default_eye_z(h: f32) -> f32 { (h / 2.0) / (std::f32::consts::PI / 6.0).tan()
 pub fn camera_look(ex: impl Num, ey: impl Num, ez: impl Num, cx: impl Num, cy: impl Num, cz: impl Num,
                    ux: impl Num, uy: impl Num, uz: impl Num) {
     let eye = [ex.f(), ey.f(), ez.f()];
+    lp_route! { crate::lp::camera(eye, [cx.f(), cy.f(), cz.f()], [ux.f(), uy.f(), uz.f()]); return; }
     let v = look_at(eye, [cx.f(), cy.f(), cz.f()], [ux.f(), uy.f(), uz.f()]);
     S.with(|s| { let mut s = s.borrow_mut(); s.view = v; s.eye = eye; s.custom_camera = true; });
 }
-pub fn camera() { S.with(|s| s.borrow_mut().custom_camera = false); }
+pub fn camera() {
+    lp_route! { crate::lp::camera_default(); return; }
+    S.with(|s| s.borrow_mut().custom_camera = false);
+}
 /// perspective(fov, aspect, near, far). fov in radians, PI/3 by default.
 pub fn perspective(fov: impl Num, aspect: impl Num, near: impl Num, far: impl Num) {
+    lp_route! { crate::lp::perspective(fov.f(), aspect.f(), near.f().max(0.001), far.f()); return; }
     let p = frustum(fov.f(), aspect.f(), near.f().max(0.001), far.f());
     S.with(|s| { let mut s = s.borrow_mut(); s.proj = p; s.custom_proj = true; });
 }
@@ -140,6 +147,7 @@ pub fn ortho() {
     let (w, h) = (w as f32, h as f32);
     let ez = default_eye_z(h);
     let (n, f) = (ez / 10.0, ez * 10.0);
+    lp_route! { crate::lp::ortho(w, h, n, f); return; }
     let mut m = IDENT;
     m[0] = 2.0 / w; m[5] = 2.0 / h; m[10] = -2.0 / (f - n); m[14] = -(f + n) / (f - n);
     S.with(|s| { let mut s = s.borrow_mut(); s.proj = m; s.custom_proj = true; });
@@ -163,6 +171,7 @@ fn matrices() -> (M4, M4, M4, [f32; 3]) {
 // ── lights ─────────────────────────────────────────────────────────────────
 /// lights(): a gray ambient light and a light shining into the screen.
 pub fn lights() {
+    lp_route! { crate::lp::lights(); return; }
     S.with(|s| {
         let mut s = s.borrow_mut();
         s.lights.clear();
@@ -170,16 +179,19 @@ pub fn lights() {
         s.lights.push(Light::Directional([0.5, 0.5, 0.5], [0.0, 0.0, -1.0]));
     });
 }
-pub fn no_lights() { S.with(|s| s.borrow_mut().lights.clear()); }
+pub fn no_lights() {
+    lp_route! { crate::lp::no_lights(); return; } S.with(|s| s.borrow_mut().lights.clear()); }
 fn c255(r: f32, g: f32, b: f32) -> [f32; 3] { [r / 255.0, g / 255.0, b / 255.0] }
 pub fn ambient_light(r: impl Num, g: impl Num, b: impl Num) {
     let c = c255(r.f(), g.f(), b.f());
+    lp_route! { crate::lp::add_light(crate::lp::LightSpec::Ambient(c)); return; }
     S.with(|s| s.borrow_mut().lights.push(Light::Ambient(c)));
 }
 /// directional_light(r, g, b, nx, ny, nz): light traveling in direction (nx, ny, nz).
 pub fn directional_light(r: impl Num, g: impl Num, b: impl Num, nx: impl Num, ny: impl Num, nz: impl Num) {
     let c = c255(r.f(), g.f(), b.f());
     let d = norm([nx.f(), ny.f(), nz.f()]);
+    lp_route! { crate::lp::add_light(crate::lp::LightSpec::Directional(c, d)); return; }
     S.with(|s| s.borrow_mut().lights.push(Light::Directional(c, d)));
 }
 /// point_light(r, g, b, x, y, z): a light at a point, shining every way.
@@ -189,6 +201,7 @@ pub fn point_light(r: impl Num, g: impl Num, b: impl Num, x: impl Num, y: impl N
     // the position goes through the current matrix, like Processing
     let (m, ..) = matrices();
     let w = apply(&m, p);
+    lp_route! { crate::lp::add_light(crate::lp::LightSpec::Point(c, [w[0], w[1], w[2]])); return; }
     S.with(|s| s.borrow_mut().lights.push(Light::Point(c, [w[0], w[1], w[2]])));
 }
 
@@ -333,6 +346,7 @@ fn draw_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], edges: Option<&[[usize; 2]
 
 /// box(size) or box_3d(w, h, d): centered on the current origin.
 pub fn box_3d(w: impl Num, h: impl Num, d: impl Num) {
+    lp_route! { crate::lp::box_3d(w.f(), h.f(), d.f()); return; }
     let (x, y, z) = (w.f() / 2.0, h.f() / 2.0, d.f() / 2.0);
     let v = [[-x, -y, -z], [x, -y, -z], [x, y, -z], [-x, y, -z], [-x, -y, z], [x, -y, z], [x, y, z], [-x, y, z]];
     let t = [[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6], [0, 4, 5], [0, 5, 1],
@@ -351,6 +365,7 @@ pub fn sphere_detail_uv(u: impl Num, v: impl Num) {
 pub fn sphere(r: impl Num) {
     let r = r.f();
     let (us, vs) = S.with(|s| s.borrow().sphere_detail);
+    lp_route! { crate::lp::sphere(r, us as u32, vs as u32); return; }
     let mut v = Vec::with_capacity((us + 1) * (vs + 1));
     for j in 0..=vs {
         let phi = std::f32::consts::PI * j as f32 / vs as f32;
@@ -374,6 +389,7 @@ pub fn sphere(r: impl Num) {
     draw_mesh(&v, &t, Some(&e));
 }
 pub fn line_3d(x1: impl Num, y1: impl Num, z1: impl Num, x2: impl Num, y2: impl Num, z2: impl Num) {
+    lp_route! { crate::lp::line_3d([x1.f(), y1.f(), z1.f()], [x2.f(), y2.f(), z2.f()], crate::render::style_pub().1); return; }
     let (m, view, proj, _) = matrices();
     let (w, h) = dims();
     let vp = mul(&proj, &view);
@@ -391,7 +407,9 @@ pub fn point_3d(x: impl Num, y: impl Num, z: impl Num) {
 #[allow(clippy::too_many_arguments)]
 pub fn triangle_3d(x1: impl Num, y1: impl Num, z1: impl Num, x2: impl Num, y2: impl Num, z2: impl Num,
                    x3: impl Num, y3: impl Num, z3: impl Num) {
-    draw_mesh(&[[x1.f(), y1.f(), z1.f()], [x2.f(), y2.f(), z2.f()], [x3.f(), y3.f(), z3.f()]], &[[0, 1, 2]], None);
+    let p = [[x1.f(), y1.f(), z1.f()], [x2.f(), y2.f(), z2.f()], [x3.f(), y3.f(), z3.f()]];
+    lp_route! { let (f, st, _) = crate::render::style_pub(); crate::lp::triangle_3d(p, f, st); return; }
+    draw_mesh(&p, &[[0, 1, 2]], None);
 }
 
 /// Where a point in space lands on the screen.
