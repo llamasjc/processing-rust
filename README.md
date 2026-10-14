@@ -140,6 +140,26 @@ Key modules inside `lib.rs`:
 | `glfw` (native) | minifb event loop, mouse/keyboard event dispatch, frame timing |
 | `wasm` | Stub (future browser export path, gated by `--features wasm`) |
 
+### Fast builds: the precompiled engine
+
+Like CppMode's precompiled `Processing.o`, RustMode can ship the engine
+already compiled, per platform and renderer, in `cache/<platform>/<renderer>/`
+(`cpu` or `libprocessing`). With a cache there, a sketch is one `rustc` call
+against it: about a second for CPU sketches, and no Bevy build at all for
+libprocessing ones.
+
+```sh
+scripts/build-cache.py              # this machine, CPU renderer
+scripts/build-cache.py all          # CPU and libprocessing (the second takes a while, once)
+scripts/create-release.py 0.3.0     # every platform via the build-cache workflow, then a zip
+```
+
+The cache is tied to the exact Rust version in `rust-toolchain.toml` and to
+the engine sources it was built from. RustMode fetches that Rust version with
+rustup the first time; if the engine changed since, or something else
+doesn't fit, it quietly goes back to the normal cargo build. Exports always
+use cargo.
+
 ### Two renderers
 
 The menu left of the mode selector in the toolbar picks where sketches draw:

@@ -1,0 +1,76 @@
+name: build-cache
+
+# Precompiles the engine (and every crate it uses) for each platform and
+# renderer, into cache/<platform>/<renderer>/. With it, RustMode builds a
+# sketch with one rustc call instead of compiling everything first.
+# scripts/create-release.py runs this and puts the results into the release.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  cache:
+    name: ${{ matrix.platform }} / ${{ matrix.renderer }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-13, macos-latest, windows-latest]
+        renderer: [cpu, libprocessing]
+        include:
+          - { os: ubuntu-22.04,   platform: linux-x86-64 }
+          - { os: macos-13,       platform: macos-x86-64 }
+          - { os: macos-latest,   platform: macos-arm64 }
+          - { os: windows-latest, platform: windows-x86-64 }
+    # libprocessing on Windows still needs GLFW sorted out; don't hold up the rest
+    continue-on-error: ${{ matrix.renderer == 'libprocessing' && matrix.os == 'windows-latest' }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust (the version in rust-toolchain.toml)
+        shell: bash
+        run: |
+          v=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$v" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
+
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libx11-dev libxkbcommon-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxinerama-dev libwayland-dev wayland-protocols libasound2-dev libudev-dev pkg-config cmake
+
+      - name: GLFW 3.4 (Linux, libprocessing)
+        if: runner.os == 'Linux' && matrix.renderer == 'libprocessing'
+        run: |
+          curl -fsSL https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.zip -o glfw.zip
+          unzip -q glfw.zip
+          cmake -S glfw-3.4 -B glfw-build -DBUILD_SHARED_LIBS=ON -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF -DGLFW_BUILD_DOCS=OFF
+          sudo cmake --build glfw-build --target install
+          sudo ldconfig
+
+      - name: GLFW (macOS, libprocessing)
+        if: runner.os == 'macOS' && matrix.renderer == 'libprocessing'
+        run: brew install glfw
+
+      - name: Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ matrix.platform }}-${{ matrix.renderer }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build the cache
+        shell: bash
+        run: (command -v python3 >/dev/null && python3 || python) scripts/build-cache.py ${{ matrix.renderer }}
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: cache-${{ matrix.platform }}-${{ matrix.renderer }}
+          path: cache/${{ matrix.platform }}/${{ matrix.renderer }}
+          if-no-files-found: error

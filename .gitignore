@@ -9,3 +9,4 @@ target/
 *.log
 core.*
 hs_err_pid*
+cache/

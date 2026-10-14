@@ -370,8 +370,11 @@ public class RustBuild {
   // ── Step 6 – cargo build ────────────────────────────────────────────────────
 
   private File runCargo(File projectDir) throws IOException, InterruptedException {
-    // ── Pre-warm: extract bundled dep rlibs on first run ─────────────────────────
-    extractPrebuiltDeps();
+    // ── Fast path: one rustc call against the precompiled engine ─────────────
+    if (!release) {
+      File fast = cachedBuild(projectDir);
+      if (fast != null) return fast;
+    }
 
     // ── Pre-flight: ensure cargo is on PATH ───────────────────────────────────
     if (!isCargoAvailable()) {
@@ -550,49 +553,171 @@ public class RustBuild {
 
   // ── Utilities ───────────────────────────────────────────────────────────────
 
-  /**
-   * Extract the platform-specific prebuilt dep rlibs (bundled in the mode dir)
-   * into the shared Cargo target so the first sketch build skips dep compilation.
-   * Runs once per mode version; a stamp file prevents repeat extraction.
-   */
-  private void extractPrebuiltDeps() {
+  // ── The precompiled engine (cache/<platform>/<renderer>/) ──────────────────
+  //
+  // scripts/build-cache.py builds the engine and every crate it uses once per
+  // platform; a sketch is then a single rustc call against those libraries,
+  // about a second instead of minutes. It needs the exact Rust version the
+  // cache was made with (rustup gets it the first time) and the engine
+  // sources it was made from. Anything off and the normal cargo build runs.
+
+  static String platformDir() {
+    String os = System.getProperty("os.name", "").toLowerCase();
+    String arch = System.getProperty("os.arch", "").toLowerCase();
+    boolean arm = arch.contains("aarch64") || arch.contains("arm");
+    if (os.contains("win")) return "windows-x86-64";
+    if (os.contains("mac")) return arm ? "macos-arm64" : "macos-x86-64";
+    return arm ? "linux-arm64" : "linux-x86-64";
+  }
+
+  /** The engine's sources and lockfile, hashed like scripts/build-cache.py does. */
+  static String engineHash(File root) {
     try {
-      String os   = System.getProperty("os.name",  "").toLowerCase();
-      String arch = System.getProperty("os.arch",  "").toLowerCase();
-      String platform;
-      if (os.contains("win"))       platform = "windows-x86-64";
-      else if (os.contains("mac"))  platform = arch.contains("aarch64") ? "macos-arm64" : "macos-x86-64";
-      else                          platform = arch.contains("aarch64") ? "linux-arm64"  : "linux-x86-64";
-
-      File modeDir = mode.getFolder();
-      File bundle  = new File(modeDir, "prebuilt-deps/" + platform + ".tar.gz");
-      if (!bundle.exists()) return;  // not bundled for this platform
-
-      File sharedDeps = new File(sharedTarget(), "debug/deps");
-
-      File stamp = new File(Compat.sketchbookFolder(null),
-        "rust-build-cache/.prebuilt-stamp-" + platform);
-
-      // Re-extract if bundle is newer than stamp
-      if (stamp.exists() && stamp.lastModified() >= bundle.lastModified()) return;
-
-      sharedDeps.mkdirs();
-      LOG.info("RustMode: extracting prebuilt deps for " + platform + "...");
-
-      ProcessBuilder pb = new ProcessBuilder(
-        "tar", "xzf", bundle.getAbsolutePath(),
-        "--strip-components=1",
-        "-C", sharedDeps.getAbsolutePath());
-      pb.redirectErrorStream(true);
-      Process p = pb.start();
-      p.waitFor();
-
-      stamp.getParentFile().mkdirs();
-      stamp.createNewFile();
-      LOG.info("RustMode: prebuilt deps extracted to " + sharedDeps);
+      java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+      List<String> names = new ArrayList<>(List.of("Cargo.toml", "Cargo.lock"));
+      List<String> rs = new ArrayList<>();
+      File[] fs = new File(root, "src").listFiles((d, n) -> n.endsWith(".rs"));
+      if (fs != null) for (File f : fs) rs.add("src/" + f.getName());
+      java.util.Collections.sort(rs);
+      names.addAll(rs);
+      for (String n : names) {
+        byte[] data = Files.readAllBytes(new File(root, n).toPath());
+        // line endings don't count, so a Windows checkout matches
+        java.io.ByteArrayOutputStream clean = new java.io.ByteArrayOutputStream(data.length);
+        for (int i = 0; i < data.length; i++) {
+          if (data[i] == '\r' && i + 1 < data.length && data[i + 1] == '\n') continue;
+          clean.write(data[i]);
+        }
+        md.update(n.getBytes(StandardCharsets.UTF_8));
+        md.update((byte) 0);
+        md.update(clean.toByteArray());
+        md.update((byte) 0);
+      }
+      StringBuilder sb = new StringBuilder();
+      for (byte b : md.digest()) sb.append(String.format("%02x", b));
+      return sb.toString();
     } catch (Exception e) {
-      LOG.log(java.util.logging.Level.WARNING, "RustMode: could not extract prebuilt deps", e);
+      return "";
     }
+  }
+
+  private static String jsonString(String json, String key) {
+    Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
+    return m.find() ? m.group(1) : null;
+  }
+  private static List<String> jsonStrings(String json, String key) {
+    List<String> out = new ArrayList<>();
+    Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*\\[([^\\]]*)\\]", Pattern.DOTALL).matcher(json);
+    if (m.find()) {
+      Matcher s = Pattern.compile("\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(m.group(1));
+      while (s.find()) out.add(s.group(1).replace("\\\\", "\\"));
+    }
+    return out;
+  }
+
+  /** Runs a short command, returns its output, or null when it can't run. */
+  private static String runQuiet(List<String> cmd, java.util.Map<String, String> env) {
+    try {
+      ProcessBuilder pb = new ProcessBuilder(cmd).redirectErrorStream(true);
+      if (env != null) pb.environment().putAll(env);
+      Process p = pb.start();
+      String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+      return p.waitFor() == 0 ? out : null;
+    } catch (IOException | InterruptedException e) {
+      return null;
+    }
+  }
+
+  /** Errors that mean the cache doesn't fit this machine, not that the sketch is wrong. */
+  private static final Pattern CACHE_MISMATCH = Pattern.compile(
+    "E0514|E0460|E0461|E0462|E0463|E0786|incompatible version of rustc|linking with .* failed|could not find native static library");
+
+  private File cachedBuild(File projectDir) throws IOException, InterruptedException {
+    String renderer = Renderer.libprocessing() ? "libprocessing" : "cpu";
+    File dir = new File(mode.getFolder(), "cache/" + platformDir() + "/" + renderer);
+    File meta = new File(dir, "cache.json");
+    if (!meta.isFile()) return null;
+    String json = readFile(meta);
+    String version = jsonString(json, "rustc");
+    String engine = jsonString(json, "engine");
+    String hash = jsonString(json, "engine_hash");
+    if (version == null || engine == null || hash == null) return null;
+    if (!hash.equals(engineHash(mode.getFolder()))) {
+      LOG.info("RustMode: the engine changed since the cache was built; using cargo");
+      return null;
+    }
+    File engineLib = new File(dir, "deps/" + engine);
+    if (!engineLib.isFile()) return null;
+
+    // the cache's exact Rust: through rustup (fetched once), or a matching rustc
+    java.util.Map<String, String> env = new java.util.HashMap<>();
+    String have = runQuiet(List.of("rustup", "toolchain", "list"), null);
+    if (have != null) {
+      if (!have.contains(version)) {
+        mode.statusMessage("Getting Rust " + version + " for fast builds (once, a minute or so)...");
+        String got = runQuiet(List.of("rustup", "toolchain", "install", version, "--profile", "minimal"), null);
+        if (got == null) { LOG.info("RustMode: couldn't install Rust " + version + "; using cargo"); return null; }
+      }
+      env.put("RUSTUP_TOOLCHAIN", version);
+    } else {
+      String v = runQuiet(List.of("rustc", "-V"), null);
+      if (v == null || !v.contains(" " + version + " ")) return null;
+    }
+
+    String bin = sanitiseName(sketch.getName());
+    File outDir = new File(targetDir(), "fast");
+    outDir.mkdirs();
+    File binary = new File(outDir, isWindows() ? bin + ".exe" : bin);
+
+    List<String> cmd = new ArrayList<>(List.of(
+      "rustc", "--edition", "2021", "--crate-name", bin, "--crate-type", "bin",
+      "-C", "opt-level=1", "--error-format=short",
+      "-L", "dependency=" + new File(dir, "deps").getAbsolutePath(),
+      "-L", "native=" + new File(dir, "native").getAbsolutePath(),
+      "--extern", "processing=" + engineLib.getAbsolutePath(),
+      "-o", binary.getAbsolutePath()));
+    for (String p : jsonStrings(json, "link_search")) {
+      if (new File(p).isDirectory()) { cmd.add("-L"); cmd.add("native=" + p); }
+    }
+    cmd.add("src/main.rs");
+
+    ProcessBuilder pb = new ProcessBuilder(cmd);
+    pb.directory(projectDir);
+    pb.redirectErrorStream(true);
+    pb.environment().putAll(env);
+    if (cancelled) throw new InterruptedException("build cancelled");
+    Process proc = pb.start();
+    cargoProc = proc;
+    if (cancelled) cancel();
+    try { proc.getOutputStream().close(); } catch (IOException ignored) {}
+
+    List<RustProblem> diagnostics = new ArrayList<>();
+    List<String> lines = new ArrayList<>();
+    String firstError = null;
+    boolean mismatch = false;
+    BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8));
+    String line;
+    while ((line = reader.readLine()) != null) {
+      if (CACHE_MISMATCH.matcher(line).find()) mismatch = true;
+      String rewritten = rewriteLocations(line);
+      lines.add(rewritten);
+      RustProblem dp = parseRewrittenDiagnostic(rewritten);
+      if (dp != null) diagnostics.add(dp);
+      if (firstError == null && dp != null && dp.getSeverity() == RustProblem.ERROR) firstError = rewritten.trim();
+    }
+    int exit;
+    try { exit = proc.waitFor(); } finally { cargoProc = null; }
+    if (cancelled) throw new InterruptedException("build cancelled");
+    if (exit != 0 && mismatch) {
+      LOG.info("RustMode: the precompiled engine doesn't fit here; using cargo");
+      return null;
+    }
+    // the sketch's own messages, as cargo would show them
+    for (String l : lines) mode.statusMessage(l);
+    if (exit != 0) {
+      throw new CargoException(firstError != null ? firstError : "rustc failed (exit " + exit + ")", diagnostics);
+    }
+    return binary.isFile() ? binary : null;
   }
 
   /** Returns true if {@code cargo} is reachable on the current PATH. */
