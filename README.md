@@ -144,7 +144,7 @@ Key modules inside `lib.rs`:
 
 The menu left of the mode selector in the toolbar picks where sketches draw:
 
-- **Software** (default): the rasterizer above. Small build, works anywhere.
+- **CPU** (default): the rasterizer above, every pixel drawn on the CPU. Small build, works anywhere.
 - **libprocessing**: the Processing Foundation's [libprocessing](https://github.com/processing/libprocessing)
   (Bevy + wgpu, on the GPU). The engine is built with the `libprocessing` cargo
   feature and the sketch runs with `PROCESSING_RENDERER=libprocessing`; every
