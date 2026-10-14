@@ -23,12 +23,14 @@ bevy              = { git = "https://github.com/processing/bevy", branch = "main
 processing_core   = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true }
 processing_render = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true, features = ["x11", "wayland"] }
 processing_input  = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true }
+# to tell GLFW which display system to use (X11 or Wayland)
+glfw              = { version = "0.60", default-features = false, optional = true }
 processing_glfw   = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true, features = ["x11", "wayland"] }
 
 [features]
 default = []
 wasm    = []
-libprocessing = ["dep:bevy", "dep:processing_core", "dep:processing_render", "dep:processing_input", "dep:processing_glfw"]
+libprocessing = ["dep:bevy", "dep:processing_core", "dep:processing_render", "dep:processing_input", "dep:processing_glfw", "dep:glfw"]
 
 [profile.dev]
 opt-level = 1   # slightly faster dev builds; incremental still on

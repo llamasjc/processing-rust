@@ -20,7 +20,7 @@ The CI workflow build-cache.yml runs this on Linux, Windows and macOS.
 Uses your own libprocessing checkout (LIBPROCESSING_DIR, or
 sketchbook/libprocessing next to the modes folder) when there is one.
 """
-import hashlib, json, os, platform, shutil, subprocess, sys, tempfile
+import hashlib, json, os, platform, shutil, subprocess, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,8 +66,9 @@ def local_fork():
 def build(renderer: str):
     plat = platform_dir()
     out = ROOT / "cache" / plat / renderer
-    work = Path(tempfile.mkdtemp(prefix="rustmode-cache-"))
-    (work / "src").mkdir()
+    # kept between runs, so after an engine change only the engine recompiles
+    work = Path(os.environ.get("RUSTMODE_CACHE_WORK", Path.home() / ".cache" / "rustmode-cache")) / plat / renderer
+    (work / "src").mkdir(parents=True, exist_ok=True)
     feature = '\n[features]\ndefault = ["processing/libprocessing"]\n' if renderer == "libprocessing" else ""
     patch = ""
     fork = local_fork() if renderer == "libprocessing" else None
@@ -153,7 +154,6 @@ incremental = false
         "opt_level": "1",
     }
     (out / "cache.json").write_text(json.dumps(meta, indent=2) + "\n")
-    shutil.rmtree(work, ignore_errors=True)
     size = sum(f.stat().st_size for f in out.rglob("*") if f.is_file()) // (1024 * 1024)
     print(f"Done: {out}  ({len(files)} libraries, {size} MB, {rustc})")
 

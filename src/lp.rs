@@ -147,9 +147,32 @@ pub(crate) fn ensure_open() {
     open(w, h);
 }
 
+/// GLFW 3.4 may try Wayland first and give up on an X11 desktop (i3, ...),
+/// or hand back an error code the glfw crate can't name and panic. Say
+/// which one: Wayland only in a Wayland session, X11 otherwise.
+/// PROCESSING_GLFW_PLATFORM=x11 or wayland decides it by hand.
+fn pick_display_system() {
+    #[cfg(target_os = "linux")]
+    {
+        let forced = std::env::var("PROCESSING_GLFW_PLATFORM").ok().map(|v| v.to_ascii_lowercase());
+        let wayland = match forced.as_deref() {
+            Some("wayland") => true,
+            Some("x11") => false,
+            _ => {
+                let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+                let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+                let has_x = std::env::var_os("DISPLAY").is_some();
+                (session == "wayland" && has_wayland) || (has_wayland && !has_x)
+            }
+        };
+        glfw::init_hint(glfw::InitHint::Platform(if wayland { glfw::Platform::Wayland } else { glfw::Platform::X11 }));
+    }
+}
+
 /// Opens the window and the canvas.
 fn open(w: u32, h: u32) {
     let root = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| ".".into());
+    pick_display_system();
     let mut glfw = match GlfwContext::new(w, h, false) {
         Ok(g) => g,
         Err(e) => { fail("opening the window", e); std::process::exit(1); }
