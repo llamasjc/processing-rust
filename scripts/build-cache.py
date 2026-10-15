@@ -7,6 +7,13 @@ of building the engine and all its crates first.
     scripts/build-cache.py              the CPU renderer
     scripts/build-cache.py libprocessing
     scripts/build-cache.py all          both
+    scripts/build-cache.py all --bg     both, in the background
+
+--bg detaches from the terminal (its own session, so closing the terminal,
+Ctrl-C or Processing can't stop it) and logs to
+~/.cache/rustmode-cache/build.log. Watch it with
+    tail -f ~/.cache/rustmode-cache/build.log
+You get a desktop notification when it's done, if notify-send is there.
 
 With a cache in place RustMode compiles a sketch with one rustc call against
 the cached libraries (cache/<platform>/<renderer>/deps). It needs the exact
@@ -158,9 +165,50 @@ incremental = false
     print(f"Done: {out}  ({len(files)} libraries, {size} MB, {rustc})")
 
 
+def notify(msg):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "RustMode", msg])
+
+
+def background(args):
+    base = Path(os.environ.get("RUSTMODE_CACHE_WORK", Path.home() / ".cache" / "rustmode-cache"))
+    base.mkdir(parents=True, exist_ok=True)
+    log = base / "build.log"
+    pidfile = base / "build.pid"
+    if pidfile.exists():
+        try:
+            old = int(pidfile.read_text())
+            os.kill(old, 0)
+            print(f"A cache build is already running (pid {old}). Log: {log}")
+            return
+        except (ValueError, OSError):
+            pass
+    with open(log, "w") as f:
+        p = subprocess.Popen([sys.executable, __file__, *args, "--fg-from-bg"],
+                             stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+                             start_new_session=True, cwd=ROOT)
+    pidfile.write_text(str(p.pid))
+    print(f"Building in the background (pid {p.pid}).")
+    print(f"Follow it:  tail -f {log}")
+
+
 if __name__ == "__main__":
-    what = sys.argv[1] if len(sys.argv) > 1 else "cpu"
-    for r in (["cpu", "libprocessing"] if what == "all" else [what]):
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if "--bg" in flags:
+        background(args)
+        sys.exit(0)
+    what = args[0] if args else "cpu"
+    todo = ["cpu", "libprocessing"] if what == "all" else [what]
+    for r in todo:
         if r not in ("cpu", "libprocessing"):
             sys.exit(f"unknown renderer {r}: use cpu, libprocessing or all")
-        build(r)
+    try:
+        for r in todo:
+            build(r)
+        if "--fg-from-bg" in flags:
+            notify(f"Engine cache ready: {', '.join(todo)}")
+    except SystemExit as e:
+        if "--fg-from-bg" in flags:
+            notify(f"Cache build failed: {e}")
+        raise
