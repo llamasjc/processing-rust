@@ -178,13 +178,16 @@ def background(args):
     if pidfile.exists():
         try:
             old = int(pidfile.read_text())
+            cmd = Path(f"/proc/{old}/cmdline").read_bytes() if Path(f"/proc/{old}").exists() else b""
+            if sys.platform.startswith("linux") and b"build-cache" not in cmd:
+                raise OSError
             os.kill(old, 0)
             print(f"A cache build is already running (pid {old}). Log: {log}")
             return
         except (ValueError, OSError):
             pass
     with open(log, "w") as f:
-        p = subprocess.Popen([sys.executable, __file__, *args, "--fg-from-bg"],
+        p = subprocess.Popen([sys.executable, "-u", __file__, *args, "--fg-from-bg"],
                              stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
                              start_new_session=True, cwd=ROOT)
     pidfile.write_text(str(p.pid))
@@ -212,3 +215,7 @@ if __name__ == "__main__":
         if "--fg-from-bg" in flags:
             notify(f"Cache build failed: {e}")
         raise
+    finally:
+        if "--fg-from-bg" in flags:
+            pid = Path(os.environ.get("RUSTMODE_CACHE_WORK", Path.home() / ".cache" / "rustmode-cache")) / "build.pid"
+            pid.unlink(missing_ok=True)
