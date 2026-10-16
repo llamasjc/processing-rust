@@ -159,10 +159,12 @@ fn pick_display_system() {
             Some("wayland") => true,
             Some("x11") => false,
             _ => {
-                let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+                // X11 whenever there is one (XWayland included): GLFW's Wayland
+                // backend reports "feature unimplemented" for things like window
+                // position, and glfw-rs panics on that error code.
                 let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
                 let has_x = std::env::var_os("DISPLAY").is_some();
-                (session == "wayland" && has_wayland) || (has_wayland && !has_x)
+                has_wayland && !has_x
             }
         };
         let (want, name) = if wayland { (glfw::Platform::Wayland, "Wayland") } else { (glfw::Platform::X11, "X11") };
