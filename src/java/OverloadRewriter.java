@@ -32,8 +32,12 @@ final class OverloadRewriter {
     Map.entry("graphics_image", Map.of(5, "graphics_image_sized")),
     Map.entry("text_font",   Map.of(2, "text_font_size")),
     Map.entry("shape",       Map.of(5, "shape_sized")),
-    Map.entry("scale",       Map.of(2, "scale_xy")),
+    Map.entry("scale",       Map.of(2, "scale_xy", 3, "scale_3d")),
     Map.entry("translate",   Map.of(3, "translate_3d")),
+    Map.entry("vertex",      Map.of(3, "vertex_3d", 4, "vertex_uv", 5, "vertex_3d_uv")),
+    Map.entry("ortho",       Map.of(4, "ortho_rect", 6, "ortho_planes")),
+    Map.entry("rotate",      Map.of(4, "rotate_axis")),
+    Map.entry("apply_matrix", Map.of(16, "apply_matrix_3d")),
     Map.entry("random",      Map.of(2, "random_range")),
     Map.entry("noise",       Map.of(2, "noise2", 3, "noise3")),
     Map.entry("begin_shape", Map.of(1, "begin_shape_kind")),
@@ -54,17 +58,21 @@ final class OverloadRewriter {
   );
 
   /** Method names rewritten like the free functions, for PShape. */
-  private static final Set<String> METHOD_OVERLOADS = Set.of("fill", "stroke", "begin_shape", "end_shape", "scale");
+  private static final Set<String> METHOD_OVERLOADS = Set.of("fill", "stroke", "begin_shape", "end_shape", "scale", "vertex", "translate");
 
   /** Float functions whose last argument is a constant (PIE, CHORD...), not a number to convert. */
   private static final Set<String> LAST_ARG_AS_IS = Set.of("arc_mode");
 
   /** Float functions whose first argument is an image or layer, not a number to convert. */
   private static final Set<String> FIRST_ARG_AS_IS =
-    Set.of("image", "image_sized", "graphics_image", "graphics_image_sized",
+    Set.of("image", "image_sized", "texture", "graphics_image", "graphics_image_sized",
            "create_font", "text_font_size", "filter_param",
            "shape", "shape_sized",
            "color_mode_range", "color_mode3", "color_mode_max", "nf_float", "nfc_float");
+
+  /** Functions whose first argument is anything that holds an image (an id, a
+   *  Movie, a Capture): passed by reference so a Movie isn't moved. */
+  private static final Set<String> BORROW_FIRST = Set.of("image", "image_sized", "texture");
 
   /** Engine functions whose numeric parameters are all f32. */
   private static final Set<String> FLOAT_ARGS = Set.of(
@@ -73,11 +81,11 @@ final class OverloadRewriter {
     "background", "background_ga", "background_rgb", "background_rgba",
     "ellipse", "circle", "rect", "rect_rounded", "square", "line", "point",
     "triangle", "quad", "arc", "translate", "translate_3d", "rotate",
-    "scale", "scale_xy", "stroke_weight", "text", "text_size", "frame_rate",
+    "scale", "scale_xy", "scale_3d", "stroke_weight", "apply_matrix_3d", "text", "text_size", "frame_rate",
     "random", "random_range", "noise", "noise2",
     "vertex", "bezier_vertex", "quadratic_vertex", "curve_vertex",
     "arc_mode", "bezier", "curve", "shear_x", "shear_y", "apply_matrix",
-    "tint", "tint_ga", "tint_rgb", "tint_rgba", "noise3",
+    "tint", "tint_ga", "tint_rgb", "tint_rgba", "noise3", "texture",
     "image", "image_sized", "graphics_image", "graphics_image_sized",
     "create_font", "text_font_size", "text_leading",
     "rect_radii", "filter_param", "shape", "shape_sized",
@@ -144,6 +152,10 @@ final class OverloadRewriter {
               boolean asIs = (LAST_ARG_AS_IS.contains(target) && ai == args.size() - 1)
                 || (FIRST_ARG_AS_IS.contains(target) && ai == 0);
               if (FLOAT_ARGS.contains(target) && !"size".equals(target) && !asIs) r = floatLiteral(r);
+              if (ai == 0 && BORROW_FIRST.contains(target) && !r.strip().startsWith("&")) {
+                int lead = r.indexOf(r.strip());
+                r = r.substring(0, lead) + "&" + r.substring(lead);
+              }
               fixed.add(r);
             }
             out.append(target).append(src, j, k + 1).append(String.join(",", fixed)).append(')');

@@ -175,12 +175,12 @@ public class RustEmitter {
 
     // If the user didn't write setup(), synthesise a no-op so main() compiles.
     if (!analysis.hasSetup()) {
-      line(sb, "fn setup(s: &mut SketchState) {}");
+      line(sb, "fn setup(__sketch: &mut SketchState) {}");
       line(sb, "");
     }
     // draw() is always required by the App builder; synthesise a no-op if missing.
     if (!analysis.hasDraw()) {
-      line(sb, "fn draw(s: &mut SketchState) {}");
+      line(sb, "fn draw(__sketch: &mut SketchState) {}");
       line(sb, "");
     }
 
@@ -224,11 +224,11 @@ public class RustEmitter {
    * Tree-sitter to rewrite sketch variable references and bare global names.
    *
    * <p>Most lifecycle functions take no parameters in the sketch and become
-   * {@code fn name(s: &mut SketchState)}.
+   * {@code fn name(__sketch: &mut SketchState)}.
    *
    * <p>{@code mouse_wheel} is the exception: the user writes
    * {@code fn mouse_wheel(delta: f32)} and we inject the state param before it,
-   * giving {@code fn mouse_wheel(s: &mut SketchState, delta: f32)}.
+   * giving {@code fn mouse_wheel(__sketch: &mut SketchState, delta: f32)}.
    * The {@link App} builder expects {@code fn(&mut S, f32)}.
    */
   private String transformFn(String fnName, String src)
@@ -252,7 +252,7 @@ public class RustEmitter {
           // User wrote fn mouse_wheel() — add the param for them.
           existing = paramName + ": f32";
         }
-        String params = "s: &mut SketchState, " + existing;
+        String params = "__sketch: &mut SketchState, " + existing;
         src = mwMatcher.replaceFirst("fn mouse_wheel(" + params + ")");
 
         // Inject processing::__set_wheel_delta(<paramName>); at the top of the block
@@ -269,7 +269,7 @@ public class RustEmitter {
       // All other lifecycle functions: replace empty param list with the state param.
       src = src.replaceFirst(
         "\\bfn\\s+" + java.util.regex.Pattern.quote(fnName) + "\\s*\\(\\s*\\)",
-        "fn " + fnName + "(s: &mut SketchState)"
+        "fn " + fnName + "(__sketch: &mut SketchState)"
       );
     }
 
@@ -351,7 +351,7 @@ public class RustEmitter {
           rewrites.add(new Rewrite(node.getStartByte(), node.getEndByte(), callee + "()"));
         } else if (isSketchVar(name) && !shadowed.contains(name)
                    && !isFieldAccess(node, parent) && !isPattern(node, parent) && !isCallTarget(node, parent)) {
-          rewrites.add(new Rewrite(node.getStartByte(), node.getEndByte(), "s." + name));
+          rewrites.add(new Rewrite(node.getStartByte(), node.getEndByte(), "__sketch." + name));
         }
       }
 

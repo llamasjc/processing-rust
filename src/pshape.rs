@@ -26,10 +26,16 @@ enum Step {
     Line([f32; 4]),
     Triangle([f32; 6]),
     Quad([f32; 8]),
+    /// x, y, z, u, v; which of z and u, v were given (1 = z, 2 = u, v)
+    Full([f32; 5], u8),
+    BeginContour,
+    EndContour,
+    Box([f32; 3]),
+    Sphere(f32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Move { T(f32, f32), R(f32), S(f32, f32) }
+enum Move { T(f32, f32), R(f32), S(f32, f32), T3([f32; 3]), RX(f32), RY(f32), S3([f32; 3]) }
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct PShape {
@@ -40,6 +46,8 @@ pub struct PShape {
     moves: Vec<Move>,
     children: Vec<PShape>,
     visible: bool,
+    texture: Option<u64>,
+    name: String,
 }
 
 /// createShape(): an empty shape; fill it with begin_shape / vertex / end_shape.
@@ -66,6 +74,14 @@ pub fn create_shape_quad(x1: impl Num, y1: impl Num, x2: impl Num, y2: impl Num,
     s
 }
 #[inline] pub fn createShape() -> PShape { create_shape() }
+/// createShape(BOX, w, h, d)
+pub fn create_shape_box(w: impl Num, h: impl Num, d: impl Num) -> PShape {
+    let mut s = create_shape(); s.steps.push(Step::Box([w.f(), h.f(), d.f()])); s
+}
+/// createShape(SPHERE, r)
+pub fn create_shape_sphere(r: impl Num) -> PShape {
+    let mut s = create_shape(); s.steps.push(Step::Sphere(r.f())); s
+}
 
 impl PShape {
     // ── building ─────────────────────────────────────────────────────────
@@ -85,12 +101,35 @@ impl PShape {
         self.steps.push(Step::Quadratic([cx.f(), cy.f(), x.f(), y.f()])); self
     }
     pub fn curve_vertex(&mut self, x: impl Num, y: impl Num) -> &mut Self { self.steps.push(Step::Curve(x.f(), y.f())); self }
+    pub fn vertex_3d(&mut self, x: impl Num, y: impl Num, z: impl Num) -> &mut Self {
+        self.steps.push(Step::Full([x.f(), y.f(), z.f(), 0.0, 0.0], 1)); self
+    }
+    pub fn vertex_uv(&mut self, x: impl Num, y: impl Num, u: impl Num, v: impl Num) -> &mut Self {
+        self.steps.push(Step::Full([x.f(), y.f(), 0.0, u.f(), v.f()], 2)); self
+    }
+    pub fn vertex_3d_uv(&mut self, x: impl Num, y: impl Num, z: impl Num, u: impl Num, v: impl Num) -> &mut Self {
+        self.steps.push(Step::Full([x.f(), y.f(), z.f(), u.f(), v.f()], 3)); self
+    }
+    pub fn begin_contour(&mut self) -> &mut Self { self.steps.push(Step::BeginContour); self }
+    pub fn end_contour(&mut self) -> &mut Self { self.steps.push(Step::EndContour); self }
+    /// texture(img): paints the shape with an image (give vertices u, v).
+    pub fn texture(&mut self, img: impl crate::ImageSource) -> &mut Self { self.texture = Some(img.image_id()); self }
+    pub fn set_texture(&mut self, img: impl crate::ImageSource) -> &mut Self { self.texture(img) }
+    pub fn no_texture(&mut self) -> &mut Self { self.texture = None; self }
+    pub fn normal(&mut self, _x: impl Num, _y: impl Num, _z: impl Num) -> &mut Self { self }
     pub fn end_shape(&mut self) -> &mut Self { self.steps.push(Step::End(false)); self }
     /// end_shape_mode(CLOSE) joins the last point back to the first.
     pub fn end_shape_mode(&mut self, mode: u8) -> &mut Self { self.steps.push(Step::End(mode == crate::CLOSE)); self }
     pub fn add_child(&mut self, child: PShape) -> &mut Self { self.children.push(child); self }
     pub fn child_count(&self) -> usize { self.children.len() }
     pub fn get_child(&mut self, i: usize) -> Option<&mut PShape> { self.children.get_mut(i) }
+    /// get_child_named("name"): a child given that name with set_name.
+    pub fn get_child_named(&mut self, name: &str) -> Option<&mut PShape> { self.children.iter_mut().find(|c| c.name == name) }
+    pub fn remove_child(&mut self, i: usize) -> &mut Self { if i < self.children.len() { self.children.remove(i); } self }
+    pub fn add_child_at(&mut self, child: PShape, i: usize) -> &mut Self { let i = i.min(self.children.len()); self.children.insert(i, child); self }
+    pub fn set_name(&mut self, name: &str) -> &mut Self { self.name = name.to_string(); self }
+    pub fn get_name(&self) -> &str { &self.name }
+    pub fn get_child_count(&self) -> usize { self.child_count() }
 
     // ── style ────────────────────────────────────────────────────────────
     pub fn fill(&mut self, c: impl Paint) -> &mut Self { self.fill = Some(Some(c.paint())); self }
@@ -122,6 +161,11 @@ impl PShape {
     pub fn rotate(&mut self, a: impl Num) -> &mut Self { self.moves.push(Move::R(a.f())); self }
     pub fn scale(&mut self, s: impl Num) -> &mut Self { let s = s.f(); self.moves.push(Move::S(s, s)); self }
     pub fn scale_xy(&mut self, x: impl Num, y: impl Num) -> &mut Self { self.moves.push(Move::S(x.f(), y.f())); self }
+    pub fn scale_3d(&mut self, x: impl Num, y: impl Num, z: impl Num) -> &mut Self { self.moves.push(Move::S3([x.f(), y.f(), z.f()])); self }
+    pub fn translate_3d(&mut self, x: impl Num, y: impl Num, z: impl Num) -> &mut Self { self.moves.push(Move::T3([x.f(), y.f(), z.f()])); self }
+    pub fn rotate_x(&mut self, a: impl Num) -> &mut Self { self.moves.push(Move::RX(a.f())); self }
+    pub fn rotate_y(&mut self, a: impl Num) -> &mut Self { self.moves.push(Move::RY(a.f())); self }
+    pub fn rotate_z(&mut self, a: impl Num) -> &mut Self { self.rotate(a) }
     /// reset_matrix(): forget translate / rotate / scale.
     pub fn reset_matrix(&mut self) -> &mut Self { self.moves.clear(); self }
 
@@ -131,8 +175,25 @@ impl PShape {
             Step::Vertex(x, y) | Step::Curve(x, y) => Some((*x, *y)),
             Step::Bezier(v) => Some((v[4], v[5])),
             Step::Quadratic(v) => Some((v[2], v[3])),
+            Step::Full(v, _) => Some((v[0], v[1])),
             _ => None,
         })
+    }
+    /// get_vertex_z(i): the z of a vertex given one (0 otherwise).
+    pub fn get_vertex_z(&self, i: usize) -> f32 {
+        self.steps.iter().filter(|s| matches!(s, Step::Vertex(..) | Step::Curve(..) | Step::Bezier(_) | Step::Quadratic(_) | Step::Full(..)))
+            .nth(i).map(|s| if let Step::Full(v, _) = s { v[2] } else { 0.0 }).unwrap_or(0.0)
+    }
+    pub fn get_vertex_x(&self, i: usize) -> f32 { self.get_vertex(i).0 }
+    pub fn get_vertex_y(&self, i: usize) -> f32 { self.get_vertex(i).1 }
+    pub fn get_vertex_count(&self) -> usize { self.vertex_count() }
+    /// The shape's extent from its vertices (0 for shapes made of rect, ellipse...).
+    pub fn width(&self) -> f32 { let (a, b) = self.span(|p| p.0); b - a }
+    pub fn height(&self) -> f32 { let (a, b) = self.span(|p| p.1); b - a }
+    fn span(&self, f: impl Fn((f32, f32)) -> f32) -> (f32, f32) {
+        let mut it = self.points().map(f);
+        let Some(first) = it.next() else { return (0.0, 0.0) };
+        it.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)))
     }
     pub fn vertex_count(&self) -> usize { self.points().count() }
     /// get_vertex(i): (x, y), or (0, 0) past the end.
@@ -145,6 +206,7 @@ impl PShape {
                 Step::Vertex(a, b) | Step::Curve(a, b) => Some((a, b)),
                 Step::Bezier(v) => { let (l, r) = v.split_at_mut(5); Some((&mut l[4], &mut r[0])) }
                 Step::Quadratic(v) => { let (l, r) = v.split_at_mut(3); Some((&mut l[2], &mut r[0])) }
+                Step::Full(v, _) => { let (l, r) = v.split_at_mut(1); Some((&mut l[0], &mut r[0])) }
                 _ => None,
             };
             if let Some((a, b)) = p {
@@ -165,6 +227,10 @@ impl PShape {
                 Move::T(x, y) => crate::translate(x, y),
                 Move::R(a) => crate::rotate(a),
                 Move::S(x, y) => crate::scale_xy(x, y),
+                Move::T3(v) => crate::translate_3d(v[0], v[1], v[2]),
+                Move::RX(a) => crate::rotate_x(a),
+                Move::RY(a) => crate::rotate_y(a),
+                Move::S3(v) => crate::scale_3d(v[0], v[1], v[2]),
             }
         }
         match self.fill { Some(Some(c)) => crate::fill_color(c), Some(None) => crate::no_fill(), None => {} }
@@ -173,7 +239,19 @@ impl PShape {
         let mut open = false;
         for s in &self.steps {
             match *s {
-                Step::Begin(k) => { crate::begin_shape_kind(k); open = true; }
+                Step::Begin(k) => {
+                    crate::begin_shape_kind(k); open = true;
+                    if let Some(t) = self.texture { crate::texture(t); }
+                }
+                Step::Full(v, f) => match f {
+                    1 => crate::vertex_3d(v[0], v[1], v[2]),
+                    2 => crate::vertex_uv(v[0], v[1], v[3], v[4]),
+                    _ => crate::vertex_3d_uv(v[0], v[1], v[2], v[3], v[4]),
+                },
+                Step::BeginContour => crate::begin_contour(),
+                Step::EndContour => crate::end_contour(),
+                Step::Box(v) => crate::box_3d(v[0], v[1], v[2]),
+                Step::Sphere(r) => crate::sphere(r),
                 Step::Vertex(x, y) => crate::vertex(x, y),
                 Step::Bezier(v) => crate::bezier_vertex(v[0], v[1], v[2], v[3], v[4], v[5]),
                 Step::Quadratic(v) => crate::quadratic_vertex(v[0], v[1], v[2], v[3]),

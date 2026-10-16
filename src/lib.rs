@@ -206,16 +206,53 @@ mod render {
     // Vertices are stored untransformed; fills go through tfm + fill_tri,
     // strokes through draw_line, so both follow the current matrix and style.
     struct ShapeState { kind: u8, pts: Vec<(f32, f32)>, curve: Vec<(f32, f32)>, active: bool,
-                        holes: Vec<Vec<(f32, f32)>>, outer: Option<Vec<(f32, f32)>> }
+                        holes: Vec<Vec<(f32, f32)>>, outer: Option<Vec<(f32, f32)>>,
+                        // per vertex, kept in step with pts: depth and texture coordinates
+                        zs: Vec<f32>, uvs: Vec<(f32, f32)>, three: bool, lp_three: bool }
     fn shape_state() -> &'static parking_lot::Mutex<ShapeState> {
         static S: std::sync::OnceLock<parking_lot::Mutex<ShapeState>> = std::sync::OnceLock::new();
         S.get_or_init(|| parking_lot::Mutex::new(ShapeState { kind: 0, pts: Vec::new(), curve: Vec::new(), active: false,
-                                                               holes: Vec::new(), outer: None }))
+                                                               holes: Vec::new(), outer: None,
+                                                               zs: Vec::new(), uvs: Vec::new(), three: false, lp_three: false }))
     }
-    pub fn shape_begin(kind: u8) { lp_route! { crate::lp::begin_shape(kind); return; }
+    pub fn shape_begin(kind: u8) {
+        TEXTURE.with(|t| t.set(None));
+        {
+            let mut s = shape_state().lock();
+            s.kind = kind; s.pts.clear(); s.curve.clear(); s.active = true;
+            s.holes.clear(); s.outer = None;
+            s.zs.clear(); s.uvs.clear(); s.three = false; s.lp_three = false;
+        }
+        lp_route! { crate::lp::begin_shape(kind); }
+    }
+    /// Pads depth and texture coordinates for points added by curves.
+    fn pad(s: &mut ShapeState) {
+        let n = s.pts.len();
+        let z = s.zs.last().copied().unwrap_or(0.0);
+        let uv = s.uvs.last().copied().unwrap_or((0.0, 0.0));
+        s.zs.resize(n, z);
+        s.uvs.resize(n, uv);
+    }
+    /// vertex(x, y, z), vertex(x, y, u, v) and vertex(x, y, z, u, v).
+    pub fn shape_vertex_full(x: f32, y: f32, z: Option<f32>, uv: Option<(f32, f32)>) {
+        #[cfg(feature = "libprocessing")]
+        if crate::lp::on() {
+            let tex = TEXTURE.with(|t| t.get());
+            if z.is_none() && tex.is_none() { crate::lp::vertex(x, y); return; }
+            // 3D or textured: collected here and drawn as a mesh at end_shape
+            let mut s = shape_state().lock();
+            s.lp_three = true;
+            s.pts.push((x, y)); s.zs.push(z.unwrap_or(0.0)); s.uvs.push(uv.unwrap_or((0.0, 0.0)));
+            if z.is_some() { s.three = true; }
+            return;
+        }
         let mut s = shape_state().lock();
-        s.kind = kind; s.pts.clear(); s.curve.clear(); s.active = true;
-        s.holes.clear(); s.outer = None;
+        s.curve.clear();
+        pad(&mut s);
+        s.pts.push((x, y));
+        s.zs.push(z.unwrap_or(0.0));
+        s.uvs.push(uv.unwrap_or((0.0, 0.0)));
+        if z.is_some_and(|z| z != 0.0) || crate::three::in_3d() { s.three = true; }
     }
     /// begin_contour / end_contour: a hole in the shape. Its points should go
     /// round the other way from the outside, like in Processing.
@@ -233,11 +270,7 @@ mod render {
         if hole.len() >= 3 { s.holes.push(hole); }
         s.curve.clear();
     }
-    pub fn shape_vertex(x: f32, y: f32) { lp_route! { crate::lp::vertex(x, y); return; }
-        let mut s = shape_state().lock();
-        s.curve.clear();
-        s.pts.push((x, y));
-    }
+    pub fn shape_vertex(x: f32, y: f32) { shape_vertex_full(x, y, None, None) }
     pub fn shape_bezier_vertex(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) { lp_route! { crate::lp::bezier_vertex(cx1, cy1, cx2, cy2, x, y); return; }
         let mut s = shape_state().lock();
         let (x0, y0) = match s.pts.last() { Some(p) => *p, None => { s.pts.push((x, y)); return; } };
@@ -271,7 +304,85 @@ mod render {
             s.pts.push(pt);
         }
     }
-    pub fn shape_end(close: bool) { lp_route! { crate::lp::end_shape(close); return; }
+    pub fn shape_end(close: bool) {
+        #[cfg(feature = "libprocessing")]
+        if crate::lp::on() {
+            let mesh = {
+                let mut s = shape_state().lock();
+                s.active = false;
+                if s.lp_three { Some((s.kind, std::mem::take(&mut s.pts), std::mem::take(&mut s.zs), std::mem::take(&mut s.uvs))) } else { None }
+            };
+            crate::lp::end_shape(close);
+            if let Some((kind, pts, zs, uvs)) = mesh {
+                let verts: Vec<[f32; 3]> = pts.iter().zip(&zs).map(|(p, z)| [p.0, p.1, *z]).collect();
+                let tex = TEXTURE.with(|t| t.get());
+                let (tris, edges) = shape_triangles(kind, &verts, close);
+                let (fill, stroke, _) = style_pub();
+                let tex_e = tex.and_then(|id| {
+                    let imgs = images().lock();
+                    let img = imgs.get((id as usize).wrapping_sub(1))?;
+                    crate::lp::image_entity(id, img_version(id), img.w, img.h, || img.px.iter().flat_map(|c| {
+                        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                        [b(c.r), b(c.g), b(c.b), b(c.a)]
+                    }).collect()).map(|e| (e, img.w, img.h))
+                });
+                let norm_uv: Vec<[f32; 2]> = uvs.iter().map(|&(u, v)| match tex_e { Some((_, w, h)) => { let (u, v) = tex_uv(u, v, w, h); [u, v] } None => [0.0, 0.0] }).collect();
+                if fill.is_some() || tex_e.is_some() {
+                    crate::lp::mesh_3d(&verts, &norm_uv, &tris, tex_e.map(|t| t.0));
+                }
+                if stroke.is_some() { for e in &edges { crate::lp::line_3d(verts[e[0]], verts[e[1]], stroke); } }
+            }
+            return;
+        }
+        // in 3D, or with a texture: drawn as triangles
+        let mesh = {
+            let mut s = shape_state().lock();
+            let tex = TEXTURE.with(|t| t.get());
+            if s.active && s.outer.is_none() && s.holes.is_empty() && (s.three || tex.is_some()) {
+                s.active = false;
+                pad(&mut s);
+                Some((s.kind, s.three, std::mem::take(&mut s.pts), std::mem::take(&mut s.zs), std::mem::take(&mut s.uvs), tex))
+            } else { None }
+        };
+        if let Some((kind, three, pts, zs, uvs, tex)) = mesh {
+            let verts: Vec<[f32; 3]> = pts.iter().zip(&zs).map(|(p, z)| [p.0, p.1, *z]).collect();
+            if three {
+                match kind {
+                    1 => for v in &verts { crate::three::point_3d(v[0], v[1], v[2]); },
+                    2 => for w in verts.chunks_exact(2) { crate::three::line_3d(w[0][0], w[0][1], w[0][2], w[1][0], w[1][1], w[1][2]); },
+                    _ => {
+                        let (tris, edges) = shape_triangles(kind, &verts, close);
+                        crate::three::draw_mesh_uv(&verts, &uvs, &tris, &edges, tex);
+                    }
+                }
+            } else {
+                match kind {
+                    1 => for p in &pts { draw_point(p.0, p.1); },
+                    2 => if with_style(|s| s.stroke.is_some()) { for w in pts.chunks_exact(2) { draw_line(w[0].0, w[0].1, w[1].0, w[1].1); } },
+                    _ => {
+                        let (tris, _) = shape_triangles(kind, &verts, close);
+                        if let Some(id) = tex {
+                            let screen: Vec<(f32, f32)> = pts.iter().map(|p| tfm(p.0, p.1)).collect();
+                            textured_tris(id, &screen, &uvs, &tris);
+                        }
+                        // the outline, as it would be drawn without a texture
+                        let has_stroke = with_style(|s| s.stroke.is_some());
+                        if has_stroke {
+                            let poly = |p: &[(f32, f32)]| shape_polygon(p, true, false, true);
+                            match kind {
+                                3 => for w in pts.chunks_exact(3) { poly(w); },
+                                4 => for i in 2..pts.len() { poly(&[pts[i-2], pts[i-1], pts[i]]); },
+                                5 => for i in 2..pts.len() { poly(&[pts[0], pts[i-1], pts[i]]); },
+                                6 => for q in pts.chunks_exact(4) { poly(q); },
+                                7 => for i in (3..pts.len()).step_by(2) { poly(&[pts[i-3], pts[i-2], pts[i], pts[i-1]]); },
+                                _ => shape_polygon(&pts, close, false, true),
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let (kind, pts) = {
             let mut s = shape_state().lock();
             if !s.active { return; }
@@ -305,6 +416,142 @@ mod render {
                  },
             _ => poly(&pts, close),                                              // polygon
         }
+    }
+    // ── texture(), textureMode(), textureWrap() ─────────────────────────
+    thread_local! {
+        static TEXTURE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+    /// 0 IMAGE (u, v in pixels of the image), 1 NORMAL (0 to 1)
+    static TEXTURE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    /// 0 CLAMP, 1 REPEAT
+    static TEXTURE_WRAP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    pub fn set_texture(id: Option<u64>) { TEXTURE.with(|t| t.set(id.filter(|&i| i > 0))); }
+    pub fn set_texture_mode(m: u8) { TEXTURE_MODE.store(m.min(1), Ordering::Relaxed); }
+    pub fn set_texture_wrap(m: u8) { TEXTURE_WRAP.store(m.min(1), Ordering::Relaxed); }
+    /// Texture coordinates as 0 to 1, from whatever textureMode says.
+    pub(crate) fn tex_uv(u: f32, v: f32, w: usize, h: usize) -> (f32, f32) {
+        if TEXTURE_MODE.load(Ordering::Relaxed) == 1 { (u, v) } else { (u / w.max(1) as f32, v / h.max(1) as f32) }
+    }
+    /// The texture's color at (u, v) (0 to 1), with wrap, smoothing and tint.
+    fn tex_sample(img: &Img, u: f32, v: f32) -> Color {
+        let wrap = |t: f32| if TEXTURE_WRAP.load(Ordering::Relaxed) == 1 { t - t.floor() } else { t.clamp(0.0, 1.0) };
+        let (u, v) = (wrap(u), wrap(v));
+        let (iw, ih) = (img.w, img.h);
+        let c = if smooth_on() {
+            let (fx, fy) = ((u * iw as f32 - 0.5).clamp(0.0, (iw - 1) as f32), (v * ih as f32 - 0.5).clamp(0.0, (ih - 1) as f32));
+            let (x0, y0) = (fx as usize, fy as usize);
+            let (x1, y1) = ((x0 + 1).min(iw - 1), (y0 + 1).min(ih - 1));
+            let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+            let (a, b, c, d) = (img.px[y0 * iw + x0], img.px[y0 * iw + x1], img.px[y1 * iw + x0], img.px[y1 * iw + x1]);
+            let mix = |f: fn(&Color) -> f32| (f(&a) * (1.0 - tx) + f(&b) * tx) * (1.0 - ty) + (f(&c) * (1.0 - tx) + f(&d) * tx) * ty;
+            Color::from_rgba(mix(|c| c.r), mix(|c| c.g), mix(|c| c.b), mix(|c| c.a))
+        } else {
+            img.px[((v * ih as f32) as usize).min(ih - 1) * iw + ((u * iw as f32) as usize).min(iw - 1)]
+        };
+        match TINT.with(|t| t.get()) {
+            Some(t) => Color::from_rgba(c.r * t.r, c.g * t.g, c.b * t.b, c.a * t.a),
+            None => c,
+        }
+    }
+    /// Runs f with a texture sampler (u, v in the sketch's textureMode), or
+    /// returns None when there is no such image.
+    pub(crate) fn with_texture<R>(id: u64, f: impl FnOnce(&dyn Fn(f32, f32) -> Color) -> R) -> Option<R> {
+        let imgs = images().lock();
+        let img = imgs.get((id as usize).wrapping_sub(1))?;
+        if img.w == 0 || img.h == 0 { return None; }
+        let sample = |u: f32, v: f32| { let (u, v) = tex_uv(u, v, img.w, img.h); tex_sample(img, u, v) };
+        Some(f(&sample))
+    }
+    /// Triangles (and the edges to outline) for a begin_shape kind.
+    pub(crate) fn shape_triangles(kind: u8, v: &[[f32; 3]], close: bool) -> (Vec<[usize; 3]>, Vec<[usize; 2]>) {
+        let n = v.len();
+        let (mut t, mut e) = (Vec::new(), Vec::new());
+        match kind {
+            3 => for i in (0..n / 3 * 3).step_by(3) { t.push([i, i + 1, i + 2]); e.extend([[i, i + 1], [i + 1, i + 2], [i + 2, i]]); },
+            4 => for i in 2..n { t.push([i - 2, i - 1, i]); e.extend([[i - 2, i - 1], [i - 1, i], [i, i - 2]]); },
+            5 => for i in 2..n { t.push([0, i - 1, i]); e.extend([[0, i - 1], [i - 1, i], [i, 0]]); },
+            6 => for i in (0..n / 4 * 4).step_by(4) {
+                t.push([i, i + 1, i + 2]); t.push([i, i + 2, i + 3]);
+                e.extend([[i, i + 1], [i + 1, i + 2], [i + 2, i + 3], [i + 3, i]]);
+            },
+            7 => for i in (3..n).step_by(2) {
+                t.push([i - 3, i - 2, i]); t.push([i - 3, i, i - 1]);
+                e.extend([[i - 3, i - 2], [i - 2, i], [i, i - 1], [i - 1, i - 3]]);
+            },
+            _ => {
+                t = ear_clip(v);
+                for i in 1..n { e.push([i - 1, i]); }
+                if close && n > 2 { e.push([n - 1, 0]); }
+            }
+        }
+        (t, e)
+    }
+    /// Triangulates a polygon (convex or not) seen face on.
+    fn ear_clip(v: &[[f32; 3]]) -> Vec<[usize; 3]> {
+        let n = v.len();
+        if n < 3 { return Vec::new(); }
+        // look along the axis the polygon faces most
+        let mut nrm = [0.0f32; 3];
+        for i in 0..n {
+            let (a, b) = (v[i], v[(i + 1) % n]);
+            nrm[0] += (a[1] - b[1]) * (a[2] + b[2]);
+            nrm[1] += (a[2] - b[2]) * (a[0] + b[0]);
+            nrm[2] += (a[0] - b[0]) * (a[1] + b[1]);
+        }
+        let ax = if nrm[0].abs() >= nrm[1].abs() && nrm[0].abs() >= nrm[2].abs() { 0 } else if nrm[1].abs() >= nrm[2].abs() { 1 } else { 2 };
+        let p: Vec<(f32, f32)> = v.iter().map(|q| match ax { 0 => (q[1], q[2]), 1 => (q[2], q[0]), _ => (q[0], q[1]) }).collect();
+        let area: f32 = (0..n).map(|i| { let (a, b) = (p[i], p[(i + 1) % n]); a.0 * b.1 - b.0 * a.1 }).sum();
+        let sign = if area >= 0.0 { 1.0 } else { -1.0 };
+        let cross = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)) * sign;
+        let mut idx: Vec<usize> = (0..n).collect();
+        let mut out = Vec::with_capacity(n - 2);
+        let mut guard = 0;
+        while idx.len() > 3 && guard < n * n {
+            guard += 1;
+            let m = idx.len();
+            let mut cut = None;
+            for k in 0..m {
+                let (i0, i1, i2) = (idx[(k + m - 1) % m], idx[k], idx[(k + 1) % m]);
+                if cross(p[i0], p[i1], p[i2]) <= 0.0 { continue; }
+                let inside = idx.iter().any(|&j| j != i0 && j != i1 && j != i2
+                    && cross(p[i0], p[i1], p[j]) > 0.0 && cross(p[i1], p[i2], p[j]) > 0.0 && cross(p[i2], p[i0], p[j]) > 0.0);
+                if !inside { cut = Some(k); break; }
+            }
+            let k = cut.unwrap_or(0); // nothing clean: cut anyway, so it always ends
+            let m = idx.len();
+            out.push([idx[(k + m - 1) % m], idx[k], idx[(k + 1) % m]]);
+            idx.remove(k);
+        }
+        if idx.len() == 3 { out.push([idx[0], idx[1], idx[2]]); }
+        out
+    }
+    /// Paints textured triangles given in canvas pixels.
+    fn textured_tris(id: u64, screen: &[(f32, f32)], uvs: &[(f32, f32)], tris: &[[usize; 3]]) {
+        let (cw, ch) = canvas_dims();
+        let _ = with_texture(id, |sample| {
+            let mut buf = pixel_buf().lock();
+            for t in tris {
+                let (a, b, c) = (screen[t[0]], screen[t[1]], screen[t[2]]);
+                let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+                if !(area.abs() > 1e-6) || !area.is_finite() { continue; }
+                let x0 = a.0.min(b.0).min(c.0).floor().max(0.0) as i32;
+                let x1 = a.0.max(b.0).max(c.0).ceil().min(cw as f32) as i32;
+                let y0 = a.1.min(b.1).min(c.1).floor().max(0.0) as i32;
+                let y1 = a.1.max(b.1).max(c.1).ceil().min(ch as f32) as i32;
+                let (ua, ub, uc) = (uvs[t[0]], uvs[t[1]], uvs[t[2]]);
+                for py in y0..y1 {
+                    for px in x0..x1 {
+                        let (x, y) = (px as f32 + 0.5, py as f32 + 0.5);
+                        let w0 = ((b.0 - x) * (c.1 - y) - (b.1 - y) * (c.0 - x)) / area;
+                        let w1 = ((c.0 - x) * (a.1 - y) - (c.1 - y) * (a.0 - x)) / area;
+                        let w2 = 1.0 - w0 - w1;
+                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+                        let col = sample(w0 * ua.0 + w1 * ub.0 + w2 * uc.0, w0 * ua.1 + w1 * ub.1 + w2 * uc.1);
+                        put(&mut buf, cw, ch, px, py, col);
+                    }
+                }
+            }
+        });
     }
     /// A polygon with holes: filled as one shape (each hole joined to the
     /// outside by a seam with no width), each ring outlined on its own.
@@ -1058,6 +1305,7 @@ mod render {
         buf.fill(p);
     }
     pub fn background_rgb(r: f32, g: f32, b: f32) { lp_route! { crate::lp::background(Color::from_rgb(r, g, b)); return; }
+        crate::three::clear_depth();
         let col = Color::from_rgb(r, g, b);
         let p = solid(col);
         let mut buf = pixel_buf().lock();
@@ -1097,8 +1345,22 @@ mod render {
         (m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5])
     }
 
+    /// With a camera, a projection or a turn in depth in play, flat shapes go
+    /// through the 3D renderer like in Processing's P3D. Returns true if it drew.
+    fn flat_in_3d(pts: &[(f32, f32)]) -> bool {
+        if !crate::three::in_3d() { return false; }
+        let verts: Vec<[f32; 3]> = pts.iter().map(|p| [p.0, p.1, 0.0]).collect();
+        let (tris, edges) = shape_triangles(0, &verts, true);
+        crate::three::draw_mesh_uv(&verts, &[], &tris, &edges, None);
+        true
+    }
+    fn ellipse_pts(cx: f32, cy: f32, w: f32, h: f32) -> Vec<(f32, f32)> {
+        let n = ((w.abs() + h.abs()) * 0.25).clamp(24.0, 128.0) as usize;
+        (0..n).map(|i| { let t = i as f32 / n as f32 * std::f32::consts::TAU; (cx + t.cos() * w * 0.5, cy + t.sin() * h * 0.5) }).collect()
+    }
     pub fn draw_ellipse(cx: f32, cy: f32, w: f32, h: f32) { lp_route! { crate::lp::ellipse(cx, cy, w, h); return; }
         if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()) { return; }
+        if flat_in_3d(&ellipse_pts(cx, cy, w, h)) { return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         let pts = arc_points(cx, cy, w * 0.5, h * 0.5, 0.0, std::f32::consts::TAU, false);
@@ -1108,6 +1370,7 @@ mod render {
     }
 
     pub fn draw_rect(x: f32, y: f32, w: f32, h: f32) { lp_route! { crate::lp::rect(x, y, w, h, [0.0; 4]); return; }
+        if flat_in_3d(&[(x, y), (x + w, y), (x + w, y + h), (x, y + h)]) { return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         // Transform all four corners so rotation/scale in the matrix stack work correctly.
@@ -1132,6 +1395,7 @@ mod render {
         if !(tl >= 1.0 || tr >= 1.0 || br >= 1.0 || bl >= 1.0) { return draw_rect(x, y, w, h); }
 
         let (cw, ch) = canvas_dims();
+        if crate::three::in_3d() { return draw_rect(x, y, w, h); }
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         use std::f32::consts::{PI, FRAC_PI_2};
         // one quarter circle per corner (or the corner itself), joined into a single outline
@@ -1151,6 +1415,7 @@ mod render {
     }
 
     pub fn draw_triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) { lp_route! { crate::lp::triangle(x1, y1, x2, y2, x3, y3); return; }
+        if flat_in_3d(&[(x1, y1), (x2, y2), (x3, y3)]) { return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         let c = [tfm(x1, y1), tfm(x2, y2), tfm(x3, y3)];
@@ -1160,6 +1425,7 @@ mod render {
     }
 
     pub fn draw_line(x1: f32, y1: f32, x2: f32, y2: f32) { lp_route! { crate::lp::line(x1, y1, x2, y2); return; }
+        if crate::three::in_3d() { return crate::three::line_3d(x1, y1, 0.0, x2, y2, 0.0); }
         let (cw, ch) = canvas_dims();
         let (sc, sw) = with_style(|s| (s.stroke, s.stroke_weight));
         if let Some(c) = sc {
@@ -1170,6 +1436,7 @@ mod render {
     }
 
     pub fn draw_point(x: f32, y: f32) { lp_route! { crate::lp::point(x, y); return; }
+        if crate::three::in_3d() { return crate::three::point_3d(x, y, 0.0); }
         let (cw, ch) = canvas_dims();
         let (sc, sw) = with_style(|s| (s.stroke, s.stroke_weight));
         if let Some(c) = sc {
@@ -1193,6 +1460,7 @@ mod render {
 
     pub fn draw_quad(x1: f32, y1: f32, x2: f32, y2: f32,
                      x3: f32, y3: f32, x4: f32, y4: f32) { lp_route! { crate::lp::quad(x1, y1, x2, y2, x3, y3, x4, y4); return; }
+        if flat_in_3d(&[(x1, y1), (x2, y2), (x3, y3), (x4, y4)]) { return; }
         let (cw, ch) = canvas_dims();
         let (fill, stroke, sw) = with_style(|s| (s.fill, s.stroke, s.stroke_weight));
         let c = [tfm(x1, y1), tfm(x2, y2), tfm(x3, y3), tfm(x4, y4)];
@@ -1270,7 +1538,9 @@ mod render {
             *top = mat_mul(top, &t);
         });
     }
-    pub fn rotate_z(angle: f32) { lp_route! { crate::lp::rotate(angle, bevy::math::Vec3::Z); }
+    pub fn rotate_z(angle: f32) { lp_route! { crate::lp::rotate(angle, bevy::math::Vec3::Z); } rotate_z_no_lp(angle) }
+    /// rotate() on the engine's own matrices only (libprocessing already told).
+    pub(crate) fn rotate_z_no_lp(angle: f32) {
         crate::three::on_rotate_z(angle);
         MATRIX_STACK.with(|s| {
             let mut st = s.borrow_mut();
@@ -2117,6 +2387,18 @@ mod render {
             if let Some(e) = e { crate::lp::image_alpha(e, x, y, w, h, has_alpha); }
             return;
         }
+        if crate::three::in_3d() {
+            drop(imgs);
+            let verts = [[x, y, 0.0], [x + w, y, 0.0], [x + w, y + h, 0.0], [x, y + h, 0.0]];
+            let uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+            let old = TEXTURE_MODE.swap(1, Ordering::Relaxed);
+            push_style();
+            with_style_mut(|s| s.stroke = None);
+            crate::three::draw_mesh_uv(&verts, &uvs, &[[0, 1, 2], [0, 2, 3]], &[], Some(id));
+            pop_style();
+            TEXTURE_MODE.store(old, Ordering::Relaxed);
+            return;
+        }
         blit(img.w, img.h, &|i| img.px[i], x, y, w, h);
     }
 
@@ -2216,7 +2498,10 @@ mod render {
         stroke: Option<Color>,
         weight: f32,
     }
-    struct SvgShape { x: f32, y: f32, w: f32, h: f32, items: Vec<SvgItem>, own_style: bool }
+    struct SvgShape { x: f32, y: f32, w: f32, h: f32, items: Vec<SvgItem>, own_style: bool, mesh: Option<ObjMesh> }
+    /// A model from an OBJ file: one corner per face corner, in groups by material.
+    struct ObjMesh { verts: Vec<[f32; 3]>, uvs: Vec<(f32, f32)>, groups: Vec<ObjGroup> }
+    struct ObjGroup { tris: Vec<[usize; 3]>, color: Option<Color>, tex: Option<u64> }
     fn shapes() -> &'static parking_lot::Mutex<Vec<SvgShape>> {
         static S: std::sync::OnceLock<parking_lot::Mutex<Vec<SvgShape>>> = std::sync::OnceLock::new();
         S.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
@@ -2236,7 +2521,7 @@ mod render {
             let len = std::fs::metadata(&file).map_err(|e| e.to_string())?.len();
             if len > MAX_SVG_BYTES { return Err("file is too large".into()); }
             let text = String::from_utf8_lossy(&std::fs::read(&file).map_err(|e| e.to_string())?).into_owned();
-            parse_svg(&text)
+            if file.extension().is_some_and(|e| e.eq_ignore_ascii_case("obj")) { parse_obj(&text, file.parent()) } else { parse_svg(&text) }
         };
         let mut all = shapes().lock();
         if all.len() >= MAX_SHAPES {
@@ -2245,7 +2530,7 @@ mod render {
         }
         match load() {
             Ok(s)  => { all.push(s); all.len() as u64 }
-            Err(e) => { eprintln!("loadShape(\"{}\"): {} (SVG files are supported)", path, e); 0 }
+            Err(e) => { eprintln!("loadShape(\"{}\"): {} (SVG and OBJ files are supported)", path, e); 0 }
         }
     }
     pub fn shape_size(id: u64) -> (f32, f32) {
@@ -2261,6 +2546,10 @@ mod render {
     pub fn draw_shape(id: u64, x: f32, y: f32, w: f32, h: f32) {
         let all = shapes().lock();
         let Some(shape) = all.get((id as usize).wrapping_sub(1)) else { return };
+        if let Some(mesh) = &shape.mesh {
+            let size = (w.is_finite() && h.is_finite() && (w != shape.w || h != shape.h)).then_some((w, h));
+            return draw_obj(shape, mesh, x, y, size);
+        }
         if !(shape.w > 0.0 && shape.h > 0.0) || !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) { return; }
         let (sx, sy) = (w / shape.w, h / shape.h);
         // libprocessing: the same outlines, as shapes with contours for holes
@@ -2340,8 +2629,121 @@ mod render {
 
     // ── SVG reading ───────────────────────────────────────────────────────
 
+    /// OBJ: v, vt, f (any number of corners, negative indexes too), and
+    /// usemtl with the color (Kd) and picture (map_Kd) from the .mtl file.
+    fn parse_obj(text: &str, dir: Option<&std::path::Path>) -> Result<SvgShape, String> {
+        let num = |t: Option<&str>| t.and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+        let (mut pos, mut tc): (Vec<[f32; 3]>, Vec<(f32, f32)>) = (Vec::new(), Vec::new());
+        let mut materials: std::collections::HashMap<String, (Option<Color>, Option<u64>)> = Default::default();
+        let mut mesh = ObjMesh { verts: Vec::new(), uvs: Vec::new(), groups: vec![ObjGroup { tris: Vec::new(), color: None, tex: None }] };
+        let resolve = |name: &str| -> std::path::PathBuf {
+            let p = std::path::Path::new(name);
+            match dir { Some(d) if !p.is_absolute() => d.join(p), _ => p.to_path_buf() }
+        };
+        for line in text.lines() {
+            let mut t = line.split_whitespace();
+            match t.next() {
+                Some("v") => pos.push([num(t.next()), num(t.next()), num(t.next())]),
+                Some("vt") => { let u = num(t.next()); let v = num(t.next()); tc.push((u, 1.0 - v)); }
+                Some("mtllib") => {
+                    let name = line.trim_start()[6..].trim();
+                    if let Ok(mtl) = std::fs::read_to_string(resolve(name)) {
+                        let mut cur = String::new();
+                        for l in mtl.lines() {
+                            let mut m = l.split_whitespace();
+                            match m.next() {
+                                Some("newmtl") => { cur = m.next().unwrap_or("").to_string(); materials.entry(cur.clone()).or_default(); }
+                                Some("Kd") => {
+                                    let (r, g, b) = (num(m.next()), num(m.next()), num(m.next()));
+                                    materials.entry(cur.clone()).or_default().0 = Some(Color::from_rgb(r, g, b));
+                                }
+                                Some("map_Kd") => {
+                                    if let Some(f) = l.split_whitespace().last() {
+                                        let id = load_image(&resolve(f).to_string_lossy());
+                                        if id > 0 { materials.entry(cur.clone()).or_default().1 = Some(id); }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Some("usemtl") => {
+                    let (color, tex) = materials.get(t.next().unwrap_or("")).copied().unwrap_or((None, None));
+                    mesh.groups.push(ObjGroup { tris: Vec::new(), color, tex });
+                }
+                Some("f") => {
+                    let mut corners = Vec::new();
+                    for c in t {
+                        let mut parts = c.split('/');
+                        let idx = |s: Option<&str>, len: usize| -> Option<usize> {
+                            let i: i64 = s?.parse().ok()?;
+                            let i = if i < 0 { len as i64 + i } else { i - 1 };
+                            (0..len as i64).contains(&i).then_some(i as usize)
+                        };
+                        let Some(vi) = idx(parts.next(), pos.len()) else { continue };
+                        let ti = idx(parts.next(), tc.len());
+                        mesh.verts.push(pos[vi]);
+                        mesh.uvs.push(ti.map(|i| tc[i]).unwrap_or((0.0, 0.0)));
+                        corners.push(mesh.verts.len() - 1);
+                    }
+                    let g = mesh.groups.last_mut().unwrap();
+                    for i in 2..corners.len() { g.tris.push([corners[0], corners[i - 1], corners[i]]); }
+                    if mesh.verts.len() > MAX_SVG_POINTS { return Err("too many faces".into()); }
+                }
+                _ => {}
+            }
+        }
+        mesh.groups.retain(|g| !g.tris.is_empty());
+        if mesh.groups.is_empty() { return Err("no faces in the file".into()); }
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for v in &mesh.verts { for k in 0..3 { lo[k] = lo[k].min(v[k]); hi[k] = hi[k].max(v[k]); } }
+        Ok(SvgShape { x: lo[0], y: lo[1], w: hi[0] - lo[0], h: hi[1] - lo[1], items: Vec::new(), own_style: true, mesh: Some(mesh) })
+    }
+
+    /// Draws an OBJ model at (x, y), scaled to fit (w, h) when given.
+    fn draw_obj(shape: &SvgShape, mesh: &ObjMesh, x: f32, y: f32, size: Option<(f32, f32)>) {
+        push_matrix();
+        translate(x, y, 0.0);
+        if let Some((w, h)) = size {
+            if shape.w > 0.0 && shape.h > 0.0 {
+                let k = (w / shape.w).min(h / shape.h);
+                scale(k, k, k);
+            }
+        }
+        let old_mode = TEXTURE_MODE.swap(1, Ordering::Relaxed);
+        for g in &mesh.groups {
+            push_style();
+            if shape.own_style {
+                let c = g.color.unwrap_or(Color::from_rgb(1.0, 1.0, 1.0));
+                with_style_mut(|s| { s.fill = Some(c); s.stroke = None; });
+                lp_route! { crate::lp::fill(Some(c)); crate::lp::stroke(None); }
+            }
+            let tex = if shape.own_style { g.tex } else { None };
+            #[cfg(feature = "libprocessing")]
+            if crate::lp::on() {
+                let tex_e = tex.and_then(|id| {
+                    let imgs = images().lock();
+                    let img = imgs.get((id as usize).wrapping_sub(1))?;
+                    crate::lp::image_entity(id, img_version(id), img.w, img.h, || img.px.iter().flat_map(|c| {
+                        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                        [b(c.r), b(c.g), b(c.b), b(c.a)]
+                    }).collect())
+                });
+                let uvs: Vec<[f32; 2]> = mesh.uvs.iter().map(|&(u, v)| [u, v]).collect();
+                crate::lp::mesh_3d(&mesh.verts, &uvs, &g.tris, tex_e);
+                pop_style();
+                continue;
+            }
+            crate::three::draw_mesh_uv(&mesh.verts, &mesh.uvs, &g.tris, &[], tex);
+            pop_style();
+        }
+        TEXTURE_MODE.store(old_mode, Ordering::Relaxed);
+        pop_matrix();
+    }
+
     fn parse_svg(text: &str) -> Result<SvgShape, String> {
-        let mut shape = SvgShape { x: 0.0, y: 0.0, w: 0.0, h: 0.0, items: Vec::new(), own_style: true };
+        let mut shape = SvgShape { x: 0.0, y: 0.0, w: 0.0, h: 0.0, items: Vec::new(), own_style: true, mesh: None };
         let base = SvgStyle { fill: Some(Color::from_gray(0.0)), stroke: None, weight: 1.0, fill_a: 1.0, stroke_a: 1.0, opacity: 1.0 };
         // one entry per open element: its transform and style, and whether its contents are drawn
         let mut stack: Vec<(Mat, SvgStyle, bool)> = vec![(identity(), base, true)];
@@ -2880,6 +3282,7 @@ mod render {
 
     /// clear(): a layer becomes fully transparent again; the canvas goes black.
     pub fn clear() { lp_route! { crate::lp::background(Color::from_rgba(0.0, 0.0, 0.0, 0.0)); return; }
+        crate::three::clear_depth();
         pixel_buf().lock().fill(0);
     }
 
@@ -3960,13 +4363,15 @@ pub fn text_descent() -> f32 { render::text_descent() }
 
 /// PNG only. Returns an image id (0 if loading failed).
 pub fn load_image(path: &str) -> u64 { render::load_image(path) }
-pub fn image(id: u64, x: f32, y: f32) {
+pub fn image(id: impl ImageSource, x: f32, y: f32) {
+    let id = id.image_id();
     let (w, h) = render::image_size(id);
     // CORNERS needs both corners; with one point it is a corner
     let (x, y) = if IMAGE_MODE.load(Ordering::Relaxed) == CENTER { (x - w / 2.0, y - h / 2.0) } else { (x, y) };
     render::draw_image(id, x, y, w, h);
 }
-pub fn image_sized(id: u64, x: f32, y: f32, w: f32, h: f32) {
+pub fn image_sized(id: impl ImageSource, x: f32, y: f32, w: f32, h: f32) {
+    let id = id.image_id();
     let (x, y, w, h) = corner_box(IMAGE_MODE.load(Ordering::Relaxed), x, y, w, h);
     render::draw_image(id, x, y, w, h);
 }
@@ -4284,6 +4689,34 @@ pub fn end_contour()                  { render::shape_end_contour(); }
 #[inline] pub fn beginContour()       { begin_contour() }
 #[inline] pub fn endContour()         { end_contour() }
 pub fn end_shape_mode(mode: u8)       { render::shape_end(mode == CLOSE); }
+/// vertex(x, y, z): a corner in space.
+pub fn vertex_3d(x: impl Num, y: impl Num, z: impl Num) { render::shape_vertex_full(x.f(), y.f(), Some(z.f()), None); }
+/// vertex(x, y, u, v): a corner with a spot on the texture.
+pub fn vertex_uv(x: impl Num, y: impl Num, u: impl Num, v: impl Num) { render::shape_vertex_full(x.f(), y.f(), None, Some((u.f(), v.f()))); }
+/// vertex(x, y, z, u, v)
+pub fn vertex_3d_uv(x: impl Num, y: impl Num, z: impl Num, u: impl Num, v: impl Num) {
+    render::shape_vertex_full(x.f(), y.f(), Some(z.f()), Some((u.f(), v.f())));
+}
+/// normal(nx, ny, nz): accepted for compatibility. Lighting uses each
+/// triangle's own facing.
+pub fn normal(_nx: impl Num, _ny: impl Num, _nz: impl Num) {}
+
+/// textureMode(IMAGE): u and v in the image's pixels (the default).
+pub const IMAGE: u8 = 0;
+/// textureMode(NORMAL): u and v from 0 to 1.
+pub const NORMAL: u8 = 1;
+/// textureWrap(CLAMP): the edge pixels stretch past the image (the default).
+pub const CLAMP: u8 = 0;
+/// textureWrap(REPEAT): the image tiles.
+pub const REPEAT: u8 = 1;
+/// texture(img): the next shape (between begin_shape and end_shape) is
+/// painted with the image. Give each vertex a u, v with vertex_uv.
+pub fn texture(img: impl ImageSource) { render::set_texture(Some(img.image_id())); }
+pub fn no_texture() { render::set_texture(None); }
+pub fn texture_mode(mode: u8) { render::set_texture_mode(mode); }
+pub fn texture_wrap(mode: u8) { render::set_texture_wrap(mode); }
+#[inline] pub fn textureMode(mode: u8) { texture_mode(mode) }
+#[inline] pub fn textureWrap(mode: u8) { texture_wrap(mode) }
 
 /// Gaussian random number, mean 0 and standard deviation 1 (Box-Muller).
 pub fn random_gaussian() -> f32 {
@@ -4583,11 +5016,22 @@ mod text_tests {
 // createShape (see pshape.rs).
 mod pshape;
 pub use pshape::{PShape, ShapeRef, create_shape, create_shape_group, create_shape_rect, create_shape_ellipse,
-                 create_shape_line, create_shape_triangle, create_shape_quad, createShape};
+                 create_shape_line, create_shape_triangle, create_shape_quad, createShape,
+                 create_shape_box, create_shape_sphere};
 
+
+// Video (see video.rs).
+mod video;
+pub use video::{Movie, Capture, capture_list, ImageSource};
 
 // 3D (see three.rs).
 mod three;
+pub use three::{begin_camera, end_camera, frustum, ortho_planes, ortho_rect, print_camera, print_projection,
+                print_matrix_3d, rotate_axis, apply_matrix_3d, model_x, model_y, model_z, screen_z};
+#[inline] pub fn beginCamera() { begin_camera() }
+#[inline] pub fn endCamera() { end_camera() }
+#[inline] pub fn printCamera() { print_camera() }
+#[inline] pub fn printProjection() { print_projection() }
 pub use three::{rotate_x, rotate_y, camera, camera_look, perspective, perspective_default, ortho,
                 lights, no_lights, ambient_light, directional_light, point_light,
                 box_3d, box_cube, sphere, sphere_detail, sphere_detail_uv, line_3d, point_3d, triangle_3d,

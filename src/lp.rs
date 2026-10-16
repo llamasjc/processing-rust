@@ -497,6 +497,34 @@ pub(crate) fn triangle_3d(p: [[f32; 3]; 3], fill_c: Option<Color>, stroke: Optio
         line_3d(p[0], p[1], stroke); line_3d(p[1], p[2], stroke); line_3d(p[2], p[0], stroke);
     }
 }
+/// A begin_shape mesh in 3D (or with a texture): triangles with their own
+/// texture coordinates (0 to 1). Filled with the texture when there is one.
+pub(crate) fn mesh_3d(verts: &[[f32; 3]], uvs: &[[f32; 2]], tris: &[[usize; 3]], tex: Option<Entity>) {
+    if tris.is_empty() { return; }
+    let g = match pr::geometry_create(pr::geometry::Topology::TriangleList) { Ok(g) => g, Err(e) => { fail("making a mesh", e); return; } };
+    for t in tris {
+        let (a, b, c) = (Vec3::from_array(verts[t[0]]), Vec3::from_array(verts[t[1]]), Vec3::from_array(verts[t[2]]));
+        let _ = pr::geometry_normal(g, (b - a).cross(c - a).normalize_or_zero());
+        for &i in t {
+            let uv = uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+            let _ = pr::geometry_uv(g, uv[0], uv[1]);
+            let _ = pr::geometry_vertex(g, Vec3::from_array(verts[i]));
+        }
+    }
+    FRAME_GEOMETRY.with(|f| f.borrow_mut().push(g));
+    match tex {
+        Some(e) => {
+            let t = TINT.with(|t| t.get()).unwrap_or(Color::from_rgb(1.0, 1.0, 1.0));
+            cmd(DrawCommand::PushStyle);
+            cmd(DrawCommand::Fill(col(t)));
+            cmd(DrawCommand::Texture(e));
+            cmd(DrawCommand::Geometry(g));
+            cmd(DrawCommand::NoTexture);
+            cmd(DrawCommand::PopStyle);
+        }
+        None => cmd(DrawCommand::Geometry(g)),
+    }
+}
 fn free_frame_geometry() {
     for g in FRAME_GEOMETRY.with(|f| std::mem::take(&mut *f.borrow_mut())) { let _ = pr::geometry_destroy(g); }
 }

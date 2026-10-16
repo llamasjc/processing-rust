@@ -212,6 +212,26 @@ Sketches are valid Rust files.  The Processing conventions:
 | Both naming styles | `mouseX()` ≡ `mouse_x()`, `noFill()` ≡ `no_fill()`, … |
 | File extension | `.pde` (default) or `.prs` |
 
+### Textures, cameras, models and video
+
+- `texture(img)` between `begin_shape()` and `end_shape()` paints the shape
+  with an image; give each corner a spot on it with `vertex(x, y, u, v)` or
+  `vertex(x, y, z, u, v)`. `texture_mode(NORMAL)` takes u and v from 0 to 1
+  (the default, `IMAGE`, takes pixels); `texture_wrap(REPEAT)` tiles it.
+- `vertex(x, y, z)` makes shapes in space. With a camera, a projection or a
+  turn in depth in play, `rect`, `ellipse`, `triangle`, `quad`, `line`,
+  `point` and `image` go through the 3D renderer too, as in P3D.
+- `begin_camera()` / `end_camera()`, `frustum(...)`, `ortho(l, r, b, t[, n, f])`,
+  `print_camera()`, `print_projection()`, `rotate(angle, x, y, z)`,
+  `model_x/y/z`, `screen_z` and `apply_matrix` with 16 numbers.
+- `load_shape("model.obj")` reads OBJ models with their materials (`Kd`
+  colors and `map_Kd` pictures). `create_shape_box` and `create_shape_sphere`
+  make 3D shapes in code; PShape takes 3D vertices, textures and contours too.
+- `Movie::new("clip.mp4")` and `Capture::new(640, 480)` play video files and
+  cameras through ffmpeg (it has to be installed): `loop_()`, `play()`,
+  `pause()`, `jump(t)`, `speed(r)`, `available()`, `read()`, then
+  `image(movie, x, y)` or `texture(movie)`. No sound.
+
 ---
 
 ## Contributing

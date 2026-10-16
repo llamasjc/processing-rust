@@ -110,7 +110,7 @@ fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> M4 {
      s[2], u[2], -f[2], 0.0,
      -dot(s, eye), -dot(u, eye), dot(f, eye), 1.0]
 }
-fn frustum(fovy: f32, aspect: f32, near: f32, far: f32) -> M4 {
+fn persp_matrix(fovy: f32, aspect: f32, near: f32, far: f32) -> M4 {
     let f = 1.0 / (fovy / 2.0).tan();
     let mut m = [0.0; 16];
     m[0] = f / aspect; m[5] = f; m[10] = (far + near) / (near - far); m[11] = -1.0;
@@ -136,7 +136,7 @@ pub fn camera() {
 /// perspective(fov, aspect, near, far). fov in radians, PI/3 by default.
 pub fn perspective(fov: impl Num, aspect: impl Num, near: impl Num, far: impl Num) {
     lp_route! { crate::lp::perspective(fov.f(), aspect.f(), near.f().max(0.001), far.f()); return; }
-    let p = frustum(fov.f(), aspect.f(), near.f().max(0.001), far.f());
+    let p = persp_matrix(fov.f(), aspect.f(), near.f().max(0.001), far.f());
     S.with(|s| { let mut s = s.borrow_mut(); s.proj = p; s.custom_proj = true; });
 }
 /// perspective(): back to the default.
@@ -153,6 +153,158 @@ pub fn ortho() {
     S.with(|s| { let mut s = s.borrow_mut(); s.proj = m; s.custom_proj = true; });
 }
 
+/// ortho(left, right, bottom, top, near, far): no perspective, with the
+/// edges of the view given in pixels from the middle of the screen.
+pub fn ortho_planes(l: impl Num, r: impl Num, b: impl Num, t: impl Num, n: impl Num, f: impl Num) {
+    let (l, r, b, t, n, f) = (l.f(), r.f(), b.f(), t.f(), n.f(), f.f());
+    if r == l || t == b || f == n { return; }
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() {
+        if (l + r).abs() > 1e-3 || (b + t).abs() > 1e-3 { crate::lp::missing("an off-center ortho()"); }
+        crate::lp::ortho(r - l, t - b, n, f);
+        return;
+    }
+    let mut m = IDENT;
+    m[0] = 2.0 / (r - l); m[5] = 2.0 / (t - b); m[10] = -2.0 / (f - n);
+    m[12] = -(r + l) / (r - l); m[13] = -(t + b) / (t - b); m[14] = -(f + n) / (f - n);
+    S.with(|s| { let mut s = s.borrow_mut(); s.proj = m; s.custom_proj = true; });
+}
+/// ortho(left, right, bottom, top): near and far as in ortho().
+pub fn ortho_rect(l: impl Num, r: impl Num, b: impl Num, t: impl Num) {
+    let (_, h) = dims();
+    let ez = default_eye_z(h as f32);
+    ortho_planes(l, r, b, t, ez / 10.0, ez * 10.0);
+}
+/// frustum(left, right, bottom, top, near, far): a perspective view given by
+/// the edges of its near side.
+pub fn frustum(l: impl Num, r: impl Num, b: impl Num, t: impl Num, n: impl Num, f: impl Num) {
+    let (l, r, b, t, n, f) = (l.f(), r.f(), b.f(), t.f(), n.f().max(1e-4), f.f());
+    if r == l || t == b || f == n { return; }
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() {
+        if (l + r).abs() > 1e-3 || (b + t).abs() > 1e-3 { crate::lp::missing("an off-center frustum()"); }
+        crate::lp::perspective(2.0 * ((t - b) / 2.0 / n).atan(), (r - l) / (t - b), n, f);
+        return;
+    }
+    let mut m = [0.0; 16];
+    m[0] = 2.0 * n / (r - l); m[5] = 2.0 * n / (t - b);
+    m[8] = (r + l) / (r - l); m[9] = (t + b) / (t - b);
+    m[10] = -(f + n) / (f - n); m[11] = -1.0; m[14] = -2.0 * f * n / (f - n);
+    S.with(|s| { let mut s = s.borrow_mut(); s.proj = m; s.custom_proj = true; });
+}
+
+fn invert(m: &M4) -> Option<M4> {
+    let mut inv = [0.0f32; 16];
+    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if !det.is_finite() || det.abs() < 1e-20 { return None; }
+    Some(inv.map(|v| v / det))
+}
+
+thread_local! { static CAMERA_EDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// begin_camera() ... end_camera(): translate, rotate and so on in between
+/// move the camera instead of the shapes.
+pub fn begin_camera() {
+    if CAMERA_EDIT.with(|c| c.replace(true)) { eprintln!("beginCamera() called twice without endCamera()"); return; }
+    crate::render::push_matrix();
+    crate::render::reset_matrix();
+}
+pub fn end_camera() {
+    if !CAMERA_EDIT.with(|c| c.replace(false)) { eprintln!("endCamera() without beginCamera()"); return; }
+    let moved = S.with(|s| *s.borrow().stack.last().unwrap());
+    crate::render::pop_matrix();
+    let (_, view, _, _) = matrices();
+    // moving the camera by `moved` moves everything else the other way
+    let Some(undo) = invert(&moved) else { return };
+    let v = mul(&undo, &view);
+    let Some(cam) = invert(&v) else { return };
+    let eye = [cam[12], cam[13], cam[14]];
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() {
+        let fwd = [-cam[8], -cam[9], -cam[10]];
+        let up = [cam[4], cam[5], cam[6]];
+        crate::lp::camera(eye, [eye[0] + fwd[0], eye[1] + fwd[1], eye[2] + fwd[2]], up);
+    }
+    S.with(|s| { let mut s = s.borrow_mut(); s.view = v; s.eye = eye; s.custom_camera = true; });
+}
+
+fn print_m4(m: &M4) {
+    for r in 0..4 {
+        println!("{:>10.4} {:>10.4} {:>10.4} {:>10.4}", m[r], m[4 + r], m[8 + r], m[12 + r]);
+    }
+}
+/// printCamera(): the camera matrix, row by row.
+pub fn print_camera() { let (_, v, _, _) = matrices(); print_m4(&v); }
+/// printProjection(): the projection matrix, row by row.
+pub fn print_projection() { let (_, _, p, _) = matrices(); print_m4(&p); }
+/// printMatrix() in 3D: the current model matrix.
+pub fn print_matrix_3d() { let (m, ..) = matrices(); print_m4(&m); }
+
+/// rotate(angle, x, y, z): turns around the axis (x, y, z).
+pub fn rotate_axis(a: impl Num, x: impl Num, y: impl Num, z: impl Num) {
+    let (a, ax) = (a.f(), norm([x.f(), y.f(), z.f()]));
+    if !(dot(ax, ax) > 0.0) { return; }
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() { crate::lp::rotate(a, bevy::math::Vec3::from_array(ax)); }
+    if ax[0].abs() < 1e-6 && ax[1].abs() < 1e-6 {
+        // around z: the 2D matrix turns too
+        let a = if ax[2] < 0.0 { -a } else { a };
+        crate::render::rotate_z_no_lp(a);
+        return;
+    }
+    let (c, s, t) = (a.cos(), a.sin(), 1.0 - a.cos());
+    let [x, y, z] = ax;
+    let m = [t*x*x + c, t*x*y + s*z, t*x*z - s*y, 0.0,
+             t*x*y - s*z, t*y*y + c, t*y*z + s*x, 0.0,
+             t*x*z + s*y, t*y*z - s*x, t*z*z + c, 0.0,
+             0.0, 0.0, 0.0, 1.0];
+    post(m);
+}
+/// applyMatrix with 16 numbers, row by row as in Processing.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_matrix_3d(n00: f32, n01: f32, n02: f32, n03: f32, n10: f32, n11: f32, n12: f32, n13: f32,
+                       n20: f32, n21: f32, n22: f32, n23: f32, n30: f32, n31: f32, n32: f32, n33: f32) {
+    let m = [n00, n10, n20, n30, n01, n11, n21, n31, n02, n12, n22, n32, n03, n13, n23, n33];
+    if !m.iter().all(|v| v.is_finite()) { return; }
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() { crate::lp::missing("applyMatrix with 16 numbers"); }
+    post(m);
+}
+
+/// modelX/Y/Z: where a point ends up in space after the current transforms
+/// (camera not included).
+pub fn model_x(x: impl Num, y: impl Num, z: impl Num) -> f32 { model_pos([x.f(), y.f(), z.f()])[0] }
+pub fn model_y(x: impl Num, y: impl Num, z: impl Num) -> f32 { model_pos([x.f(), y.f(), z.f()])[1] }
+pub fn model_z(x: impl Num, y: impl Num, z: impl Num) -> f32 { model_pos([x.f(), y.f(), z.f()])[2] }
+fn model_pos(p: [f32; 3]) -> [f32; 3] {
+    let (m, ..) = matrices();
+    let q = apply(&m, p);
+    let w = if q[3].abs() > 1e-12 { q[3] } else { 1.0 };
+    [q[0] / w, q[1] / w, q[2] / w]
+}
+/// screenZ: depth on the screen, 0 near to 1 far.
+pub fn screen_z(x: impl Num, y: impl Num, z: impl Num) -> f32 {
+    let (m, view, proj, _) = matrices();
+    let (w, h) = dims();
+    let q = apply(&m, [x.f(), y.f(), z.f()]);
+    to_screen(apply(&mul(&proj, &view), [q[0], q[1], q[2]]), w as f32, h as f32).map(|s| s.z).unwrap_or(f32::NAN)
+}
+
 fn matrices() -> (M4, M4, M4, [f32; 3]) {
     let (w, h) = dims();
     let (w, h) = (w as f32, h as f32);
@@ -163,7 +315,7 @@ fn matrices() -> (M4, M4, M4, [f32; 3]) {
             let eye = [w / 2.0, h / 2.0, ez];
             (look_at(eye, [w / 2.0, h / 2.0, 0.0], [0.0, 1.0, 0.0]), eye)
         };
-        let proj = if s.custom_proj { s.proj } else { frustum(std::f32::consts::PI / 3.0, w / h, ez / 10.0, ez * 10.0) };
+        let proj = if s.custom_proj { s.proj } else { persp_matrix(std::f32::consts::PI / 3.0, w / h, ez / 10.0, ez * 10.0) };
         (*s.stack.last().unwrap(), view, proj, eye)
     })
 }
@@ -224,13 +376,13 @@ fn shade(base: Color, normal: [f32; 3], center: [f32; 3], eye: [f32; 3], lights:
 
 // ── rasterizing ────────────────────────────────────────────────────────────
 #[derive(Clone, Copy)]
-struct SV { x: f32, y: f32, z: f32 } // screen x, y and depth (0 near .. 1 far)
+struct SV { x: f32, y: f32, z: f32, iw: f32 } // screen x, y, depth (0 near .. 1 far), 1 / clip w
 
 fn to_screen(clip: [f32; 4], w: f32, h: f32) -> Option<SV> {
     if clip[3] <= 1e-4 { return None; }
     let (nx, ny, nz) = (clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]);
     if !(nx.is_finite() && ny.is_finite()) || !(-1.0..=1.0).contains(&nz) { return None; }
-    Some(SV { x: (nx + 1.0) / 2.0 * w, y: (ny + 1.0) / 2.0 * h, z: nz * 0.5 + 0.5 })
+    Some(SV { x: (nx + 1.0) / 2.0 * w, y: (ny + 1.0) / 2.0 * h, z: nz * 0.5 + 0.5, iw: 1.0 / clip[3] })
 }
 
 fn with_depth<R>(f: impl FnOnce(&mut Vec<f32>, usize, usize) -> R) -> R {
@@ -261,6 +413,12 @@ fn put(buf: &mut [u32], i: usize, c: Color, opaque_target: bool) {
 }
 
 fn raster_tri(a: SV, b: SV, c: SV, col: Color) {
+    raster_tri_with(a, b, c, col.a < 0.999, &|_, _, _| col);
+}
+
+/// Fills a triangle, asking `color` for each pixel with the perspective
+/// correct weights of the three corners.
+fn raster_tri_with(a: SV, b: SV, c: SV, see_through: bool, color: &dyn Fn(f32, f32, f32) -> Color) {
     let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
     if area.abs() < 1e-6 { return; }
     with_depth(|depth, w, h| {
@@ -283,7 +441,12 @@ fn raster_tri(a: SV, b: SV, c: SV, col: Color) {
                 let z = w0 * a.z + w1 * b.z + w2 * c.z;
                 let i = y as usize * w + x as usize;
                 if z < depth[i] {
-                    if col.a >= 0.999 { depth[i] = z; }
+                    // weights in space, not on the screen, so textures don't swim
+                    let (p0, p1, p2) = (w0 * a.iw, w1 * b.iw, w2 * c.iw);
+                    let sum = p0 + p1 + p2;
+                    let col = if sum > 0.0 { color(p0 / sum, p1 / sum, p2 / sum) } else { color(w0, w1, w2) };
+                    if col.a <= 0.0 { continue; }
+                    if !see_through && col.a >= 0.999 { depth[i] = z; }
                     put(&mut buf, i, col, opaque);
                 }
             }
@@ -342,6 +505,51 @@ fn draw_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], edges: Option<&[[usize; 2]
             None => for t in tris { draw(t[0], t[1]); draw(t[1], t[2]); draw(t[2], t[0]); },
         }
     }
+}
+
+/// A begin_shape / vertex / end_shape made in 3D (or textured in 3D):
+/// filled with the texture or the fill, lit, and outlined along `edges`.
+pub(crate) fn draw_mesh_uv(verts: &[[f32; 3]], uvs: &[(f32, f32)], tris: &[[usize; 3]], edges: &[[usize; 2]], tex: Option<u64>) {
+    let Some(tex) = tex else { return draw_mesh(verts, tris, Some(edges)) };
+    let (m, view, proj, eye) = matrices();
+    let (w, h) = dims();
+    let vp = mul(&proj, &view);
+    let world: Vec<[f32; 3]> = verts.iter().map(|p| { let q = apply(&m, *p); [q[0], q[1], q[2]] }).collect();
+    let screen: Vec<Option<SV>> = world.iter().map(|p| to_screen(apply(&vp, *p), w as f32, h as f32)).collect();
+    let lights = S.with(|s| s.borrow().lights.clone());
+    let white = Color::from_rgb(1.0, 1.0, 1.0);
+    let _ = crate::render::with_texture(tex, |sample| {
+        for t in tris {
+            let (Some(a), Some(b), Some(c)) = (screen[t[0]], screen[t[1]], screen[t[2]]) else { continue };
+            let (pa, pb, pc) = (world[t[0]], world[t[1]], world[t[2]]);
+            let n = norm(cross(sub(pb, pa), sub(pc, pa)));
+            let center = [(pa[0] + pb[0] + pc[0]) / 3.0, (pa[1] + pb[1] + pc[1]) / 3.0, (pa[2] + pb[2] + pc[2]) / 3.0];
+            let light = shade(white, n, center, eye, &lights);
+            let (ua, ub, uc) = (uvs[t[0]], uvs[t[1]], uvs[t[2]]);
+            raster_tri_with(a, b, c, false, &|k0, k1, k2| {
+                let col = sample(k0 * ua.0 + k1 * ub.0 + k2 * uc.0, k0 * ua.1 + k1 * ub.1 + k2 * uc.1);
+                Color::from_rgba(col.r * light.r, col.g * light.g, col.b * light.b, col.a)
+            });
+        }
+    });
+    let (_, stroke, weight) = crate::render::style_pub();
+    if let Some(sc) = stroke {
+        for e in edges { if let (Some(a), Some(b)) = (screen[e[0]], screen[e[1]]) { raster_line(a, b, sc, weight); } }
+    }
+}
+
+/// background() and clear() start the depth over.
+pub(crate) fn clear_depth() { S.with(|s| s.borrow_mut().depth_frame = u64::MAX); }
+
+/// Is anything 3D in play: a camera, a projection, or a turn or move in depth?
+pub(crate) fn in_3d() -> bool {
+    S.with(|s| {
+        let s = s.borrow();
+        let m = s.stack.last().unwrap();
+        s.custom_camera || s.custom_proj
+            || m[2].abs() > 1e-6 || m[6].abs() > 1e-6 || m[8].abs() > 1e-6 || m[9].abs() > 1e-6
+            || m[14].abs() > 1e-6
+    })
 }
 
 /// box(size) or box_3d(w, h, d): centered on the current origin.
