@@ -165,7 +165,14 @@ fn pick_display_system() {
                 (session == "wayland" && has_wayland) || (has_wayland && !has_x)
             }
         };
-        glfw::init_hint(glfw::InitHint::Platform(if wayland { glfw::Platform::Wayland } else { glfw::Platform::X11 }));
+        let (want, name) = if wayland { (glfw::Platform::Wayland, "Wayland") } else { (glfw::Platform::X11, "X11") };
+        if !want.is_supported() {
+            let other = if wayland { "X11" } else { "Wayland" };
+            eprintln!("libprocessing can't open a window: your session is {name}, but the GLFW library on this system only supports {other}.");
+            eprintln!("On Arch, install the glfw package with {name} support (sudo pacman -S glfw), or use the CPU renderer.");
+            std::process::exit(1);
+        }
+        glfw::init_hint(glfw::InitHint::Platform(want));
     }
 }
 
