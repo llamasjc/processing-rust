@@ -147,34 +147,21 @@ pub(crate) fn ensure_open() {
     open(w, h);
 }
 
-/// GLFW 3.4 may try Wayland first and give up on an X11 desktop (i3, ...),
-/// or hand back an error code the glfw crate can't name and panic. Say
-/// which one: Wayland only in a Wayland session, X11 otherwise.
-/// PROCESSING_GLFW_PLATFORM=x11 or wayland decides it by hand.
+/// Always X11 (XWayland in Wayland sessions). See Cargo.toml for why.
 fn pick_display_system() {
     #[cfg(target_os = "linux")]
     {
-        let forced = std::env::var("PROCESSING_GLFW_PLATFORM").ok().map(|v| v.to_ascii_lowercase());
-        let wayland = match forced.as_deref() {
-            Some("wayland") => true,
-            Some("x11") => false,
-            _ => {
-                // X11 whenever there is one (XWayland included): GLFW's Wayland
-                // backend reports "feature unimplemented" for things like window
-                // position, and glfw-rs panics on that error code.
-                let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-                let has_x = std::env::var_os("DISPLAY").is_some();
-                has_wayland && !has_x
-            }
-        };
-        let (want, name) = if wayland { (glfw::Platform::Wayland, "Wayland") } else { (glfw::Platform::X11, "X11") };
-        if !want.is_supported() {
-            let other = if wayland { "X11" } else { "Wayland" };
-            eprintln!("libprocessing can't open a window: your session is {name}, but the GLFW library on this system only supports {other}.");
-            eprintln!("On Arch, install the glfw package with {name} support (sudo pacman -S glfw), or use the CPU renderer.");
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("libprocessing needs X11 (or XWayland in a Wayland session), and DISPLAY isn't set.");
+            eprintln!("Install xorg-xwayland, or use the CPU renderer.");
             std::process::exit(1);
         }
-        glfw::init_hint(glfw::InitHint::Platform(want));
+        if !glfw::Platform::X11.is_supported() {
+            eprintln!("libprocessing can't open a window: the GLFW library here was built without X11.");
+            eprintln!("On Arch: sudo pacman -S glfw. Or use the CPU renderer.");
+            std::process::exit(1);
+        }
+        glfw::init_hint(glfw::InitHint::Platform(glfw::Platform::X11));
     }
 }
 

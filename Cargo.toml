@@ -25,7 +25,10 @@ processing_render = { git = "https://github.com/processing/libprocessing", rev =
 processing_input  = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true }
 # to tell GLFW which display system to use (X11 or Wayland)
 glfw              = { version = "0.60", default-features = false, optional = true }
-processing_glfw   = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true, features = ["x11", "wayland"] }
+# X11 only (Wayland sessions go through XWayland): with glfw's "wayland"
+# feature on, glfw-rs hands out Wayland window handles even on X11, and the
+# first GLFW call on them fails with "Wayland: Platform not initialized".
+processing_glfw   = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true, features = ["x11"] }
 
 [features]
 default = []
