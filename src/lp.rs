@@ -512,7 +512,10 @@ pub(crate) fn mesh_3d(verts: &[[f32; 3]], uvs: &[[f32; 2]], tris: &[[usize; 3]],
         }
     }
     FRAME_GEOMETRY.with(|f| f.borrow_mut().push(g));
+    #[cfg(lp_no_texture)]
+    let tex: Option<Entity> = { let _ = tex; None };
     match tex {
+        #[cfg(not(lp_no_texture))]
         Some(e) => {
             let t = TINT.with(|t| t.get()).unwrap_or(Color::from_rgb(1.0, 1.0, 1.0));
             cmd(DrawCommand::PushStyle);
@@ -522,7 +525,7 @@ pub(crate) fn mesh_3d(verts: &[[f32; 3]], uvs: &[[f32; 2]], tris: &[[usize; 3]],
             cmd(DrawCommand::NoTexture);
             cmd(DrawCommand::PopStyle);
         }
-        None => cmd(DrawCommand::Geometry(g)),
+        _ => cmd(DrawCommand::Geometry(g)),
     }
 }
 fn free_frame_geometry() {
