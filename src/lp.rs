@@ -359,7 +359,9 @@ pub(crate) fn camera(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) {
     let (hw, hh) = (w as f32 / 2.0, h as f32 / 2.0);
     let to_world = |p: [f32; 3]| Vec3::new(p[0] - hw, -(p[1] - hh), p[2]);
     if let Some(g) = target() {
-        let up = Vec3::new(up[0], -up[1], up[2]);
+        // Processing's up points to the bottom of the screen (its y grows
+        // downward); libprocessing's points to the top
+        let up = Vec3::new(-up[0], up[1], -up[2]);
         if let Err(e) = pr::graphics_camera(g, to_world(eye), to_world(center), up) { fail("camera", e); }
     }
 }
@@ -375,9 +377,51 @@ pub(crate) fn perspective(fov: f32, aspect: f32, near: f32, far: f32) {
     }
 }
 pub(crate) fn ortho(w: f32, h: f32, near: f32, far: f32) {
-    if let Some(g) = target() {
-        if let Err(e) = pr::graphics_ortho(g, -w / 2.0, w / 2.0, -h / 2.0, h / 2.0, near, far) { fail("ortho", e); }
+    ortho_edges(-w / 2.0, w / 2.0, -h / 2.0, h / 2.0, near, far);
+}
+
+/// A projection given as a matrix. libprocessing's own ortho() follows the
+/// window size and is always centered, so ortho with edges and frustum set the
+/// camera's projection themselves. Depth is reversed (near 1, far 0), as Bevy wants.
+#[derive(Debug, Clone)]
+struct MatrixProjection { m: bevy::math::Mat4, far: f32 }
+impl bevy::camera::CameraProjection for MatrixProjection {
+    fn get_clip_from_view(&self) -> bevy::math::Mat4 { self.m }
+    fn get_clip_from_view_for_sub(&self, _: &bevy::camera::SubCameraView) -> bevy::math::Mat4 { self.m }
+    fn update(&mut self, _w: f32, _h: f32) {}
+    fn far(&self) -> f32 { self.far }
+    fn get_frustum_corners(&self, _near: f32, _far: f32) -> [bevy::math::Vec3A; 8] {
+        let inv = self.m.inverse();
+        let at = |x: f32, y: f32, z: f32| { let p = inv * Vec4::new(x, y, z, 1.0); bevy::math::Vec3A::from(p.truncate() / p.w) };
+        [at(1.0, -1.0, 1.0), at(1.0, 1.0, 1.0), at(-1.0, 1.0, 1.0), at(-1.0, -1.0, 1.0),
+         at(1.0, -1.0, 0.0), at(1.0, 1.0, 0.0), at(-1.0, 1.0, 0.0), at(-1.0, -1.0, 0.0)]
     }
+}
+fn set_projection(m: bevy::math::Mat4, far: f32) {
+    let Some(g) = target() else { return };
+    let _ = pr::graphics_flush(g);
+    let _ = processing_core::app_mut(|app| {
+        if let Some(mut p) = app.world_mut().get_mut::<bevy::camera::Projection>(g) {
+            *p = bevy::camera::Projection::custom(MatrixProjection { m, far });
+        }
+        Ok(())
+    });
+}
+// Processing's view has y growing downward and libprocessing's upward, so
+// bottom and top swap sides.
+pub(crate) fn ortho_edges(l: f32, r: f32, b: f32, t: f32, near: f32, far: f32) {
+    let (b, t) = (-t, -b);
+    set_projection(bevy::math::Mat4::orthographic_rh(l, r, b, t, far, near), far);
+}
+pub(crate) fn frustum(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) {
+    let (b, t) = (-t, -b);
+    let m = bevy::math::Mat4::from_cols(
+        Vec4::new(2.0 * n / (r - l), 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 2.0 * n / (t - b), 0.0, 0.0),
+        Vec4::new((r + l) / (r - l), (t + b) / (t - b), n / (f - n), -1.0),
+        Vec4::new(0.0, 0.0, n * f / (f - n), 0.0),
+    );
+    set_projection(m, f);
 }
 // ── lights ───────────────────────────────────────────────────────────────
 // Processing's lights last one frame: draw() asks for them again each time.
@@ -410,6 +454,9 @@ pub(crate) fn no_lights() {
 // surface facing the camera gives about its fill color, like Processing.
 const DIR_LUX: f32 = 3_500.0;
 const AMBIENT_NITS: f32 = 1_500.0;
+// The ambient light that shows a texture at its own colors when the sketch has
+// no lights (textured shapes are drawn as rough metal: all ambient, no white sheen).
+const TEX_AMBIENT: f32 = 1.47;
 const POINT_LUMENS: f32 = 1.5e8;
 fn begin_frame_lights() { WANT.with(|w| w.borrow_mut().clear()); LIT.with(|l| l.set(false)); }
 /// Brings the scene's lights in line with what this frame asked for.
@@ -501,7 +548,17 @@ pub(crate) fn triangle_3d(p: [[f32; 3]; 3], fill_c: Option<Color>, stroke: Optio
 /// texture coordinates (0 to 1). Filled with the texture when there is one.
 pub(crate) fn mesh_3d(verts: &[[f32; 3]], uvs: &[[f32; 2]], tris: &[[usize; 3]], tex: Option<Entity>) {
     if tris.is_empty() { return; }
+    #[cfg(lp_no_texture)]
+    let tex: Option<Entity> = { let _ = tex; None };
+    // flat (unlit) shapes take their color from the vertices
+    let fill_c = crate::render::style_pub().0;
+    let vc = match (tex, fill_c) {
+        (Some(_), _) => TINT.with(|t| t.get()).unwrap_or(Color::from_rgb(1.0, 1.0, 1.0)),
+        (None, Some(c)) => c,
+        (None, None) => return,
+    };
     let g = match pr::geometry_create(pr::geometry::Topology::TriangleList) { Ok(g) => g, Err(e) => { fail("making a mesh", e); return; } };
+    let _ = pr::geometry_color(g, Vec4::new(vc.r, vc.g, vc.b, vc.a));
     for t in tris {
         let (a, b, c) = (Vec3::from_array(verts[t[0]]), Vec3::from_array(verts[t[1]]), Vec3::from_array(verts[t[2]]));
         let _ = pr::geometry_normal(g, (b - a).cross(c - a).normalize_or_zero());
@@ -512,14 +569,23 @@ pub(crate) fn mesh_3d(verts: &[[f32; 3]], uvs: &[[f32; 2]], tris: &[[usize; 3]],
         }
     }
     FRAME_GEOMETRY.with(|f| f.borrow_mut().push(g));
-    #[cfg(lp_no_texture)]
-    let tex: Option<Entity> = { let _ = tex; None };
     match tex {
         #[cfg(not(lp_no_texture))]
         Some(e) => {
             let t = TINT.with(|t| t.get()).unwrap_or(Color::from_rgb(1.0, 1.0, 1.0));
             cmd(DrawCommand::PushStyle);
+            // libprocessing's textures are always lit: without lights in the
+            // sketch, a full white ambient light shows them at their own colors
+            if !LIT.with(|l| l.get()) {
+                WANT.with(|w| { let mut w = w.borrow_mut(); if !w.contains(&LightSpec::Ambient([TEX_AMBIENT; 3])) { w.push(LightSpec::Ambient([TEX_AMBIENT; 3])); } });
+                cmd(DrawCommand::Roughness(1.0));
+                cmd(DrawCommand::Metallic(1.0));
+            }
             cmd(DrawCommand::Fill(col(t)));
+            // textureWrap and noSmooth, as the image's sampler
+            let filter = if crate::render::smooth_on() { 0 } else { 1 };
+            let wrap = crate::render::texture_wrap_mode();
+            let _ = pr::image_set_sampler(e, filter, wrap, wrap);
             cmd(DrawCommand::Texture(e));
             cmd(DrawCommand::Geometry(g));
             cmd(DrawCommand::NoTexture);
@@ -657,6 +723,7 @@ pub(crate) fn read_pixels() -> Option<(Vec<u32>, usize, usize)> {
     ensure_open();
     let g = target()?;
     let (w, h) = target_size()?;
+    sync_lights();
     let _ = pr::graphics_flush(g);
     let px = match pr::graphics_readback(g) { Ok(p) => p, Err(e) => { fail("reading pixels", e); return None; } };
     let out = px.iter().map(|c: &LinearRgba| {

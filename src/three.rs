@@ -160,8 +160,7 @@ pub fn ortho_planes(l: impl Num, r: impl Num, b: impl Num, t: impl Num, n: impl 
     if r == l || t == b || f == n { return; }
     #[cfg(feature = "libprocessing")]
     if crate::lp::on() {
-        if (l + r).abs() > 1e-3 || (b + t).abs() > 1e-3 { crate::lp::missing("an off-center ortho()"); }
-        crate::lp::ortho(r - l, t - b, n, f);
+        crate::lp::ortho_edges(l, r, b, t, n, f);
         return;
     }
     let mut m = IDENT;
@@ -182,8 +181,7 @@ pub fn frustum(l: impl Num, r: impl Num, b: impl Num, t: impl Num, n: impl Num, 
     if r == l || t == b || f == n { return; }
     #[cfg(feature = "libprocessing")]
     if crate::lp::on() {
-        if (l + r).abs() > 1e-3 || (b + t).abs() > 1e-3 { crate::lp::missing("an off-center frustum()"); }
-        crate::lp::perspective(2.0 * ((t - b) / 2.0 / n).atan(), (r - l) / (t - b), n, f);
+        crate::lp::frustum(l, r, b, t, n, f);
         return;
     }
     let mut m = [0.0; 16];

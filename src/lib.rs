@@ -428,6 +428,7 @@ mod render {
     pub fn set_texture(id: Option<u64>) { TEXTURE.with(|t| t.set(id.filter(|&i| i > 0))); }
     pub fn set_texture_mode(m: u8) { TEXTURE_MODE.store(m.min(1), Ordering::Relaxed); }
     pub fn set_texture_wrap(m: u8) { TEXTURE_WRAP.store(m.min(1), Ordering::Relaxed); }
+    pub(crate) fn texture_wrap_mode() -> u8 { TEXTURE_WRAP.load(Ordering::Relaxed) }
     /// Texture coordinates as 0 to 1, from whatever textureMode says.
     pub(crate) fn tex_uv(u: f32, v: f32, w: usize, h: usize) -> (f32, f32) {
         if TEXTURE_MODE.load(Ordering::Relaxed) == 1 { (u, v) } else { (u / w.max(1) as f32, v / h.max(1) as f32) }
@@ -713,7 +714,7 @@ mod render {
     // smooth() / noSmooth(): anti-aliased edges, on by default as in Processing.
     static SMOOTH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     #[inline]
-    fn smooth_on() -> bool { SMOOTH.load(Ordering::Relaxed) }
+    pub(crate) fn smooth_on() -> bool { SMOOTH.load(Ordering::Relaxed) }
 
     // blendMode(): how a drawn color combines with what is already there.
     // 0 BLEND (default), 1 ADD, 2 SUBTRACT, 3 DARKEST, 4 LIGHTEST,
