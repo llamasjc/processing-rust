@@ -190,6 +190,21 @@ Known differences on libprocessing, for now:
 - Edges are always smooth; `no_smooth()` does nothing.
 - Lights apply to the whole frame: `no_lights()` makes the shapes after it
   flat again, but the lights stay for the shapes drawn before.
+- `filter()` on a layer (`create_graphics`) doesn't change it yet, and the
+  see-through parts of a layer can cover what's under it when it's drawn.
+- Half-transparent arcs come out a little off.
+
+The sketch draws on a canvas of exactly its own size, which is then shown in
+the top left of the window. A window manager that won't make a window that
+small (i3 stops at about 75 pixels) or a window resized by hand shows the
+sketch at its own size, with black around it. `get()` and `saveFrame()` always
+see just the sketch.
+
+Textures need libprocessing at the pinned commit or newer. Built against an
+older checkout of your own, textured shapes draw untextured and the build says
+so; older checkouts also tone-map colors, which makes everything a little dull.
+To build against the pinned commit without touching your checkout, set
+`LIBPROCESSING_DIR` to a folder that doesn't exist.
 
 Sketches build against your own libprocessing checkout when there is one:
 `LIBPROCESSING_DIR`, the `rust.libprocessing` preference, or
