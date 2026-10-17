@@ -43,6 +43,12 @@ pub(crate) fn on() -> bool {
 struct Lp {
     glfw: Option<GlfwContext>,
     surface: Entity,
+    /// the window's own canvas: each frame, the sketch's canvas is copied
+    /// into it. The window can end up bigger than the sketch (a window
+    /// manager with a minimum size), the sketch's canvas never does.
+    win: Entity,
+    /// the sketch's canvas (an offscreen image) and its graphics
+    canvas: Entity,
     main: Entity,
     /// where drawing goes right now: the window, or a layer
     target: Entity,
@@ -132,14 +138,32 @@ pub(crate) fn size(w: u32, h: u32) {
     }
     let resized = LP.with(|l| {
         let mut l = l.borrow_mut();
-        let Some(l) = l.as_mut() else { return false };
+        let Some(l) = l.as_mut() else { return None };
         if l.size != (w, h) {
-            if let Err(e) = pr::surface_resize(l.main, w, h) { fail("resize", e); }
-            l.size = (w, h);
+            if let Err(e) = pr::surface_resize(l.surface, w, h) { fail("resize", e); }
+            if let Some((canvas, main)) = make_canvas(w, h) {
+                let (old_c, old_m) = (l.canvas, l.main);
+                if l.target == old_m { l.target = main; }
+                l.canvas = canvas;
+                l.main = main;
+                l.size = (w, h);
+                let _ = pr::graphics_destroy(old_m);
+                let _ = pr::surface_destroy(old_c);
+                return Some(main);
+            }
         }
-        true
+        None
     });
-    if resized { return; }
+    // the new canvas picks up where the old one was: begun, in Processing's
+    // coordinates, with Processing's gray
+    if let Some(main) = resized {
+        start_canvas(main);
+        corner_modes();
+        let (th, tv, ts) = crate::render::text_state();
+        text_align(th, tv);
+        text_size(ts);
+        cmd(DrawCommand::BackgroundColor(BColor::srgb(0.8, 0.8, 0.8)));
+    }
 }
 
 /// Opens the window now if it isn't open yet: something needs the canvas
@@ -168,6 +192,47 @@ fn pick_display_system() {
     }
 }
 
+/// The sketch's canvas: an offscreen image of exactly the sketch's size, and
+/// its graphics. Always libprocessing's 3D camera, turned to Processing's
+/// coordinates (see processing_coords): 2D drawing lands on the same pixels,
+/// box() and sphere() get perspective, and translucent fills work
+/// (libprocessing's 2D mode drops them for now).
+fn make_canvas(w: u32, h: u32) -> Option<(Entity, Entity)> {
+    let canvas = match pr::surface_create_offscreen(w, h, 1.0, TextureFormat::Rgba16Float) {
+        Ok(s) => s, Err(e) => { fail("making the canvas", e); return None; }
+    };
+    let main = match pr::graphics_create(canvas, w, h, TextureFormat::Rgba16Float) {
+        Ok(g) => g, Err(e) => { fail("making the canvas", e); return None; }
+    };
+    if let Err(e) = pr::graphics_mode_3d(main) { fail("3D mode", e); }
+    Some((canvas, main))
+}
+fn start_canvas(main: Entity) {
+    let _ = pr::graphics_begin_draw(main);
+    processing_coords();
+}
+/// Ends the frame: draws the sketch's canvas, then copies it into the
+/// window at the top left.
+fn finish_frame() {
+    let Some((main, win, canvas, (w, h))) = LP.with(|l| l.borrow().as_ref().map(|l| (l.main, l.win, l.canvas, l.size))) else { return };
+    end_draw_guarded(main);
+    let _ = pr::graphics_begin_draw(win);
+    let rec = |c: DrawCommand| { if let Err(e) = pr::graphics_record_command(win, c) { fail("showing the frame", e); } };
+    rec(DrawCommand::BackgroundColor(BColor::srgb(0.0, 0.0, 0.0)));
+    rec(DrawCommand::ImageMode(ShapeMode::Corner));
+    // The window's canvas keeps the size it was made with and is stretched
+    // over the whole window, so a window bigger than the sketch would stretch
+    // the picture. Shrink it by as much, to show it at its own size.
+    let surface = LP.with(|l| l.borrow().as_ref().map(|l| l.surface));
+    let (ww, wh) = surface.and_then(|s| processing_core::app_mut(|app| {
+        Ok(app.world().get::<bevy::window::Window>(s).map(|win| (win.resolution.width(), win.resolution.height())))
+    }).ok().flatten()).unwrap_or((w as f32, h as f32));
+    let (fw, fh) = (w as f32, h as f32);
+    let (dw, dh) = (fw * fw / ww.max(1.0), fh * fh / wh.max(1.0));
+    rec(DrawCommand::Image { entity: canvas, dx: 0.0, dy: 0.0, d_width: Some(dw), d_height: Some(dh), sx: None, sy: None, s_width: None, s_height: None });
+    end_draw_guarded(win);
+}
+
 /// Opens the window and the canvas.
 fn open(w: u32, h: u32) {
     let root = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| ".".into());
@@ -181,22 +246,17 @@ fn open(w: u32, h: u32) {
         Ok(s) => s,
         Err(e) => { fail("making the surface", e); std::process::exit(1); }
     };
-    let main = match pr::graphics_create(surface, w, h, TextureFormat::Rgba16Float) {
+    let win = match pr::graphics_create(surface, w, h, TextureFormat::Rgba16Float) {
         Ok(g) => g,
-        Err(e) => { fail("making the canvas", e); std::process::exit(1); }
+        Err(e) => { fail("making the window's canvas", e); std::process::exit(1); }
     };
+    let Some((canvas, main)) = make_canvas(w, h) else { std::process::exit(1) };
     let _ = pr::surface_set_title(surface, "sketch".into());
     LP.with(|l| *l.borrow_mut() = Some(Lp {
-        glfw: Some(glfw), surface, main, target: main, size: (w, h),
+        glfw: Some(glfw), surface, win, canvas, main, target: main, size: (w, h),
         images: HashMap::new(), fonts: HashMap::new(), layers: HashMap::new(), warned: Vec::new(),
     }));
-    // Always libprocessing's 3D camera, turned to Processing's coordinates
-    // (see processing_coords): 2D drawing lands on the same pixels, box() and
-    // sphere() get perspective, and translucent fills work (libprocessing's
-    // 2D mode drops them for now).
-    if let Err(e) = pr::graphics_mode_3d(main) { fail("3D mode", e); }
-    let _ = pr::graphics_begin_draw(main);
-    processing_coords();
+    start_canvas(main);
     // start in step with the engine: its shape modes, text alignment and size
     corner_modes();
     let (th, tv, ts) = crate::render::text_state();
@@ -1002,9 +1062,8 @@ pub(crate) fn run<S: 'static>(mut app: crate::App<S>) {
     ensure_open();
     let title = app.title.clone();
     if title != "sketch" { set_title(&title); }
-    let main = LP.with(|l| l.borrow().as_ref().map(|l| l.main)).unwrap();
     sync_lights();
-    end_draw_guarded(main);
+    finish_frame();
     free_frame_geometry();
 
     let mut frame: u64 = 0;
@@ -1040,8 +1099,8 @@ pub(crate) fn run<S: 'static>(mut app: crate::App<S>) {
             frame += 1;
             sync(start, frame);
             let _ = pr::advance_frame_count();
-            let _ = pr::graphics_begin_draw(main);
-            processing_coords();
+            let main = LP.with(|l| l.borrow().as_ref().map(|l| l.main)).unwrap();
+            start_canvas(main);
             corner_modes();
             crate::render::begin_draw();
             begin_frame_lights();
@@ -1049,7 +1108,7 @@ pub(crate) fn run<S: 'static>(mut app: crate::App<S>) {
             (app.draw_fn)(&mut app.state);
             crate::render::end_draw();
             sync_lights();
-            end_draw_guarded(main);
+            finish_frame();
             free_frame_geometry();
             { use std::io::Write; let _ = std::io::stdout().flush(); }
             // images made for this frame (pixels, layers) can go now
