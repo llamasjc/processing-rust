@@ -96,7 +96,10 @@ fn init_app(asset_root: &str) -> processing_core::error::Result<()> {
         .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
         // no sound for now: don't open the sound card
         .disable::<bevy::audio::AudioPlugin>()
-        .set(WindowPlugin { primary_window: None, exit_condition: bevy::window::ExitCondition::DontExit, ..default() });
+        .set(WindowPlugin { primary_window: None, exit_condition: bevy::window::ExitCondition::DontExit, ..default() })
+        // don't watch the sketch folder for changes: in a big folder, or one
+        // with folders we can't read (like /tmp), the watcher fails to start
+        .set(bevy::asset::AssetPlugin { watch_for_changes_override: Some(false), ..default() });
     app.add_plugins(plugins);
     // no sound and no MIDI: just input and drawing
     app.add_plugins(processing_input::InputPlugin);
