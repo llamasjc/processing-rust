@@ -456,6 +456,7 @@ const DIR_LUX: f32 = 3_500.0;
 const AMBIENT_NITS: f32 = 1_500.0;
 // The ambient light that shows a texture at its own colors when the sketch has
 // no lights (textured shapes are drawn as rough metal: all ambient, no white sheen).
+#[allow(dead_code)]
 const TEX_AMBIENT: f32 = 1.47;
 const POINT_LUMENS: f32 = 1.5e8;
 fn begin_frame_lights() { WANT.with(|w| w.borrow_mut().clear()); LIT.with(|l| l.set(false)); }

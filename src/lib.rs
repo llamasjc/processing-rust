@@ -428,6 +428,7 @@ mod render {
     pub fn set_texture(id: Option<u64>) { TEXTURE.with(|t| t.set(id.filter(|&i| i > 0))); }
     pub fn set_texture_mode(m: u8) { TEXTURE_MODE.store(m.min(1), Ordering::Relaxed); }
     pub fn set_texture_wrap(m: u8) { TEXTURE_WRAP.store(m.min(1), Ordering::Relaxed); }
+    #[allow(dead_code)] // unused when libprocessing has no textures
     pub(crate) fn texture_wrap_mode() -> u8 { TEXTURE_WRAP.load(Ordering::Relaxed) }
     /// Texture coordinates as 0 to 1, from whatever textureMode says.
     pub(crate) fn tex_uv(u: f32, v: f32, w: usize, h: usize) -> (f32, f32) {
