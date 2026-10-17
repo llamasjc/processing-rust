@@ -730,12 +730,35 @@ pub(crate) fn read_pixels() -> Option<(Vec<u32>, usize, usize)> {
     sync_lights();
     let _ = pr::graphics_flush(g);
     let px = match pr::graphics_readback(g) { Ok(p) => p, Err(e) => { fail("reading pixels", e); return None; } };
-    let out = px.iter().map(|c: &LinearRgba| {
+    let all: Vec<u32> = px.iter().map(|c: &LinearRgba| {
         let s: Srgba = (*c).into();
         let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
         (b(s.alpha) << 24) | (b(s.red) << 16) | (b(s.green) << 8) | b(s.blue)
     }).collect();
-    Some((out, w as usize, h as usize))
+    let (w, h) = (w as usize, h as usize);
+    if all.len() == w * h { return Some((all, w, h)); }
+    // The canvas came back a different size than the sketch's (a window
+    // manager that won't make the window that small, say). Keep the sketch's
+    // part, from the top left.
+    let n = all.len();
+    let (aw, ah) = if n % h == 0 && n / h >= w { (n / h, h) } else if n % w == 0 { (w, n / w) } else { (0, 0) };
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("libprocessing: the canvas is {aw}x{ah} pixels, the sketch {w}x{h}; get() and saveFrame() use the top left {w}x{h}");
+    }
+    if std::env::var_os("LP_DEBUG_READBACK").is_some() && aw > 0 {
+        let bytes: Vec<u8> = all.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, (p >> 24) as u8]).collect();
+        if let Ok(f) = std::fs::File::create("readback-raw.png") {
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(f), aw as u32, ah as u32);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            if let Ok(mut wr) = enc.write_header() { let _ = wr.write_image_data(&bytes); }
+        }
+    }
+    if aw == 0 { return None; }
+    let mut out = vec![0u32; w * h];
+    for y in 0..h.min(ah) { for x in 0..w.min(aw) { out[y * w + x] = all[y * aw + x]; } }
+    Some((out, w, h))
 }
 // Copies what libprocessing has drawn into the engine's own pixel buffer,
 // so get(), loadPixels(), filter() and saveFrame() can work on it. Only
