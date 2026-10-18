@@ -40,7 +40,7 @@ public class RustAnalyzer {
   // ── Known lifecycle function names (snake_case canonical forms) ─────────────
   private static final Set<String> LIFECYCLE_FNS = Set.of(
     "setup", "draw",
-    "mouse_pressed", "mouse_released", "mouse_moved", "mouse_dragged",
+    "mouse_pressed", "mouse_released", "mouse_clicked", "mouse_moved", "mouse_dragged",
     "mouse_wheel",
     "key_pressed",  "key_released",  "key_typed"
   );
@@ -51,6 +51,7 @@ public class RustAnalyzer {
     java.util.Map.of(
       "mousePressed",  "mouse_pressed",
       "mouseReleased", "mouse_released",
+      "mouseClicked",  "mouse_clicked",
       "mouseMoved",    "mouse_moved",
       "mouseDragged",  "mouse_dragged",
       "mouseWheel",    "mouse_wheel",

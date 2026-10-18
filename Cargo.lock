@@ -5190,6 +5190,7 @@ dependencies = [
  "processing_glfw",
  "processing_input",
  "processing_render",
+ "regex",
  "zune-jpeg 0.4.21",
 ]
 

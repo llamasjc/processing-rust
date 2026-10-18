@@ -273,8 +273,13 @@ impl PShape {
 }
 
 /// What shape() can draw: an SVG from load_shape (its id) or a PShape.
-pub trait ShapeRef { fn draw_at(&self, x: f32, y: f32, size: Option<(f32, f32)>); }
+pub trait ShapeRef {
+    fn draw_at(&self, x: f32, y: f32, size: Option<(f32, f32)>);
+    /// Its own width and height, for shape_mode(CENTER).
+    fn natural_size(&self) -> (f32, f32);
+}
 impl ShapeRef for u64 {
+    fn natural_size(&self) -> (f32, f32) { crate::render::shape_size(*self) }
     fn draw_at(&self, x: f32, y: f32, size: Option<(f32, f32)>) {
         match size {
             Some((w, h)) => crate::render::draw_shape(*self, x, y, w, h),
@@ -283,6 +288,7 @@ impl ShapeRef for u64 {
     }
 }
 impl ShapeRef for PShape {
+    fn natural_size(&self) -> (f32, f32) { (self.width(), self.height()) }
     fn draw_at(&self, x: f32, y: f32, size: Option<(f32, f32)>) {
         crate::push_matrix();
         crate::translate(x, y);
@@ -294,9 +300,11 @@ impl ShapeRef for PShape {
     }
 }
 impl<T: ShapeRef + ?Sized> ShapeRef for &T {
+    fn natural_size(&self) -> (f32, f32) { (**self).natural_size() }
     fn draw_at(&self, x: f32, y: f32, size: Option<(f32, f32)>) { (**self).draw_at(x, y, size) }
 }
 impl<T: ShapeRef + ?Sized> ShapeRef for &mut T {
+    fn natural_size(&self) -> (f32, f32) { (**self).natural_size() }
     fn draw_at(&self, x: f32, y: f32, size: Option<(f32, f32)>) { (**self).draw_at(x, y, size) }
 }
 

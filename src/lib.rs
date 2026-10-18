@@ -274,8 +274,9 @@ mod render {
     pub fn shape_bezier_vertex(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) { lp_route! { crate::lp::bezier_vertex(cx1, cy1, cx2, cy2, x, y); return; }
         let mut s = shape_state().lock();
         let (x0, y0) = match s.pts.last() { Some(p) => *p, None => { s.pts.push((x, y)); return; } };
-        for i in 1..=24 {
-            let t = i as f32 / 24.0; let u = 1.0 - t;
+        let n = crate::BEZIER_DETAIL.load(Ordering::Relaxed).max(1);
+        for i in 1..=n {
+            let t = i as f32 / n as f32; let u = 1.0 - t;
             let px = u*u*u*x0 + 3.0*u*u*t*cx1 + 3.0*u*t*t*cx2 + t*t*t*x;
             let py = u*u*u*y0 + 3.0*u*u*t*cy1 + 3.0*u*t*t*cy2 + t*t*t*y;
             s.pts.push((px, py));
@@ -297,10 +298,10 @@ mod render {
         if n < 4 { return; }
         let (p0, p1, p2, p3) = (s.curve[n-4], s.curve[n-3], s.curve[n-2], s.curve[n-1]);
         let start = if n == 4 { 0 } else { 1 };
-        for i in start..=12 {
-            let t = i as f32 / 12.0; let t2 = t*t; let t3 = t2*t;
-            let f = |a: f32, b: f32, c: f32, d: f32| 0.5 * ((2.0*b) + (-a + c)*t + (2.0*a - 5.0*b + 4.0*c - d)*t2 + (-a + 3.0*b - 3.0*c + d)*t3);
-            let pt = (f(p0.0, p1.0, p2.0, p3.0), f(p0.1, p1.1, p2.1, p3.1));
+        let steps = crate::CURVE_DETAIL.load(Ordering::Relaxed).max(1);
+        for i in start..=steps {
+            let t = i as f32 / steps as f32;
+            let pt = (crate::curve_point(p0.0, p1.0, p2.0, p3.0, t), crate::curve_point(p0.1, p1.1, p2.1, p3.1, t));
             s.pts.push(pt);
         }
     }
@@ -697,6 +698,7 @@ mod render {
         static MATRIX_STACK: std::cell::RefCell<Vec<Mat>> =
             std::cell::RefCell::new(vec![identity()]);
     }
+    pub(crate) fn current_matrix_pub() -> [f32; 6] { current_matrix() }
     fn current_matrix() -> Mat {
         MATRIX_STACK.with(|s| *s.borrow().last().unwrap())
     }
@@ -723,7 +725,7 @@ mod render {
     static BLEND_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     pub fn set_blend_mode(mode: u8) { lp_route! { crate::lp::blend_mode(if mode <= 9 { mode } else { 0 }); } BLEND_MODE.store(if mode <= 9 { mode } else { 0 }, Ordering::Relaxed); }
     #[inline]
-    fn blend_mode() -> u8 { BLEND_MODE.load(Ordering::Relaxed) }
+    pub(crate) fn blend_mode() -> u8 { BLEND_MODE.load(Ordering::Relaxed) }
 
     // Drawing into a createGraphics() layer: its pixels carry alpha in the top
     // byte (0 = nothing drawn there yet), so the layer can be put over
@@ -3424,6 +3426,10 @@ mod glfw {
     }
     /// Frames per second actually reached (smoothed), like Processing's frameRate.
     pub fn measured_frame_rate() -> f32 { f32::from_bits(MEASURED_FPS.load(Ordering::Relaxed)) }
+    static MOVE_TO: Mutex<Option<(isize, isize)>> = Mutex::new(None);
+    static RESIZE_TO: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+    pub fn request_move(x: isize, y: isize) { *MOVE_TO.lock().unwrap() = Some((x, y)); }
+    pub fn request_resize(w: u32, h: u32) { *RESIZE_TO.lock().unwrap() = Some((w, h)); }
     pub fn set_window_title(t: &str) {
         lp_route! { crate::lp::set_title(t); }
         *WANT_TITLE.get_or_init(|| Mutex::new(t.to_owned())).lock().unwrap() = t.to_owned();
@@ -3542,6 +3548,21 @@ mod glfw {
 
             // Escape closes the sketch, after the sketch's own keyPressed() has seen it
             while window.is_open() && !quit {
+                if let Some((x, y)) = MOVE_TO.lock().unwrap().take() { window.set_position(x, y); }
+                // windowResize(): minifb can't resize a window, so a new one replaces it
+                if let Some((nw, nh)) = RESIZE_TO.lock().unwrap().take() {
+                    if present.is_none() {
+                        resize_canvas(nw, nh);
+                        let pos = window.get_position();
+                        let opts = WindowOptions { resize: RESIZABLE.load(Ordering::Relaxed), ..WindowOptions::default() };
+                        if let Ok(mut nwin) = Window::new(&title, nw as usize, nh as usize, opts) {
+                            nwin.set_position(pos.0, pos.1);
+                            nwin.set_target_fps(target_fps as usize);
+                            nwin.set_input_callback(Box::new(KeyTap(key_events.clone())));
+                            window = nwin;
+                        }
+                    }
+                }
                 // frameRate() can be called at any time, not just in setup()
                 if fps() != target_fps {
                     target_fps = fps();
@@ -4386,11 +4407,26 @@ pub fn image_height(id: u64) -> f32 { render::image_size(id).1 }
 pub fn load_shape(path: &str) -> u64 { render::load_shape(path) }
 pub fn shape_width(id: u64)  -> f32 { render::shape_size(id).0 }
 pub fn shape_height(id: u64) -> f32 { render::shape_size(id).1 }
-/// shape(s, x, y): draws it at its own size, top-left corner at (x, y).
-/// Works for SVGs from load_shape and shapes from create_shape (pass &shape).
-pub fn shape(s: impl ShapeRef, x: impl Num, y: impl Num) { s.draw_at(x.f(), y.f(), None) }
-/// shape(s, x, y, w, h)
-pub fn shape_sized(s: impl ShapeRef, x: impl Num, y: impl Num, w: impl Num, h: impl Num) { s.draw_at(x.f(), y.f(), Some((w.f(), h.f()))) }
+/// shape(s, x, y): draws it at its own size, top-left corner at (x, y)
+/// (or as shape_mode says). Works for SVGs from load_shape and shapes from
+/// create_shape (pass &shape).
+pub fn shape(s: impl ShapeRef, x: impl Num, y: impl Num) {
+    let (x, y) = (x.f(), y.f());
+    if SHAPE_MODE.load(Ordering::Relaxed) == CENTER {
+        let (w, h) = s.natural_size();
+        return s.draw_at(x - w / 2.0, y - h / 2.0, None);
+    }
+    s.draw_at(x, y, None)
+}
+/// shape(s, x, y, w, h): w and h read as shape_mode says (CORNER, CORNERS, CENTER).
+pub fn shape_sized(s: impl ShapeRef, x: impl Num, y: impl Num, w: impl Num, h: impl Num) {
+    let (x, y, w, h) = corner_box(SHAPE_MODE.load(Ordering::Relaxed), x.f(), y.f(), w.f(), h.f());
+    s.draw_at(x, y, Some((w, h)))
+}
+static SHAPE_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// shape_mode(CORNER | CORNERS | CENTER): how shape() reads its position and size.
+pub fn shape_mode(mode: u32) { SHAPE_MODE.store(mode, Ordering::Relaxed); }
+#[inline] pub fn shapeMode(mode: u32) { shape_mode(mode) }
 /// Draw the shape with the sketch's fill and stroke, not the file's colors.
 pub fn shape_disable_style(id: u64) { render::shape_own_style(id, false); }
 /// Back to the colors in the file.
@@ -4504,6 +4540,101 @@ pub fn get_pixel(x: i32, y: i32) -> (u8, u8, u8) {
     }
 }
 
+// ─────────────── copy, blend, save, densities, the window ─────────────────────
+
+/// copy(sx, sy, sw, sh, dx, dy, dw, dh): copies a part of the canvas to
+/// another place on it, scaled to fit.
+#[allow(clippy::too_many_arguments)]
+pub fn copy(sx: impl Num, sy: impl Num, sw: impl Num, sh: impl Num, dx: impl Num, dy: impl Num, dw: impl Num, dh: impl Num) {
+    copy_region(sx.f(), sy.f(), sw.f(), sh.f(), dx.f(), dy.f(), dw.f(), dh.f(), None);
+}
+/// blend(sx, sy, sw, sh, dx, dy, dw, dh, mode): copy() with a blend mode
+/// (ADD, MULTIPLY...); the sketch's own blend mode stays as it was.
+#[allow(clippy::too_many_arguments)]
+pub fn blend(sx: impl Num, sy: impl Num, sw: impl Num, sh: impl Num, dx: impl Num, dy: impl Num, dw: impl Num, dh: impl Num, mode: u32) {
+    copy_region(sx.f(), sy.f(), sw.f(), sh.f(), dx.f(), dy.f(), dw.f(), dh.f(), Some(mode));
+}
+#[allow(clippy::too_many_arguments)]
+fn copy_region(sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh: f32, mode: Option<u32>) {
+    if !(sw >= 1.0 && sh >= 1.0) || !(sx.is_finite() && sy.is_finite() && dx.is_finite() && dy.is_finite() && dw.is_finite() && dh.is_finite()) { return; }
+    let (cw, ch) = (CANVAS_W.load(Ordering::Relaxed) as i64, CANVAS_H.load(Ordering::Relaxed) as i64);
+    let (sw, sh) = ((sw as i64).min(MAX_CANVAS as i64), (sh as i64).min(MAX_CANVAS as i64));
+    let px = render::copy_pixels();
+    let mut part = Vec::with_capacity((sw * sh) as usize);
+    for y in 0..sh {
+        for x in 0..sw {
+            let (X, Y) = (sx as i64 + x, sy as i64 + y);
+            let p = if X >= 0 && Y >= 0 && X < cw && Y < ch { px.get((Y * cw + X) as usize).copied().unwrap_or(0) } else { 0 };
+            part.push(Color::from_rgba(((p >> 16) & 255) as f32 / 255.0, ((p >> 8) & 255) as f32 / 255.0,
+                                       (p & 255) as f32 / 255.0, ((p >> 24) & 255) as f32 / 255.0));
+        }
+    }
+    // one picture, reused, so copying every frame doesn't pile up images
+    static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut id = SCRATCH.load(Ordering::Relaxed);
+    if id == 0 { id = create_image(sw as u32, sh as u32); SCRATCH.store(id, Ordering::Relaxed); }
+    if render::image_size(id) != (sw as f32, sh as f32) { render::image_resize(id, sw as usize, sh as usize); }
+    render::image_set_pixels(id, &part);
+    let old_blend = render::blend_mode();
+    push_style();
+    no_tint();
+    if let Some(m) = mode { blend_mode(m); }
+    let old_mode = IMAGE_MODE.swap(CORNER, Ordering::Relaxed);
+    render::draw_image(id, dx, dy, dw, dh);
+    IMAGE_MODE.store(old_mode, Ordering::Relaxed);
+    pop_style();
+    render::set_blend_mode(old_blend);
+}
+
+/// save("name.png"): the canvas to a PNG, like save_frame without the numbering.
+pub fn save(name: &str) {
+    if name.contains('#') { eprintln!("save(): # is only numbered by saveFrame()"); }
+    save_frame(&name.replace('#', "_"));
+}
+/// pixel_density(d): only 1 for now; other values are accepted and noted.
+pub fn pixel_density(d: impl Num) {
+    if d.f() != 1.0 { eprintln!("pixelDensity({}): only 1 for now, so the canvas stays at 1 pixel per unit", d.f()); }
+}
+/// display_density(): pixels per unit on the screen. 1 here.
+pub fn display_density() -> f32 { 1.0 }
+pub fn pixel_width() -> f32 { width() }
+pub fn pixel_height() -> f32 { height() }
+#[inline] pub fn pixelDensity(d: impl Num) { pixel_density(d) }
+#[inline] pub fn displayDensity() -> f32 { display_density() }
+#[inline] pub fn pixelWidth() -> f32 { pixel_width() }
+#[inline] pub fn pixelHeight() -> f32 { pixel_height() }
+
+/// window_move(x, y): puts the window at that place on the screen.
+pub fn window_move(x: impl Num, y: impl Num) {
+    let (x, y) = (x.f() as i32, y.f() as i32);
+    lp_route! { crate::lp::window_move(x, y); return; }
+    #[cfg(not(feature = "wasm"))] glfw::request_move(x as isize, y as isize);
+}
+/// window_resize(w, h): makes the window, and the canvas, that size.
+pub fn window_resize(w: impl Num, h: impl Num) {
+    let (w, h) = (w.f().max(1.0) as u32, h.f().max(1.0) as u32);
+    lp_route! { crate::lp::size(w, h); return; }
+    #[cfg(not(feature = "wasm"))] glfw::request_resize(w, h);
+}
+#[inline] pub fn windowMove(x: impl Num, y: impl Num) { window_move(x, y) }
+#[inline] pub fn windowResize(w: impl Num, h: impl Num) { window_resize(w, h) }
+
+/// text_mode(MODEL | SHAPE): text is always drawn as glyphs here; accepted.
+pub const MODEL: u32 = 4;
+pub const SHAPE: u32 = 5;
+pub fn text_mode(_mode: u32) {}
+#[inline] pub fn textMode(mode: u32) { text_mode(mode) }
+/// request_image(path): load_image, which is quick enough not to need a thread.
+pub fn request_image(path: &str) -> u64 { load_image(path) }
+#[inline] pub fn requestImage(path: &str) -> u64 { request_image(path) }
+/// print_matrix(): the current 2D matrix, as two rows.
+pub fn print_matrix() {
+    let m = render::current_matrix_pub();
+    println!("{:>10.4} {:>10.4} {:>10.4}", m[0], m[2], m[4]);
+    println!("{:>10.4} {:>10.4} {:>10.4}", m[1], m[3], m[5]);
+}
+#[inline] pub fn printMatrix() { print_matrix() }
+
 // ─────────────────────────── saveFrame ───────────────────────────────────────
 
 /// Save the current canvas as a PNG. "#" runs in the name become the
@@ -4535,6 +4666,12 @@ pub fn save_frame(name: &str) {
 
 // ─────────────────────────────── App builder ─────────────────────────────────
 
+// mouseClicked: a release counts as a click unless the mouse was dragged since the press
+static CLICK_DRAGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn click_pressed() { CLICK_DRAGGED.store(false, Ordering::Relaxed); }
+pub(crate) fn click_dragged() { CLICK_DRAGGED.store(true, Ordering::Relaxed); }
+pub(crate) fn click_released() -> bool { !CLICK_DRAGGED.swap(false, Ordering::Relaxed) }
+
 pub struct App<S: 'static> {
     state:             S,
     setup_fn:          fn(&mut S),
@@ -4542,6 +4679,7 @@ pub struct App<S: 'static> {
     title:             String,
     mouse_pressed_fn:  Option<fn(&mut S)>,
     mouse_released_fn: Option<fn(&mut S)>,
+    mouse_clicked_fn:  Option<fn(&mut S)>,
     mouse_moved_fn:    Option<fn(&mut S)>,
     mouse_dragged_fn:  Option<fn(&mut S)>,
     mouse_wheel_fn:    Option<fn(&mut S, f32)>,
@@ -4555,7 +4693,7 @@ impl<S: 'static> App<S> {
         Self {
             state, setup_fn, draw_fn,
             title: String::from("sketch"),
-            mouse_pressed_fn: None, mouse_released_fn: None,
+            mouse_pressed_fn: None, mouse_released_fn: None, mouse_clicked_fn: None,
             mouse_moved_fn: None,   mouse_dragged_fn: None,
             mouse_wheel_fn: None,   key_pressed_fn: None,
             key_released_fn: None,  key_typed_fn: None,
@@ -4566,6 +4704,8 @@ impl<S: 'static> App<S> {
 
     pub fn mouse_pressed(mut self, f: fn(&mut S)) -> Self  { self.mouse_pressed_fn  = Some(f); self }
     pub fn mouse_released(mut self, f: fn(&mut S)) -> Self { self.mouse_released_fn = Some(f); self }
+    /// mouseClicked(): after a press and release with no drag in between.
+    pub fn mouse_clicked(mut self, f: fn(&mut S)) -> Self { self.mouse_clicked_fn = Some(f); self }
     pub fn mouse_moved(mut self, f: fn(&mut S)) -> Self    { self.mouse_moved_fn    = Some(f); self }
     pub fn mouse_dragged(mut self, f: fn(&mut S)) -> Self  { self.mouse_dragged_fn  = Some(f); self }
     pub fn mouse_wheel(mut self, f: fn(&mut S, f32)) -> Self { self.mouse_wheel_fn  = Some(f); self }
@@ -4592,10 +4732,11 @@ impl<S: 'static> App<S> {
                     }
                     // Sync globals before every event callback so mouseX()/mouseY()/key()
                     // reflect the position and key that triggered this specific event.
-                    Event::MousePressed  => { sync_globals(ctx); if let Some(f) = self.mouse_pressed_fn  { f(&mut self.state); } }
-                    Event::MouseReleased => { sync_globals(ctx); if let Some(f) = self.mouse_released_fn { f(&mut self.state); } }
+                    Event::MousePressed  => { sync_globals(ctx); click_pressed(); if let Some(f) = self.mouse_pressed_fn  { f(&mut self.state); } }
+                    Event::MouseReleased => { sync_globals(ctx); if let Some(f) = self.mouse_released_fn { f(&mut self.state); }
+                                              if click_released() { if let Some(f) = self.mouse_clicked_fn { f(&mut self.state); } } }
                     Event::MouseMoved    => { sync_globals(ctx); if let Some(f) = self.mouse_moved_fn    { f(&mut self.state); } }
-                    Event::MouseDragged  => { sync_globals(ctx); if let Some(f) = self.mouse_dragged_fn  { f(&mut self.state); } }
+                    Event::MouseDragged  => { sync_globals(ctx); click_dragged(); if let Some(f) = self.mouse_dragged_fn  { f(&mut self.state); } }
                     Event::MouseWheel(d) => {
                         sync_globals(ctx);
                         __set_wheel_delta(d);
@@ -4619,6 +4760,7 @@ impl<S: 'static> App<S> {
             let draw_fn           = self.draw_fn;
             let mouse_pressed_fn  = self.mouse_pressed_fn;
             let mouse_released_fn = self.mouse_released_fn;
+            let mouse_clicked_fn  = self.mouse_clicked_fn;
             let mouse_moved_fn    = self.mouse_moved_fn;
             let mouse_dragged_fn  = self.mouse_dragged_fn;
             let mouse_wheel_fn    = self.mouse_wheel_fn;
@@ -4647,10 +4789,11 @@ impl<S: 'static> App<S> {
                         render::end_draw();
                         render::present();
                     }
-                    Event::MousePressed  => { if let Some(f) = mouse_pressed_fn  { f(&mut state); } }
-                    Event::MouseReleased => { if let Some(f) = mouse_released_fn { f(&mut state); } }
+                    Event::MousePressed  => { click_pressed(); if let Some(f) = mouse_pressed_fn  { f(&mut state); } }
+                    Event::MouseReleased => { if let Some(f) = mouse_released_fn { f(&mut state); }
+                                              if click_released() { if let Some(f) = mouse_clicked_fn { f(&mut state); } } }
                     Event::MouseMoved    => { if let Some(f) = mouse_moved_fn    { f(&mut state); } }
-                    Event::MouseDragged  => { if let Some(f) = mouse_dragged_fn  { f(&mut state); } }
+                    Event::MouseDragged  => { click_dragged(); if let Some(f) = mouse_dragged_fn  { f(&mut state); } }
                     Event::MouseWheel(d) => { if let Some(f) = mouse_wheel_fn    { f(&mut state, d); } }
                     Event::KeyPressed    => { if let Some(f) = key_pressed_fn    { f(&mut state); } }
                     Event::KeyReleased   => { if let Some(f) = key_released_fn   { f(&mut state); } }
@@ -4728,6 +4871,8 @@ pub fn random_gaussian() -> f32 {
 }
 
 // Files, JSON and tables (see data.rs).
+mod extra;
+pub use extra::*;
 mod data;
 pub use data::{load_strings, load_text, load_bytes, save_strings, save_text, save_bytes,
                split_tokens, split, join, trim, Json, parse_json, load_json, save_json,
@@ -4897,13 +5042,39 @@ pub fn bezier_point(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
 pub fn bezier_tangent(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
     3.0 * t * t * (-a + 3.0 * b - 3.0 * c + d) + 6.0 * t * (a - 2.0 * b + c) + 3.0 * (-a + b)
 }
-/// A point along a Catmull-Rom curve (what curve() draws).
+pub(crate) static BEZIER_DETAIL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(20);
+pub(crate) static CURVE_DETAIL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(20);
+static CURVE_TIGHTNESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // f32 bits
+/// bezier_detail(n): how many straight pieces each bezier is drawn with.
+pub fn bezier_detail(n: impl Num) { BEZIER_DETAIL.store(n.f().clamp(1.0, 1000.0) as u32, Ordering::Relaxed); }
+/// curve_detail(n): how many straight pieces each curve segment is drawn with.
+pub fn curve_detail(n: impl Num) { CURVE_DETAIL.store(n.f().clamp(1.0, 1000.0) as u32, Ordering::Relaxed); }
+/// curve_tightness(t): 0 is the usual Catmull-Rom curve, 1 straight lines
+/// between the points, below 0 looser.
+pub fn curve_tightness(t: impl Num) { let t = t.f(); if t.is_finite() { CURVE_TIGHTNESS.store(t.to_bits(), Ordering::Relaxed); } }
+#[inline] pub fn bezierDetail(n: impl Num) { bezier_detail(n) }
+#[inline] pub fn curveDetail(n: impl Num) { curve_detail(n) }
+#[inline] pub fn curveTightness(t: impl Num) { curve_tightness(t) }
+/// Processing's curve basis for tightness s: [t³ t² t 1] times this, times the points.
+fn curve_basis() -> [[f32; 4]; 4] {
+    let s = f32::from_bits(CURVE_TIGHTNESS.load(Ordering::Relaxed));
+    [[(s - 1.0) / 2.0, (s + 3.0) / 2.0, (-3.0 - s) / 2.0, (1.0 - s) / 2.0],
+     [1.0 - s, (-5.0 - s) / 2.0, s + 2.0, (s - 1.0) / 2.0],
+     [(s - 1.0) / 2.0, 0.0, (1.0 - s) / 2.0, 0.0],
+     [0.0, 1.0, 0.0, 0.0]]
+}
+/// A point along a curve (what curve() draws), with the curve_tightness in effect.
 pub fn curve_point(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
-    let (t2, t3) = (t * t, t * t * t);
-    0.5 * ((2.0 * b) + (-a + c) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (-a + 3.0 * b - 3.0 * c + d) * t3)
+    let m = curve_basis();
+    let tv = [t * t * t, t * t, t, 1.0];
+    let p = [a, b, c, d];
+    (0..4).map(|j| (0..4).map(|i| tv[i] * m[i][j]).sum::<f32>() * p[j]).sum()
 }
 pub fn curve_tangent(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
-    0.5 * ((-a + c) + 2.0 * (2.0 * a - 5.0 * b + 4.0 * c - d) * t + 3.0 * (-a + 3.0 * b - 3.0 * c + d) * t * t)
+    let m = curve_basis();
+    let tv = [3.0 * t * t, 2.0 * t, 1.0, 0.0];
+    let p = [a, b, c, d];
+    (0..4).map(|j| (0..4).map(|i| tv[i] * m[i][j]).sum::<f32>() * p[j]).sum()
 }
 /// delay(ms): pauses the sketch. Mostly useful in setup; in draw it stalls the window.
 pub fn delay(ms: u32) { std::thread::sleep(std::time::Duration::from_millis(ms as u64)); }
@@ -5037,7 +5208,8 @@ pub use three::{begin_camera, end_camera, frustum, ortho_planes, ortho_rect, pri
 pub use three::{rotate_x, rotate_y, camera, camera_look, perspective, perspective_default, ortho,
                 lights, no_lights, ambient_light, directional_light, point_light,
                 box_3d, box_cube, sphere, sphere_detail, sphere_detail_uv, line_3d, point_3d, triangle_3d,
-                screen_x, screen_y};
+                screen_x, screen_y, spot_light, light_falloff, light_specular, ambient, specular, emissive, shininess,
+                spotLight, lightFalloff, lightSpecular};
 pub const P2D: u32 = 2;
 pub const P3D: u32 = 3;
 /// size(w, h, P3D): every sketch can draw 3D already, so the renderer is only noted.

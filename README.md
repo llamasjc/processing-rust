@@ -227,6 +227,21 @@ Sketches are valid Rust files.  The Processing conventions:
 | Both naming styles | `mouseX()` ≡ `mouse_x()`, `noFill()` ≡ `no_fill()`, … |
 | File extension | `.pde` (default) or `.prs` |
 
+### Lights, materials and the rest of the API
+
+- `spot_light`, `light_falloff`, `light_specular`, and the material calls
+  `ambient`, `specular`, `emissive`, `shininess`, with Processing's lighting
+  model. With lights on, flat shapes are lit too, as in P3D.
+- `bezier_detail`, `curve_detail`, `curve_tightness` (and `curve_point` /
+  `curve_tangent` follow the tightness), `shape_mode`, `copy`, `blend`,
+  `save`, `print_matrix`, `window_move`, `window_resize`, `mouse_clicked()`.
+- `load_xml` / `parse_xml` / `save_xml` and the `Xml` element, `create_writer`,
+  `create_reader`, `select_input` / `select_output` / `select_folder` (these
+  wait for the choice and give back the path; zenity or kdialog on Linux),
+  `hex`, `binary`, `unhex`, `unbinary`, `match_re` / `match_all` (regular
+  expressions), `print_array`, `thread`.
+- `pixel_density` stays at 1 for now; `text_mode` is accepted.
+
 ### Textures, cameras, models and video
 
 - `texture(img)` between `begin_shape()` and `end_shape()` paints the shape

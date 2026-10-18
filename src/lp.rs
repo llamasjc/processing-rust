@@ -298,6 +298,9 @@ fn open(w: u32, h: u32) {
     for c in early { cmd(c); }
 }
 
+pub(crate) fn window_move(x: i32, y: i32) {
+    LP.with(|l| if let Some(l) = l.borrow().as_ref() { let _ = pr::surface_set_position(l.surface, x, y); });
+}
 pub(crate) fn set_title(t: &str) {
     LP.with(|l| if let Some(l) = l.borrow().as_ref() { let _ = pr::surface_set_title(l.surface, t.to_string()); });
 }
@@ -723,7 +726,9 @@ pub(crate) fn frustum(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) {
 // The lights asked for during a frame are compared with the ones in the
 // scene when the frame ends, and only remade when they changed.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum LightSpec { Ambient([f32; 3]), Directional([f32; 3], [f32; 3]), Point([f32; 3], [f32; 3]) }
+pub(crate) enum LightSpec { Ambient([f32; 3]), Directional([f32; 3], [f32; 3]), Point([f32; 3], [f32; 3]),
+    /// color, position, direction, half-angle of the cone
+    Spot([f32; 3], [f32; 3], [f32; 3], f32) }
 thread_local! {
     static WANT: RefCell<Vec<LightSpec>> = const { RefCell::new(Vec::new()) };
     static HAVE: RefCell<(Vec<LightSpec>, Vec<Entity>)> = const { RefCell::new((Vec::new(), Vec::new())) };
@@ -733,7 +738,31 @@ thread_local! {
 thread_local! { static LIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 pub(crate) fn add_light(spec: LightSpec) {
     WANT.with(|w| w.borrow_mut().push(spec));
-    if !LIT.with(|l| l.replace(true)) { cmd(DrawCommand::Roughness(0.9)); cmd(DrawCommand::Metallic(0.0)); }
+    if !LIT.with(|l| l.replace(true)) { cmd(DrawCommand::Roughness(0.9)); cmd(DrawCommand::Metallic(0.0)); send_material(); }
+    if matches!(spec, LightSpec::Spot(..)) { sync_lights(); }
+}
+// The material calls, as libprocessing's PBR material: emissive is its glow,
+// shininess its smoothness. A specular color has no match there (the shine
+// takes the light's color), so it only turns the shine off when it's black.
+// Only sent while lights are on: they make libprocessing's material a lit
+// one, which would darken flat shapes. Kept, and sent when lights come on.
+thread_local! { static MATERIAL: std::cell::Cell<([f32; 3], Option<f32>)> = const { std::cell::Cell::new(([0.0; 3], None)) }; }
+fn send_material() {
+    let (e, rough) = MATERIAL.with(|m| m.get());
+    cmd(DrawCommand::Emissive(BColor::linear_rgb(e[0], e[1], e[2])));
+    if let Some(r) = rough { cmd(DrawCommand::Roughness(r)); }
+}
+pub(crate) fn material_emissive(c: [f32; 3]) {
+    MATERIAL.with(|m| { let (_, r) = m.get(); m.set((c, r)); });
+    if LIT.with(|l| l.get()) { send_material(); }
+}
+pub(crate) fn material_shininess(sh: f32) {
+    MATERIAL.with(|m| { let (e, _) = m.get(); m.set((e, Some((2.0 / (sh + 2.0)).sqrt().clamp(0.02, 1.0)))); });
+    if LIT.with(|l| l.get()) { send_material(); }
+}
+pub(crate) fn material_specular(c: [f32; 3]) {
+    if c == [0.0; 3] { MATERIAL.with(|m| { let (e, _) = m.get(); m.set((e, Some(1.0))); }); }
+    if LIT.with(|l| l.get()) { send_material(); }
 }
 pub(crate) fn lights() {
     add_light(LightSpec::Ambient([0.5; 3]));
@@ -753,7 +782,15 @@ const AMBIENT_NITS: f32 = 1_500.0;
 // no lights (textured shapes are drawn as rough metal: all ambient, no white sheen).
 #[allow(dead_code)]
 const TEX_AMBIENT: f32 = 1.47;
-const POINT_LUMENS: f32 = 1.5e8;
+/// Processing's point and spot lights don't fade with distance (unless
+/// lightFalloff says so); libprocessing's fade with its square. So a light is
+/// made as bright as it takes to light the middle of the canvas at full
+/// strength from where it is.
+fn point_lumens(p: [f32; 3], w: u32, h: u32) -> f32 {
+    let d = Vec3::new(p[0] - w as f32 / 2.0, p[1] - h as f32 / 2.0, p[2]).length().max(1.0);
+    POINT_LUMENS_PER_UNIT2 * d * d
+}
+const POINT_LUMENS_PER_UNIT2: f32 = 2.2e5;
 fn begin_frame_lights() { WANT.with(|w| w.borrow_mut().clear()); LIT.with(|l| l.set(false)); }
 /// Brings the scene's lights in line with what this frame asked for.
 fn sync_lights() {
@@ -784,9 +821,23 @@ fn sync_lights() {
                     Err(e) => fail("a directional light", e),
                 }
             }
+            LightSpec::Spot(c, p, d, angle) => {
+                let range = (w.max(h) as f32) * 4.0;
+                let outer = angle.clamp(0.01, std::f32::consts::FRAC_PI_2 - 0.01);
+                let lumens = point_lumens(p, w, h);
+                match pr::light_create_spot(main, BColor::linear_rgb(c[0], c[1], c[2]), lumens, range * 4.0, 0.0, outer * 0.8, outer) {
+                    Ok(e) => {
+                        let pos = Vec3::new(p[0] - hw, -(p[1] - hh), p[2]);
+                        let _ = pr::transform_set_position(e, pos);
+                        let _ = pr::transform_look_at(e, pos + Vec3::new(d[0], -d[1], d[2]));
+                        made.push(e);
+                    }
+                    Err(e) => fail("a spot light", e),
+                }
+            }
             LightSpec::Point(c, p) => {
                 let range = (w.max(h) as f32) * 4.0;
-                match pr::light_create_point(main, BColor::linear_rgb(c[0], c[1], c[2]), POINT_LUMENS, range, 0.0) {
+                match pr::light_create_point(main, BColor::linear_rgb(c[0], c[1], c[2]), point_lumens(p, w, h), range * 4.0, 0.0) {
                     Ok(e) => {
                         let _ = pr::transform_set_position(e, Vec3::new(p[0] - hw, -(p[1] - hh), p[2]));
                         made.push(e);
@@ -800,9 +851,16 @@ fn sync_lights() {
         let brightness = if want.is_empty() { 80.0 } else { AMBIENT_NITS };
         let color = if want.is_empty() { BColor::WHITE } else { BColor::linear_rgb(ambient[0], ambient[1], ambient[2]) };
         app.world_mut().insert_resource(bevy::light::GlobalAmbientLight { color, brightness, affects_lightmapped_meshes: true });
+        // new lights get their place in the world in PostUpdate; without
+        // this they would light the scene only from the next render on
+        let _ = &made;
         Ok(())
     });
+    // a new light shows from the render after the one it was made in, so
+    // render once now, before anything is drawn with it
+    let fresh = !made.is_empty();
     HAVE.with(|h| *h.borrow_mut() = (want, made));
+    if fresh { let _ = pr::graphics_flush(main); }
 }
 
 // ── 3D lines, points and triangles: small meshes made for the frame ──────
@@ -1309,10 +1367,14 @@ pub(crate) fn run<S: 'static>(mut app: crate::App<S>) {
         sync_window();
         sync(start, frame);
         // events, like Processing: before draw()
-        if input::input_mouse_any_just_pressed().unwrap_or(false) { if let Some(f) = app.mouse_pressed_fn { f(&mut app.state); } }
-        if input::input_mouse_any_just_released().unwrap_or(false) { if let Some(f) = app.mouse_released_fn { f(&mut app.state); } }
+        if input::input_mouse_any_just_pressed().unwrap_or(false) { crate::click_pressed(); if let Some(f) = app.mouse_pressed_fn { f(&mut app.state); } }
+        if input::input_mouse_any_just_released().unwrap_or(false) {
+            if let Some(f) = app.mouse_released_fn { f(&mut app.state); }
+            if crate::click_released() { if let Some(f) = app.mouse_clicked_fn { f(&mut app.state); } }
+        }
         if input::input_mouse_moved().unwrap_or(false) {
             let pressed = input::input_mouse_is_pressed().unwrap_or(false);
+            if pressed { crate::click_dragged(); }
             let f = if pressed { app.mouse_dragged_fn } else { app.mouse_moved_fn };
             if let Some(f) = f { f(&mut app.state); }
         }

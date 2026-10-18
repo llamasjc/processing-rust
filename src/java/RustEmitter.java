@@ -207,6 +207,7 @@ public class RustEmitter {
     line(sb, "        .title(\"" + analysis.sketchName().replace("\\", "\\\\").replace("\"", "\\\"") + "\")");
     if (analysis.hasMousePressed())  line(sb, "        .mouse_pressed(mouse_pressed)");
     if (analysis.hasMouseReleased()) line(sb, "        .mouse_released(mouse_released)");
+    if (analysis.hasMouseClicked())  line(sb, "        .mouse_clicked(mouse_clicked)");
     if (analysis.hasMouseMoved())    line(sb, "        .mouse_moved(mouse_moved)");
     if (analysis.hasMouseDragged())  line(sb, "        .mouse_dragged(mouse_dragged)");
     if (analysis.hasMouseWheel())    line(sb, "        .mouse_wheel(mouse_wheel)");

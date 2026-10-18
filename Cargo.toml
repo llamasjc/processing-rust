@@ -15,6 +15,8 @@ png = "0.17"
 zune-jpeg = "0.4"
 # TrueType / OpenType text for createFont() and textFont()
 fontdue = "0.9"
+# match() and matchAll()
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 
 # The libprocessing renderer (Bevy + wgpu). Off by default: it is a large
 # build and needs a newer Rust (edition 2024). RustMode turns it on when the

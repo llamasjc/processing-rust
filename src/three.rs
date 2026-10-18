@@ -34,8 +34,21 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] { [a[1] * b[2] - a[2] * b[1], a[2
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 { a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
 fn norm(a: [f32; 3]) -> [f32; 3] { let l = dot(a, a).sqrt(); if l > 0.0 { [a[0] / l, a[1] / l, a[2] / l] } else { a } }
 
+/// A light, as Processing has them: its kind, color, the specular color and
+/// falloff in effect when it was made, and for a spot its cone.
 #[derive(Clone, Copy)]
-enum Light { Ambient([f32; 3]), Directional([f32; 3], [f32; 3]), Point([f32; 3], [f32; 3]) }
+enum Kind { Ambient, Directional([f32; 3]), Point([f32; 3]), Spot { pos: [f32; 3], dir: [f32; 3], cos_angle: f32, conc: f32 } }
+#[derive(Clone, Copy)]
+struct Light { kind: Kind, c: [f32; 3], spec: [f32; 3], fall: [f32; 3] }
+#[allow(non_snake_case)]
+fn Ambient(c: [f32; 3]) -> Light { Light { kind: Kind::Ambient, c, spec: [0.0; 3], fall: [1.0, 0.0, 0.0] } }
+#[allow(non_snake_case)]
+fn Directional(c: [f32; 3], d: [f32; 3]) -> Light { Light { kind: Kind::Directional(d), c, spec: [0.0; 3], fall: [1.0, 0.0, 0.0] } }
+
+/// The material: ambient (None: the fill), specular, emissive, shininess.
+#[derive(Clone, Copy)]
+struct Material { ambient: Option<[f32; 3]>, specular: [f32; 3], emissive: [f32; 3], shininess: f32 }
+const DEFAULT_MATERIAL: Material = Material { ambient: None, specular: [0.5; 3], emissive: [0.0; 3], shininess: 1.0 };
 
 struct State {
     stack: Vec<M4>,
@@ -45,6 +58,9 @@ struct State {
     custom_camera: bool,
     custom_proj: bool,
     lights: Vec<Light>,
+    material: Material,
+    light_spec: [f32; 3],
+    light_fall: [f32; 3],
     sphere_detail: (usize, usize),
     depth: Vec<f32>,
     depth_frame: u64,
@@ -55,6 +71,7 @@ thread_local! {
     static S: RefCell<State> = RefCell::new(State {
         stack: vec![IDENT], view: IDENT, proj: IDENT, eye: [0.0, 0.0, 1.0],
         custom_camera: false, custom_proj: false, lights: Vec::new(),
+        material: DEFAULT_MATERIAL, light_spec: [0.0; 3], light_fall: [1.0, 0.0, 0.0],
         sphere_detail: (30, 30), depth: Vec::new(), depth_frame: u64::MAX, depth_dims: (0, 0),
     });
 }
@@ -325,8 +342,8 @@ pub fn lights() {
     S.with(|s| {
         let mut s = s.borrow_mut();
         s.lights.clear();
-        s.lights.push(Light::Ambient([0.5, 0.5, 0.5]));
-        s.lights.push(Light::Directional([0.5, 0.5, 0.5], [0.0, 0.0, -1.0]));
+        s.lights.push(Ambient([0.5, 0.5, 0.5]));
+        s.lights.push(Directional([0.5, 0.5, 0.5], [0.0, 0.0, -1.0]));
     });
 }
 pub fn no_lights() {
@@ -335,14 +352,14 @@ fn c255(r: f32, g: f32, b: f32) -> [f32; 3] { [r / 255.0, g / 255.0, b / 255.0] 
 pub fn ambient_light(r: impl Num, g: impl Num, b: impl Num) {
     let c = c255(r.f(), g.f(), b.f());
     lp_route! { crate::lp::add_light(crate::lp::LightSpec::Ambient(c)); return; }
-    S.with(|s| s.borrow_mut().lights.push(Light::Ambient(c)));
+    S.with(|s| s.borrow_mut().lights.push(Ambient(c)));
 }
 /// directional_light(r, g, b, nx, ny, nz): light traveling in direction (nx, ny, nz).
 pub fn directional_light(r: impl Num, g: impl Num, b: impl Num, nx: impl Num, ny: impl Num, nz: impl Num) {
     let c = c255(r.f(), g.f(), b.f());
     let d = norm([nx.f(), ny.f(), nz.f()]);
     lp_route! { crate::lp::add_light(crate::lp::LightSpec::Directional(c, d)); return; }
-    S.with(|s| s.borrow_mut().lights.push(Light::Directional(c, d)));
+    S.with(|s| { let mut s = s.borrow_mut(); let spec = s.light_spec; s.lights.push(Light { spec, ..Directional(c, d) }); });
 }
 /// point_light(r, g, b, x, y, z): a light at a point, shining every way.
 pub fn point_light(r: impl Num, g: impl Num, b: impl Num, x: impl Num, y: impl Num, z: impl Num) {
@@ -352,24 +369,98 @@ pub fn point_light(r: impl Num, g: impl Num, b: impl Num, x: impl Num, y: impl N
     let (m, ..) = matrices();
     let w = apply(&m, p);
     lp_route! { crate::lp::add_light(crate::lp::LightSpec::Point(c, [w[0], w[1], w[2]])); return; }
-    S.with(|s| s.borrow_mut().lights.push(Light::Point(c, [w[0], w[1], w[2]])));
+    S.with(|s| { let mut s = s.borrow_mut(); let (spec, fall) = (s.light_spec, s.light_fall);
+        s.lights.push(Light { kind: Kind::Point([w[0], w[1], w[2]]), c, spec, fall }); });
 }
+/// spot_light(r, g, b, x, y, z, nx, ny, nz, angle, concentration): a cone of
+/// light from (x, y, z) pointing along (nx, ny, nz), `angle` wide on each side.
+#[allow(clippy::too_many_arguments)]
+pub fn spot_light(r: impl Num, g: impl Num, b: impl Num, x: impl Num, y: impl Num, z: impl Num,
+                  nx: impl Num, ny: impl Num, nz: impl Num, angle: impl Num, concentration: impl Num) {
+    let c = c255(r.f(), g.f(), b.f());
+    let (m, ..) = matrices();
+    let w = apply(&m, [x.f(), y.f(), z.f()]);
+    let pos = [w[0], w[1], w[2]];
+    let tip = apply(&m, [x.f() + nx.f(), y.f() + ny.f(), z.f() + nz.f()]);
+    let dir = norm(sub([tip[0], tip[1], tip[2]], pos));
+    let (angle, conc) = (angle.f(), concentration.f().max(0.0));
+    lp_route! { crate::lp::add_light(crate::lp::LightSpec::Spot(c, pos, dir, angle)); return; }
+    S.with(|s| { let mut s = s.borrow_mut(); let (spec, fall) = (s.light_spec, s.light_fall);
+        s.lights.push(Light { kind: Kind::Spot { pos, dir, cos_angle: angle.cos(), conc }, c, spec, fall }); });
+}
+/// light_falloff(constant, linear, quadratic): how point and spot lights made
+/// after it fade with distance d: 1 / (constant + linear d + quadratic d²).
+pub fn light_falloff(constant: impl Num, linear: impl Num, quadratic: impl Num) {
+    let f = [constant.f(), linear.f(), quadratic.f()];
+    S.with(|s| s.borrow_mut().light_fall = f);
+}
+/// light_specular(r, g, b): the shine color of lights made after it.
+pub fn light_specular(r: impl Num, g: impl Num, b: impl Num) {
+    let c = c255(r.f(), g.f(), b.f());
+    S.with(|s| s.borrow_mut().light_spec = c);
+}
+fn material_mut(f: impl FnOnce(&mut Material)) { S.with(|s| f(&mut s.borrow_mut().material)); }
+/// ambient(r, g, b): how the shape takes ambient light (by default, like its fill).
+pub fn ambient(r: impl Num, g: impl Num, b: impl Num) { let c = c255(r.f(), g.f(), b.f()); material_mut(|m| m.ambient = Some(c)); }
+/// specular(r, g, b): the color of the shine on the shape.
+pub fn specular(r: impl Num, g: impl Num, b: impl Num) {
+    let c = c255(r.f(), g.f(), b.f());
+    lp_route! { crate::lp::material_specular(c); }
+    material_mut(|m| m.specular = c);
+}
+/// emissive(r, g, b): light the shape gives off itself.
+pub fn emissive(r: impl Num, g: impl Num, b: impl Num) {
+    let c = c255(r.f(), g.f(), b.f());
+    lp_route! { crate::lp::material_emissive(c); }
+    material_mut(|m| m.emissive = c);
+}
+/// shininess(s): how tight the shine is; bigger is a smaller, sharper spot.
+pub fn shininess(sh: impl Num) {
+    let sh = sh.f().max(0.0);
+    lp_route! { crate::lp::material_shininess(sh); }
+    material_mut(|m| m.shininess = sh);
+}
+#[inline] pub fn spotLight(r: impl Num, g: impl Num, b: impl Num, x: impl Num, y: impl Num, z: impl Num,
+                           nx: impl Num, ny: impl Num, nz: impl Num, angle: impl Num, concentration: impl Num) {
+    spot_light(r, g, b, x, y, z, nx, ny, nz, angle, concentration)
+}
+#[inline] pub fn lightFalloff(c: impl Num, l: impl Num, q: impl Num) { light_falloff(c, l, q) }
+#[inline] pub fn lightSpecular(r: impl Num, g: impl Num, b: impl Num) { light_specular(r, g, b) }
 
+#[cfg(test)]
 fn shade(base: Color, normal: [f32; 3], center: [f32; 3], eye: [f32; 3], lights: &[Light]) -> Color {
+    shade_with(base, normal, center, eye, lights, &DEFAULT_MATERIAL)
+}
+/// Processing's lighting: emissive, plus for each light its ambient part
+/// (times the ambient material), diffuse part (times the fill) and shine
+/// (times the specular material), faded with distance and by a spot's cone.
+fn shade_with(base: Color, normal: [f32; 3], center: [f32; 3], eye: [f32; 3], lights: &[Light], mat: &Material) -> Color {
     if lights.is_empty() { return base; }
     // two-sided: the normal faces whoever is looking
-    let to_eye = sub(eye, center);
+    let to_eye = norm(sub(eye, center));
     let n = if dot(normal, to_eye) < 0.0 { [-normal[0], -normal[1], -normal[2]] } else { normal };
-    let mut l = [0.0f32; 3];
+    let fill = [base.r, base.g, base.b];
+    let amb = mat.ambient.unwrap_or(fill);
+    let mut out = mat.emissive;
     for light in lights {
-        let (c, k) = match *light {
-            Light::Ambient(c) => (c, 1.0),
-            Light::Directional(c, d) => (c, dot(n, [-d[0], -d[1], -d[2]]).max(0.0)),
-            Light::Point(c, p) => (c, dot(n, norm(sub(p, center))).max(0.0)),
+        let (to_light, dist) = match light.kind {
+            Kind::Ambient => { for i in 0..3 { out[i] += light.c[i] * amb[i]; } continue; }
+            Kind::Directional(d) => ([-d[0], -d[1], -d[2]], 0.0),
+            Kind::Point(p) | Kind::Spot { pos: p, .. } => { let v = sub(p, center); let d = dot(v, v).sqrt(); (norm(v), d) }
         };
-        for i in 0..3 { l[i] += c[i] * k; }
+        let f = light.fall;
+        let mut k = 1.0 / (f[0] + f[1] * dist + f[2] * dist * dist).max(1e-6);
+        if let Kind::Spot { dir, cos_angle, conc, .. } = light.kind {
+            let c = dot([-to_light[0], -to_light[1], -to_light[2]], dir);
+            if c < cos_angle { continue; }
+            k *= c.max(0.0).powf(conc);
+        }
+        let diff = dot(n, to_light).max(0.0);
+        let h = norm([to_light[0] + to_eye[0], to_light[1] + to_eye[1], to_light[2] + to_eye[2]]);
+        let shine = if diff > 0.0 && mat.shininess > 0.0 { dot(n, h).max(0.0).powf(mat.shininess) } else { 0.0 };
+        for i in 0..3 { out[i] += k * (light.c[i] * fill[i] * diff + light.spec[i] * mat.specular[i] * shine); }
     }
-    Color::from_rgba((base.r * l[0]).min(1.0), (base.g * l[1]).min(1.0), (base.b * l[2]).min(1.0), base.a)
+    Color::from_rgba(out[0].min(1.0), out[1].min(1.0), out[2].min(1.0), base.a)
 }
 
 // ── rasterizing ────────────────────────────────────────────────────────────
@@ -484,14 +575,14 @@ fn draw_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], edges: Option<&[[usize; 2]
     let world: Vec<[f32; 3]> = verts.iter().map(|p| { let q = apply(&m, *p); [q[0], q[1], q[2]] }).collect();
     let screen: Vec<Option<SV>> = world.iter().map(|p| to_screen(apply(&vp, *p), wf, hf)).collect();
     let (fill, stroke, weight) = crate::render::style_pub();
-    let lights = S.with(|s| s.borrow().lights.clone());
+    let (lights, mat) = S.with(|s| { let s = s.borrow(); (s.lights.clone(), s.material) });
     if let Some(fc) = fill {
         for t in tris {
             let (Some(a), Some(b), Some(c)) = (screen[t[0]], screen[t[1]], screen[t[2]]) else { continue };
             let (pa, pb, pc) = (world[t[0]], world[t[1]], world[t[2]]);
             let n = norm(cross(sub(pb, pa), sub(pc, pa)));
             let center = [(pa[0] + pb[0] + pc[0]) / 3.0, (pa[1] + pb[1] + pc[1]) / 3.0, (pa[2] + pb[2] + pc[2]) / 3.0];
-            raster_tri(a, b, c, shade(fc, n, center, eye, &lights));
+            raster_tri(a, b, c, shade_with(fc, n, center, eye, &lights, &mat));
         }
     }
     if let Some(sc) = stroke {
@@ -514,7 +605,7 @@ pub(crate) fn draw_mesh_uv(verts: &[[f32; 3]], uvs: &[(f32, f32)], tris: &[[usiz
     let vp = mul(&proj, &view);
     let world: Vec<[f32; 3]> = verts.iter().map(|p| { let q = apply(&m, *p); [q[0], q[1], q[2]] }).collect();
     let screen: Vec<Option<SV>> = world.iter().map(|p| to_screen(apply(&vp, *p), w as f32, h as f32)).collect();
-    let lights = S.with(|s| s.borrow().lights.clone());
+    let (lights, mat) = S.with(|s| { let s = s.borrow(); (s.lights.clone(), s.material) });
     let white = Color::from_rgb(1.0, 1.0, 1.0);
     let _ = crate::render::with_texture(tex, |sample| {
         for t in tris {
@@ -522,7 +613,7 @@ pub(crate) fn draw_mesh_uv(verts: &[[f32; 3]], uvs: &[(f32, f32)], tris: &[[usiz
             let (pa, pb, pc) = (world[t[0]], world[t[1]], world[t[2]]);
             let n = norm(cross(sub(pb, pa), sub(pc, pa)));
             let center = [(pa[0] + pb[0] + pc[0]) / 3.0, (pa[1] + pb[1] + pc[1]) / 3.0, (pa[2] + pb[2] + pc[2]) / 3.0];
-            let light = shade(white, n, center, eye, &lights);
+            let light = shade_with(white, n, center, eye, &lights, &mat);
             let (ua, ub, uc) = (uvs[t[0]], uvs[t[1]], uvs[t[2]]);
             raster_tri_with(a, b, c, false, &|k0, k1, k2| {
                 let col = sample(k0 * ua.0 + k1 * ub.0 + k2 * uc.0, k0 * ua.1 + k1 * ub.1 + k2 * uc.1);
@@ -544,7 +635,7 @@ pub(crate) fn in_3d() -> bool {
     S.with(|s| {
         let s = s.borrow();
         let m = s.stack.last().unwrap();
-        s.custom_camera || s.custom_proj
+        s.custom_camera || s.custom_proj || !s.lights.is_empty()
             || m[2].abs() > 1e-6 || m[6].abs() > 1e-6 || m[8].abs() > 1e-6 || m[9].abs() > 1e-6
             || m[14].abs() > 1e-6
     })
@@ -655,10 +746,10 @@ mod tests {
     fn lighting() {
         let base = Color::from_rgb(1.0, 1.0, 1.0);
         let lit = shade(base, [0.0, 0.0, 1.0], [0.0; 3], [0.0, 0.0, 10.0],
-                        &[Light::Ambient([0.2; 3]), Light::Directional([0.8; 3], [0.0, 0.0, -1.0])]);
+                        &[Ambient([0.2; 3]), Directional([0.8; 3], [0.0, 0.0, -1.0])]);
         assert!((lit.r - 1.0).abs() < 1e-5);
         let side = shade(base, [1.0, 0.0, 0.0], [0.0; 3], [0.0, 0.0, 10.0],
-                         &[Light::Ambient([0.2; 3]), Light::Directional([0.8; 3], [0.0, 0.0, -1.0])]);
+                         &[Ambient([0.2; 3]), Directional([0.8; 3], [0.0, 0.0, -1.0])]);
         assert!((side.r - 0.2).abs() < 1e-5);
     }
 }

@@ -31,6 +31,7 @@ public record RustAnalysis(
   public boolean hasDraw()         { return lifecycleFns.containsKey("draw"); }
   public boolean hasMousePressed() { return lifecycleFns.containsKey("mouse_pressed"); }
   public boolean hasMouseReleased(){ return lifecycleFns.containsKey("mouse_released"); }
+  public boolean hasMouseClicked() { return lifecycleFns.containsKey("mouse_clicked"); }
   public boolean hasMouseMoved()   { return lifecycleFns.containsKey("mouse_moved"); }
   public boolean hasMouseDragged() { return lifecycleFns.containsKey("mouse_dragged"); }
   public boolean hasMouseWheel()   { return lifecycleFns.containsKey("mouse_wheel"); }
