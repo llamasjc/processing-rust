@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bevy::color::{Color as BColor, LinearRgba, Srgba};
+use bevy::color::{Color as BColor, LinearRgba};
 use bevy::math::{Affine3A, Mat3, Vec3, Vec4};
 use bevy::prelude::Entity;
 use bevy::render::render_resource::{Extent3d, TextureFormat};
@@ -162,7 +162,7 @@ pub(crate) fn size(w: u32, h: u32) {
         let (th, tv, ts) = crate::render::text_state();
         text_align(th, tv);
         text_size(ts);
-        cmd(DrawCommand::BackgroundColor(BColor::srgb(0.8, 0.8, 0.8)));
+        cmd(DrawCommand::BackgroundColor(BColor::linear_rgb(0.8, 0.8, 0.8)));
     }
 }
 
@@ -208,6 +208,7 @@ fn make_canvas(w: u32, h: u32) -> Option<(Entity, Entity)> {
     Some((canvas, main))
 }
 fn start_canvas(main: Entity) {
+    DRAWN.store(false, Ordering::Relaxed);
     let _ = pr::graphics_begin_draw(main);
     processing_coords();
 }
@@ -230,7 +231,36 @@ fn finish_frame() {
     let (fw, fh) = (w as f32, h as f32);
     let (dw, dh) = (fw * fw / ww.max(1.0), fh * fh / wh.max(1.0));
     rec(DrawCommand::Image { entity: canvas, dx: 0.0, dy: 0.0, d_width: Some(dw), d_height: Some(dh), sx: None, sy: None, s_width: None, s_height: None });
+    // the canvas holds sRGB numbers; the window wants light
+    if let Some(f) = to_light_filter() {
+        let _ = pr::graphics_flush(win);
+        if let Err(e) = pr::graphics_apply_filter(win, f) { fail("showing the frame", e); }
+    }
     end_draw_guarded(win);
+}
+
+thread_local! { static TO_LIGHT: std::cell::Cell<Option<Option<Entity>>> = const { std::cell::Cell::new(None) }; }
+/// A filter that turns sRGB numbers into linear light.
+fn to_light_filter() -> Option<Entity> {
+    if let Some(f) = TO_LIGHT.with(|t| t.get()) { return f; }
+    const SRC: &str = r#"import processing::filter::{sample, FullscreenVertexOutput};
+
+fn to_light(v: f32) -> f32 {
+    if v <= 0.04045 { return v / 12.92; }
+    return pow((v + 0.055) / 1.055, 2.4);
+}
+
+@fragment
+fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
+    let c = sample(in.uv);
+    return vec4<f32>(to_light(c.r), to_light(c.g), to_light(c.b), c.a);
+}
+"#;
+    let f = pr::shader_create(SRC).and_then(pr::filter_create);
+    if let Err(e) = &f { eprintln!("libprocessing: couldn't make the display filter ({e}); colors will look too light"); }
+    let f = f.ok();
+    TO_LIGHT.with(|t| t.set(Some(f)));
+    f
 }
 
 /// Opens the window and the canvas.
@@ -263,7 +293,7 @@ fn open(w: u32, h: u32) {
     text_align(th, tv);
     text_size(ts);
     // Processing's gray, then whatever setup() drew before size()
-    cmd(DrawCommand::BackgroundColor(BColor::srgb(0.8, 0.8, 0.8)));
+    cmd(DrawCommand::BackgroundColor(BColor::linear_rgb(0.8, 0.8, 0.8)));
     let early = EARLY.with(|e| std::mem::take(&mut *e.borrow_mut()));
     for c in early { cmd(c); }
 }
@@ -280,12 +310,173 @@ fn target_size() -> Option<(u32, u32)> {
     }))
 }
 
+thread_local! { static TARGETS: RefCell<Vec<Entity>> = const { RefCell::new(Vec::new()) }; }
 static DIRTY: AtomicBool = AtomicBool::new(true);
+/// Something was drawn since the canvas last showed its work. libprocessing
+/// clears for background() before anything else in a batch, so a background()
+/// after drawing first finishes what came before it.
+static DRAWN: AtomicBool = AtomicBool::new(false);
+
+// ── transforms libprocessing can't keep ─────────────────────────────────
+// libprocessing turns the current transform into a position, a turn and a
+// scale for every batch it draws, so a shear (or a scale after a turn) comes
+// out as a turn. The transform is followed here too, and while it is one of
+// those, shapes go out with their corners already moved.
+thread_local! {
+    static MAT: RefCell<HashMap<Entity, (Affine3A, Vec<Affine3A>)>> = RefCell::new(HashMap::new());
+    static BAKING_SHAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+fn mat_reset(t: Entity) { MAT.with(|m| { m.borrow_mut().insert(t, (Affine3A::IDENTITY, Vec::new())); }); }
+fn track(t: Entity, c: &DrawCommand) {
+    MAT.with(|m| {
+        let mut m = m.borrow_mut();
+        let (cur, stack) = m.entry(t).or_insert((Affine3A::IDENTITY, Vec::new()));
+        match c {
+            DrawCommand::PushMatrix => stack.push(*cur),
+            DrawCommand::PopMatrix => { if let Some(p) = stack.pop() { *cur = p; } }
+            DrawCommand::ResetMatrix => *cur = Affine3A::IDENTITY,
+            DrawCommand::ApplyMatrix(a) => *cur *= *a,
+            DrawCommand::Translate(v) => *cur *= Affine3A::from_translation(*v),
+            DrawCommand::Rotate { angle, axis } => *cur *= Affine3A::from_axis_angle(axis.normalize(), *angle),
+            DrawCommand::Scale(v) => *cur *= Affine3A::from_scale(*v),
+            DrawCommand::ShearX { angle } => *cur *= Affine3A::from_mat3(Mat3::from_cols(Vec3::X, Vec3::new(angle.tan(), 1.0, 0.0), Vec3::Z)),
+            DrawCommand::ShearY { angle } => *cur *= Affine3A::from_mat3(Mat3::from_cols(Vec3::new(1.0, angle.tan(), 0.0), Vec3::Y, Vec3::Z)),
+            _ => {}
+        }
+    });
+}
+/// The current transform, when libprocessing can't keep it.
+fn skewed(t: Entity) -> Option<Affine3A> {
+    let cur = MAT.with(|m| m.borrow().get(&t).map(|v| v.0))?;
+    let (a, b, c) = (Vec3::from(cur.matrix3.x_axis), Vec3::from(cur.matrix3.y_axis), Vec3::from(cur.matrix3.z_axis));
+    let off = |u: Vec3, v: Vec3| u.dot(v).abs() > 1e-4 * (u.length() * v.length()).max(1e-12);
+    (off(a, b) || off(a, c) || off(b, c)).then_some(cur)
+}
+fn record(t: Entity, c: DrawCommand) {
+    DIRTY.store(true, Ordering::Relaxed);
+    if !matches!(c, DrawCommand::BackgroundColor(_)) { DRAWN.store(true, Ordering::Relaxed); }
+    if let Err(e) = pr::graphics_record_command(t, c) { fail("drawing", e); }
+}
+/// Starts drawing in plain Processing coordinates (the transform undone).
+fn bake_begin(t: Entity) {
+    record(t, DrawCommand::PushMatrix);
+    record(t, DrawCommand::ResetMatrix);
+    base_coords(t);
+}
+fn bake_end(t: Entity) { record(t, DrawCommand::PopMatrix); }
+fn ellipse_points(cx: f32, cy: f32, w: f32, h: f32, a0: f32, a1: f32, n: usize) -> Vec<(f32, f32)> {
+    (0..=n).map(|i| { let a = a0 + (a1 - a0) * i as f32 / n as f32; (cx + a.cos() * w / 2.0, cy + a.sin() * h / 2.0) }).collect()
+}
+/// Draws c with its points moved by m. false: not a shape this knows.
+fn bake(t: Entity, m: Affine3A, c: &DrawCommand) -> bool {
+    let p = |x: f32, y: f32| { let q = m.transform_point3(Vec3::new(x, y, 0.0)); (q.x, q.y) };
+    let poly = |pts: &[(f32, f32)], close: bool| {
+        bake_begin(t);
+        record(t, DrawCommand::BeginShape { kind: ShapeKind::Polygon });
+        for &(x, y) in pts { let (x, y) = p(x, y); record(t, DrawCommand::ShapeVertex { x, y }); }
+        record(t, DrawCommand::EndShape { close });
+        bake_end(t);
+    };
+    match *c {
+        DrawCommand::Rect { x, y, w, h, radii } => {
+            if radii.iter().any(|r| *r > 0.5) {
+                use std::f32::consts::{FRAC_PI_2, PI};
+                let fit = |r: f32| r.min(w.abs() / 2.0).min(h.abs() / 2.0).max(0.0);
+                let [tl, tr, br, bl] = radii.map(fit);
+                let mut pts = Vec::new();
+                pts.extend(ellipse_points(x + tl, y + tl, 2.0 * tl, 2.0 * tl, PI, PI + FRAC_PI_2, 6));
+                pts.extend(ellipse_points(x + w - tr, y + tr, 2.0 * tr, 2.0 * tr, PI + FRAC_PI_2, 2.0 * PI, 6));
+                pts.extend(ellipse_points(x + w - br, y + h - br, 2.0 * br, 2.0 * br, 0.0, FRAC_PI_2, 6));
+                pts.extend(ellipse_points(x + bl, y + h - bl, 2.0 * bl, 2.0 * bl, FRAC_PI_2, PI, 6));
+                poly(&pts, true);
+            } else {
+                poly(&[(x, y), (x + w, y), (x + w, y + h), (x, y + h)], true);
+            }
+        }
+        DrawCommand::Ellipse { cx, cy, w, h } => {
+            let n = ((w.abs() + h.abs()) * 0.3).clamp(24.0, 160.0) as usize;
+            let mut pts = ellipse_points(cx, cy, w, h, 0.0, std::f32::consts::TAU, n);
+            pts.pop();
+            poly(&pts, true);
+        }
+        DrawCommand::Arc { cx, cy, w, h, start, stop, mode } => {
+            let n = ((w.abs() + h.abs()) * 0.3 * ((stop - start).abs() / std::f32::consts::TAU)).clamp(8.0, 160.0) as usize;
+            let mut pts = ellipse_points(cx, cy, w, h, start, stop, n);
+            match mode { ArcMode::Pie => { pts.push((cx, cy)); poly(&pts, true) } ArcMode::Chord => poly(&pts, true), _ => poly(&pts, false) }
+        }
+        DrawCommand::Triangle { x1, y1, x2, y2, x3, y3 } => {
+            let ((x1, y1), (x2, y2), (x3, y3)) = (p(x1, y1), p(x2, y2), p(x3, y3));
+            bake_begin(t); record(t, DrawCommand::Triangle { x1, y1, x2, y2, x3, y3 }); bake_end(t);
+        }
+        DrawCommand::Quad { x1, y1, x2, y2, x3, y3, x4, y4 } => {
+            let ((x1, y1), (x2, y2), (x3, y3), (x4, y4)) = (p(x1, y1), p(x2, y2), p(x3, y3), p(x4, y4));
+            bake_begin(t); record(t, DrawCommand::Quad { x1, y1, x2, y2, x3, y3, x4, y4 }); bake_end(t);
+        }
+        DrawCommand::Line { x1, y1, x2, y2 } => {
+            let ((x1, y1), (x2, y2)) = (p(x1, y1), p(x2, y2));
+            bake_begin(t); record(t, DrawCommand::Line { x1, y1, x2, y2 }); bake_end(t);
+        }
+        DrawCommand::Point { x, y } => {
+            let (x, y) = p(x, y);
+            bake_begin(t); record(t, DrawCommand::Point { x, y }); bake_end(t);
+        }
+        DrawCommand::Image { entity, dx, dy, d_width, d_height, sx: None, .. } => {
+            let (w, h) = (d_width.unwrap_or(0.0), d_height.unwrap_or(0.0));
+            let corners = [p(dx, dy), p(dx + w, dy), p(dx + w, dy + h), p(dx, dy + h)];
+            let verts: Vec<[f32; 3]> = corners.iter().map(|&(x, y)| [x, y, 0.0]).collect();
+            bake_begin(t);
+            // drawn as a textured mesh: no lights, no outline
+            record(t, DrawCommand::PushStyle);
+            record(t, DrawCommand::NoStroke);
+            mesh_3d(&verts, &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], &[[0, 1, 2], [0, 2, 3]], Some(entity));
+            record(t, DrawCommand::PopStyle);
+            bake_end(t);
+        }
+        DrawCommand::BeginShape { kind } => {
+            bake_begin(t);
+            BAKING_SHAPE.with(|b| b.set(true));
+            record(t, DrawCommand::BeginShape { kind });
+        }
+        _ => return false,
+    }
+    true
+}
+/// A vertex of a shape begun while the transform was skewed.
+fn bake_vertex(m: Affine3A, c: DrawCommand) -> DrawCommand {
+    let p = |x: f32, y: f32| { let q = m.transform_point3(Vec3::new(x, y, 0.0)); (q.x, q.y) };
+    match c {
+        DrawCommand::ShapeVertex { x, y } => { let (x, y) = p(x, y); DrawCommand::ShapeVertex { x, y } }
+        DrawCommand::ShapeCurveVertex { x, y } => { let (x, y) = p(x, y); DrawCommand::ShapeCurveVertex { x, y } }
+        DrawCommand::ShapeQuadraticVertex { cx, cy, x, y } => {
+            let ((cx, cy), (x, y)) = (p(cx, cy), p(x, y));
+            DrawCommand::ShapeQuadraticVertex { cx, cy, x, y }
+        }
+        DrawCommand::ShapeBezierVertex { cx1, cy1, cx2, cy2, x, y } => {
+            let ((cx1, cy1), (cx2, cy2), (x, y)) = (p(cx1, cy1), p(cx2, cy2), p(x, y));
+            DrawCommand::ShapeBezierVertex { cx1, cy1, cx2, cy2, x, y }
+        }
+        c => c,
+    }
+}
 
 /// Records a draw command on whatever is being drawn on.
 pub(crate) fn cmd(c: DrawCommand) {
     if !finite(&c) { return; }
+    if let Some(t) = target() {
+        track(t, &c);
+        if BAKING_SHAPE.with(|b| b.get()) {
+            let m = MAT.with(|m| m.borrow().get(&t).map(|v| v.0)).unwrap_or(Affine3A::IDENTITY);
+            let end = matches!(c, DrawCommand::EndShape { .. });
+            record(t, bake_vertex(m, c));
+            if end { BAKING_SHAPE.with(|b| b.set(false)); bake_end(t); }
+            return;
+        }
+        if let Some(m) = skewed(t) {
+            if bake(t, m, &c) { return; }
+        }
+    }
     DIRTY.store(true, Ordering::Relaxed);
+    if !matches!(c, DrawCommand::BackgroundColor(_)) { DRAWN.store(true, Ordering::Relaxed); }
     match target() {
         Some(t) => { if let Err(e) = pr::graphics_record_command(t, c) { fail("drawing", e); } }
         None => EARLY.with(|e| e.borrow_mut().push(c)),
@@ -309,7 +500,7 @@ fn finite(c: &DrawCommand) -> bool {
         DrawCommand::ShapeBezierVertex { cx1, cy1, cx2, cy2, x, y } => ok(&[*cx1, *cy1, *cx2, *cy2, *x, *y]),
         DrawCommand::ShapeQuadraticVertex { cx, cy, x, y } => ok(&[*cx, *cy, *x, *y]),
         DrawCommand::Translate(v) | DrawCommand::Scale(v) => ok(&[v.x, v.y, v.z]),
-        DrawCommand::Rotate { angle, .. } => ok(&[*angle]),
+        DrawCommand::Rotate { angle, .. } | DrawCommand::ShearX { angle } | DrawCommand::ShearY { angle } => ok(&[*angle]),
         DrawCommand::StrokeWeight(w) | DrawCommand::TextSize(w) => ok(&[*w]),
         DrawCommand::Text { x, y, .. } => ok(&[*x, *y]),
         DrawCommand::Image { dx, dy, d_width, d_height, .. } => ok(&[*dx, *dy, d_width.unwrap_or(0.0), d_height.unwrap_or(0.0)]),
@@ -319,10 +510,23 @@ fn finite(c: &DrawCommand) -> bool {
     }
 }
 
-fn col(c: Color) -> BColor { BColor::srgba(c.r.clamp(0.0, 1.0), c.g.clamp(0.0, 1.0), c.b.clamp(0.0, 1.0), c.a.clamp(0.0, 1.0)) }
+// Colors go to libprocessing as the numbers they are (0.8 is 0.8), not turned
+// into linear light, and come back from the canvas the same way. So blending,
+// translucency and blend modes add and mix those numbers, like Processing.
+// The window turns them into light when the frame is shown (finish_frame).
+/// The canvas keeps colors multiplied by their alpha; get() and layers want
+/// them as drawn.
+fn unpremultiply(c: LinearRgba) -> LinearRgba {
+    if c.alpha <= 0.0 || c.alpha >= 1.0 { return c; }
+    LinearRgba::new(c.red / c.alpha, c.green / c.alpha, c.blue / c.alpha, c.alpha)
+}
+fn col(c: Color) -> BColor { BColor::linear_rgba(c.r.clamp(0.0, 1.0), c.g.clamp(0.0, 1.0), c.b.clamp(0.0, 1.0), c.a.clamp(0.0, 1.0)) }
 
 // ── style ────────────────────────────────────────────────────────────────
-pub(crate) fn background(c: Color) { cmd(DrawCommand::BackgroundColor(col(c))); }
+pub(crate) fn background(c: Color) {
+    if DRAWN.swap(false, Ordering::Relaxed) { if let Some(g) = target() { let _ = pr::graphics_flush(g); } }
+    cmd(DrawCommand::BackgroundColor(col(c)));
+}
 pub(crate) fn fill(c: Option<Color>) { cmd(match c { Some(c) => DrawCommand::Fill(col(c)), None => DrawCommand::NoFill }); }
 pub(crate) fn stroke(c: Option<Color>) { cmd(match c { Some(c) => DrawCommand::StrokeColor(col(c)), None => DrawCommand::NoStroke }); }
 pub(crate) fn stroke_weight(w: f32) { cmd(DrawCommand::StrokeWeight(w)); }
@@ -342,6 +546,19 @@ pub(crate) fn blend_mode(m: u8) {
     let mode = pr::render::command::BlendMode::try_from(m).unwrap_or_default();
     cmd(DrawCommand::BlendMode(mode.to_blend_state()));
 }
+/// smooth() / noSmooth(): multisampling on the canvas, on or off. What was
+/// drawn before keeps the setting it was drawn with.
+pub(crate) fn smooth(on: bool) {
+    let Some(t) = target() else { return };
+    let want = if on { bevy::render::view::Msaa::Sample4 } else { bevy::render::view::Msaa::Off };
+    let same = processing_core::app_mut(|app| Ok(app.world().get::<bevy::render::view::Msaa>(t).copied() == Some(want))).unwrap_or(true);
+    if same { return; }
+    if DRAWN.swap(false, Ordering::Relaxed) { let _ = pr::graphics_flush(t); }
+    let _ = processing_core::app_mut(|app| {
+        if let Ok(mut e) = app.world_mut().get_entity_mut(t) { e.insert(want); }
+        Ok(())
+    });
+}
 pub(crate) fn push_style() { cmd(DrawCommand::PushStyle); }
 pub(crate) fn pop_style() { cmd(DrawCommand::PopStyle); }
 /// The engine works out rect / ellipse / image modes itself, so libprocessing
@@ -355,8 +572,17 @@ fn corner_modes() {
 // ── shapes ───────────────────────────────────────────────────────────────
 pub(crate) fn rect(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) { cmd(DrawCommand::Rect { x, y, w, h, radii }); }
 pub(crate) fn ellipse(cx: f32, cy: f32, w: f32, h: f32) { cmd(DrawCommand::Ellipse { cx, cy, w, h }); }
-pub(crate) fn line(x1: f32, y1: f32, x2: f32, y2: f32) { cmd(DrawCommand::Line { x1, y1, x2, y2 }); }
-pub(crate) fn point(x: f32, y: f32) { cmd(DrawCommand::Point { x, y }); }
+/// Lines and points of an odd width sit in the middle of a pixel row, like
+/// the other renderer, so a 1-pixel line on whole coordinates is one crisp row.
+fn pixel_center() -> f32 {
+    let w = crate::render::style_pub().2.round() as i64;
+    if w % 2 == 1 { 0.5 } else { 0.0 }
+}
+pub(crate) fn line(x1: f32, y1: f32, x2: f32, y2: f32) {
+    let o = pixel_center();
+    cmd(DrawCommand::Line { x1: x1 + o, y1: y1 + o, x2: x2 + o, y2: y2 + o });
+}
+pub(crate) fn point(x: f32, y: f32) { let o = pixel_center(); cmd(DrawCommand::Point { x: x + o, y: y + o }); }
 pub(crate) fn triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
     cmd(DrawCommand::Triangle { x1, y1, x2, y2, x3, y3 });
 }
@@ -409,9 +635,15 @@ pub(crate) fn apply_matrix(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) {
 /// puts the origin in the top left corner with y going down. This turns the
 /// first into the second, at the start of every frame.
 fn processing_coords() {
+    let Some(t) = target() else { return };
+    base_coords(t);
+    mat_reset(t);
+}
+/// Processing's coordinates, recorded as they are (not followed by track()).
+fn base_coords(t: Entity) {
     let Some((w, h)) = target_size() else { return };
-    cmd(DrawCommand::Scale(Vec3::new(1.0, -1.0, 1.0)));
-    cmd(DrawCommand::Translate(Vec3::new(-(w as f32) / 2.0, -(h as f32) / 2.0, 0.0)));
+    record(t, DrawCommand::Scale(Vec3::new(1.0, -1.0, 1.0)));
+    record(t, DrawCommand::Translate(Vec3::new(-(w as f32) / 2.0, -(h as f32) / 2.0, 0.0)));
 }
 
 pub(crate) fn box_3d(w: f32, h: f32, d: f32) { cmd(DrawCommand::Box { width: w, height: h, depth: d }); }
@@ -751,7 +983,7 @@ pub(crate) fn image_entity(id: u64, version: u64, w: usize, h: usize, rgba: impl
     let have = LP.with(|l| l.borrow().as_ref().and_then(|l| l.images.get(&id).copied()));
     if let Some((e, v)) = have { if v == version { return Some(e); } }
     let size = Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
-    let e = match pr::image_create(size, rgba(), TextureFormat::Rgba8UnormSrgb) {
+    let e = match pr::image_create(size, rgba(), TextureFormat::Rgba8Unorm) {
         Ok(e) => e,
         Err(e) => { fail("uploading an image", e); return None; }
     };
@@ -790,8 +1022,8 @@ pub(crate) fn read_pixels() -> Option<(Vec<u32>, usize, usize)> {
     sync_lights();
     let _ = pr::graphics_flush(g);
     let px = match pr::graphics_readback(g) { Ok(p) => p, Err(e) => { fail("reading pixels", e); return None; } };
-    let all: Vec<u32> = px.iter().map(|c: &LinearRgba| {
-        let s: Srgba = (*c).into();
+    let all: Vec<u32> = px.iter().map(|s: &LinearRgba| {
+        let s = &unpremultiply(*s);
         let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
         (b(s.alpha) << 24) | (b(s.red) << 16) | (b(s.green) << 8) | b(s.blue)
     }).collect();
@@ -858,7 +1090,7 @@ pub(crate) fn write_pixels(px: &[u32], w: usize, h: usize) { write_pixels_as(px,
 fn write_pixels_as(px: &[u32], w: usize, h: usize, layer: bool) {
     let rgba: Vec<u8> = px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, if layer { (p >> 24) as u8 } else { 0xFF }]).collect();
     let size = Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 };
-    match pr::image_create(size, rgba, TextureFormat::Rgba8UnormSrgb) {
+    match pr::image_create(size, rgba, TextureFormat::Rgba8Unorm) {
         Ok(e) => {
             cmd(DrawCommand::PushMatrix);
             cmd(DrawCommand::ResetMatrix);
@@ -903,6 +1135,8 @@ pub(crate) fn begin_layer(id: u64) -> bool {
         let Some(l) = l.as_mut() else { return false };
         let Some(&(g, ..)) = l.layers.get(&id) else { return false };
         let _ = pr::graphics_begin_draw(g);
+        // a layer begun inside another goes back to that one when it ends
+        TARGETS.with(|t| t.borrow_mut().push(l.target));
         l.target = g;
         true
     });
@@ -932,8 +1166,8 @@ pub(crate) fn end_layer() {
     let _ = pr::graphics_flush(g);
     match pr::graphics_readback(g) {
         Ok(px) => {
-            let rgba: Vec<u8> = px.iter().flat_map(|c: &LinearRgba| {
-                let s: Srgba = (*c).into();
+            let rgba: Vec<u8> = px.iter().flat_map(|s: &LinearRgba| {
+                let s = &unpremultiply(*s);
                 let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
                 [b(s.red), b(s.green), b(s.blue), b(s.alpha)]
             }).collect();
@@ -945,7 +1179,7 @@ pub(crate) fn end_layer() {
         let mut l = l.borrow_mut();
         let Some(l) = l.as_mut() else { return };
         let _ = pr::graphics_end_draw(l.target);
-        l.target = l.main;
+        l.target = TARGETS.with(|t| t.borrow_mut().pop()).unwrap_or(l.main);
     });
 }
 /// Draws a layer: read it back and draw it as an image.
@@ -956,7 +1190,7 @@ pub(crate) fn draw_layer(id: u64, x: f32, y: f32, w: f32, h: f32) {
         .unwrap_or_else(|| vec![0u8; (lw * lh * 4) as usize]);
     if rgba.len() != (lw * lh * 4) as usize { return; }
     let size = Extent3d { width: lw, height: lh, depth_or_array_layers: 1 };
-    if let Ok(e) = pr::image_create(size, rgba, TextureFormat::Rgba8UnormSrgb) {
+    if let Ok(e) = pr::image_create(size, rgba, TextureFormat::Rgba8Unorm) {
         image_alpha(e, x, y, w, h, true);
         PENDING_FREE.with(|f| f.borrow_mut().push(e));
     }

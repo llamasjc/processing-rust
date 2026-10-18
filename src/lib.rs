@@ -1953,7 +1953,7 @@ mod render {
         TEXT_SIZE.with(|s| *s.borrow_mut() = size);
     }
 
-    pub fn set_smooth(on: bool) { SMOOTH.store(on, Ordering::Relaxed); }
+    pub fn set_smooth(on: bool) { lp_route! { crate::lp::smooth(on); } SMOOTH.store(on, Ordering::Relaxed); }
 
     pub fn reset_matrix() { lp_route! { crate::lp::reset_matrix(); }
         crate::three::on_reset();
