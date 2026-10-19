@@ -796,7 +796,21 @@ fn point_lumens(p: [f32; 3], w: u32, h: u32) -> f32 {
     POINT_LUMENS_PER_UNIT2 * d * d
 }
 const POINT_LUMENS_PER_UNIT2: f32 = 2.2e5;
-fn begin_frame_lights() { WANT.with(|w| w.borrow_mut().clear()); LIT.with(|l| l.set(false)); }
+fn begin_frame_lights() {
+    WANT.with(|w| w.borrow_mut().clear());
+    LIT.with(|l| l.set(false));
+    // A spot light kept from the last frame doesn't light this one on some
+    // GPUs (one made in the frame always does), so spot lights are made anew
+    // each frame. Points and directionals are kept.
+    let had_spot = HAVE.with(|h| h.borrow().0.iter().any(|s| matches!(s, LightSpec::Spot(..))));
+    if had_spot {
+        let old = HAVE.with(|h| std::mem::take(&mut *h.borrow_mut()));
+        let _ = processing_core::app_mut(|app| {
+            for e in &old.1 { if let Ok(em) = app.world_mut().get_entity_mut(*e) { em.despawn(); } }
+            Ok(())
+        });
+    }
+}
 /// Brings the scene's lights in line with what this frame asked for.
 fn sync_lights() {
     let want = WANT.with(|w| w.borrow().clone());
