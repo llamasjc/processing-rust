@@ -183,16 +183,10 @@ Needs Rust stable (libprocessing uses the 2024 edition) and GLFW 3.4
 
 Known differences on libprocessing, for now:
 
-- Colors blend in linear light, so half-transparent colors and `ADD` come out
-  a little different from the software renderer.
-- `shear_x` / `shear_y` turn shapes instead of slanting them (libprocessing
-  keeps transforms as position, rotation and scale).
-- Edges are always smooth; `no_smooth()` does nothing.
 - Lights apply to the whole frame: `no_lights()` makes the shapes after it
   flat again, but the lights stay for the shapes drawn before.
-- `filter()` on a layer (`create_graphics`) doesn't change it yet, and the
-  see-through parts of a layer can cover what's under it when it's drawn.
-- Half-transparent arcs come out a little off.
+- `specular()` only turns the shine off (black) or on; the shine takes the
+  light's color. Textures are slightly smoothed.
 
 The sketch draws on a canvas of exactly its own size, which is then shown in
 the top left of the window. A window manager that won't make a window that
