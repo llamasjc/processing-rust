@@ -713,7 +713,6 @@ impl Comp<'_> {
                 let ca: Vec<C> = args.iter().map(|a| self.expr(a)).collect::<Result<_, _>>()?;
                 if let Some(t) = Ty::parse(name) { return Ok(C::Make(t, ca)); }
                 if let Some(b) = bi(name, args.len()) {
-                    if b == Bi::Texture { return Ok(C::Bi(b, ca.into_iter().skip(1).collect())); }
                     return Ok(C::Bi(b, ca));
                 }
                 let Some(&fi) = self.fn_index.get(name) else { return Err(format!("unknown function {name}()")) };
@@ -811,11 +810,25 @@ pub fn compile(prog: &Program) -> Result<Cpu, String> {
 enum Flow { Go, Brk, Cont, Ret(Val), Discard }
 
 /// What a running shader can see: the canvas to sample.
-pub struct Ctx<'a> { pub w: usize, pub h: usize, pub px: &'a [u32] }
+pub struct Ctx<'a> { pub w: usize, pub h: usize, pub px: &'a [u32], pub images: &'a [(usize, usize, Vec<u32>)] }
+
+/// One picture a shader can sample: the canvas, or an image set as a uniform.
+struct Pic<'a> { w: usize, h: usize, px: &'a [u32] }
 
 impl Ctx<'_> {
-    /// Bilinear sample at (u, v), 0..1 from the top left, clamped at the edges.
+    /// Bilinear sample of picture `which` (0 the canvas, then the images) at
+    /// (u, v), 0..1 from the top left, clamped at the edges.
+    fn sample(&self, which: usize, u: f32, v: f32) -> [f32; 4] {
+        let pic = match which {
+            0 => Pic { w: self.w, h: self.h, px: self.px },
+            i => match self.images.get(i - 1) { Some((w, h, px)) => Pic { w: *w, h: *h, px }, None => return [0.0; 4] },
+        };
+        pic.sample(u, v)
+    }
+}
+impl Pic<'_> {
     fn sample(&self, u: f32, v: f32) -> [f32; 4] {
+        if self.w == 0 || self.h == 0 || self.px.len() < self.w * self.h { return [0.0; 4]; }
         let (w, h) = (self.w as f32, self.h as f32);
         let (x, y) = (u * w - 0.5, v * h - 0.5);
         let (x0, y0) = (x.floor(), y.floor());
@@ -872,9 +885,9 @@ impl Cpu {
     pub fn has_uniform(&self, name: &str) -> bool { self.uniforms.contains_key(name) }
 
     /// Runs the shader over the whole canvas `src`, writing the result to `dst`.
-    pub fn run(&self, w: usize, h: usize, src: &[u32], dst: &mut [u32]) {
+    pub fn run(&self, w: usize, h: usize, src: &[u32], dst: &mut [u32], images: &[(usize, usize, Vec<u32>)]) {
         if w == 0 || h == 0 { return; }
-        let ctx = Ctx { w, h, px: src };
+        let ctx = Ctx { w, h, px: src, images };
         let mut g = self.globals.clone();
         // global initializers run once
         for (slot, e) in &self.global_init { let v = self.eval(e, &mut [], &mut g, &ctx); g[*slot] = v; }
@@ -1110,7 +1123,11 @@ fn builtin(b: Bi, a: &[Val], ctx: &Ctx) -> Val {
         Bi::Cross => { let (x, y) = (a[0].v, a[1].v); Val::vec(&[x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]]) }
         Bi::Normalize => { let l = len(&a[0]); let mut o = a[0]; if l > 0.0 { for i in 0..o.n() { o.v[i] /= l; } } o }
         Bi::Reflect => { let d = dot(&a[1], &a[0]); let mut o = a[0]; for i in 0..o.n() { o.v[i] -= 2.0 * d * a[1].v[i]; } o }
-        Bi::Texture => { let uv = a.first().map(|v| v.v).unwrap_or([0.0; 16]); Val::vec(&ctx.sample(uv[0], uv[1])) }
+        Bi::Texture => {
+            let which = a.first().map(|v| v.v[0].max(0.0) as usize).unwrap_or(0);
+            let uv = a.get(1).map(|v| v.v).unwrap_or([0.0; 16]);
+            Val::vec(&ctx.sample(which, uv[0], uv[1]))
+        }
     }
 }
 
@@ -1243,12 +1260,13 @@ impl W<'_> {
         let f32_or = |t: Ty| if matches!(t, Ty::Int | Ty::Bool) { Ty::Float } else { t };
         Ok(match name {
             "texture2D" | "texture" => {
-                if let Some(Expr::Var(s)) = args.first() {
-                    if s != "texture" && self.uniforms.get(s.as_str()) == Some(&Ty::Sampler) {
-                        return Err(format!("only the canvas (`texture`) can be sampled for now, not `{s}`"));
-                    }
+                let uv = arg_as(self, 1, Ty::Vec(2))?;
+                match args.first() {
+                    Some(Expr::Var(s)) if s == "texture" => format!("glsl_sample({uv})"),
+                    Some(Expr::Var(s)) if self.uniforms.get(s.as_str()) == Some(&Ty::Sampler) =>
+                        format!("textureSampleLevel(tex_{s}, texture_sampler, {uv}, 0.0)"),
+                    _ => return Err("texture2D() takes a sampler2D uniform".into()),
                 }
-                format!("glsl_sample({})", arg_as(self, 1, Ty::Vec(2))?)
             }
             "mod" => {
                 let w = f32_or(t);
@@ -1415,7 +1433,6 @@ pub fn to_wgsl(prog: &Program) -> Result<String, String> {
         .filter(|(t, n)| *t != Ty::Sampler && n != "texOffset" && n != "resolution")
         .cloned().collect();
     for (t, n) in &prog.uniforms {
-        if *t == Ty::Sampler && n != "texture" { return Err(format!("only the canvas (`texture`) can be sampled for now, not `{n}`")); }
         w.uniforms.insert(n.clone(), *t);
         w.sc.set(n, *t);
     }
@@ -1427,6 +1444,14 @@ pub fn to_wgsl(prog: &Program) -> Result<String, String> {
             w.out.push_str(&format!("    {n}: {ty},\n"));
         }
         w.out.push_str("}\n@group(1) @binding(0) var<uniform> params: GlslParams;\n\n");
+    }
+    // images set as uniforms: one texture each, named after the uniform
+    let mut binding = 1;
+    for (t, n) in &prog.uniforms {
+        if *t == Ty::Sampler && n != "texture" {
+            w.out.push_str(&format!("@group(1) @binding({binding}) var tex_{n}: texture_2d<f32>;\n"));
+            binding += 1;
+        }
     }
     w.out.push_str("var<private> glsl_frag_color: vec4<f32>;\nvar<private> glsl_frag_coord: vec4<f32>;\nvar<private> glsl_tex_coord: vec4<f32>;\n");
     w.out.push_str("fn glsl_sample(uv: vec2<f32>) -> vec4<f32> { return textureSampleLevel(screen_texture, texture_sampler, uv, 0.0); }\n");

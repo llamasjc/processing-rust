@@ -2262,6 +2262,16 @@ mod render {
         Ok(Img { w, h, px })
     }
 
+    /// The image as a libprocessing image (uploaded when it changed).
+    #[cfg(feature = "libprocessing")]
+    pub(crate) fn lp_image(id: u64) -> Option<bevy::prelude::Entity> {
+        let imgs = images().lock();
+        let img = imgs.get((id as usize).wrapping_sub(1))?;
+        crate::lp::image_entity(id, img_version(id), img.w, img.h, || img.px.iter().flat_map(|c| {
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            [b(c.r), b(c.g), b(c.b), b(c.a)]
+        }).collect())
+    }
     pub fn image_size(id: u64) -> (f32, f32) {
         let v = images().lock();
         v.get((id as usize).wrapping_sub(1)).map(|i| (i.w as f32, i.h as f32)).unwrap_or((0.0, 0.0))

@@ -304,7 +304,7 @@ thread_local! {
     static SHADERS: RefCell<HashMap<usize, (Entity, u64)>> = RefCell::new(HashMap::new());
 }
 /// filter(shader): the shader's WGSL (from glsl.rs) as a libprocessing filter.
-pub(crate) fn filter_shader(id: usize, src: &str, values: &[(String, crate::glsl::Ty, Vec<f32>)], version: u64) {
+pub(crate) fn filter_shader(id: usize, src: &str, values: &[(String, crate::glsl::Ty, Vec<f32>)], textures: &[(String, Entity)], version: u64) {
     use crate::glsl::Ty;
     use pr::shader_value::ShaderValue as V;
     ensure_open();
@@ -332,6 +332,10 @@ pub(crate) fn filter_shader(id: usize, src: &str, values: &[(String, crate::glsl
             if let Err(e) = pr::filter_set(filter, name.as_str(), val) { fail("setting a shader uniform", e); }
         }
         SHADERS.with(|m| { if let Some(x) = m.borrow_mut().get_mut(&id) { x.1 = version; } });
+    }
+    // images are sent every time: their pixels may have changed
+    for (name, e) in textures {
+        if let Err(err) = pr::filter_set(filter, name.as_str(), V::Texture(*e)) { fail("setting a shader image", err); }
     }
     let Some(t) = target() else { return };
     let _ = pr::graphics_flush(t);

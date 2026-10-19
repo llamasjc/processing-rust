@@ -16,6 +16,8 @@ pub(crate) struct Entry {
     #[cfg_attr(not(feature = "libprocessing"), allow(dead_code))]
     pub wgsl: Result<String, String>,
     pub values: HashMap<String, Vec<f32>>,
+    /// images set on sampler2D uniforms
+    pub textures: HashMap<String, u64>,
     pub version: u64,
     pub name: String,
 }
@@ -29,8 +31,14 @@ pub(crate) fn shaders() -> &'static Mutex<Vec<Entry>> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PShader { pub(crate) id: usize }
 
-/// Values set() takes: numbers, booleans, 2 to 4 numbers, a color.
-pub trait UniformValue { fn floats(&self) -> Vec<f32>; }
+/// Values set() takes: numbers, booleans, 2 to 4 numbers, a color, or an
+/// image (its id) for a sampler2D.
+pub trait UniformValue {
+    fn floats(&self) -> Vec<f32>;
+    fn image(&self) -> Option<u64> { None }
+}
+impl UniformValue for u64 { fn floats(&self) -> Vec<f32> { Vec::new() } fn image(&self) -> Option<u64> { Some(*self) } }
+impl UniformValue for &u64 { fn floats(&self) -> Vec<f32> { Vec::new() } fn image(&self) -> Option<u64> { Some(**self) } }
 impl UniformValue for f32 { fn floats(&self) -> Vec<f32> { vec![*self] } }
 impl UniformValue for f64 { fn floats(&self) -> Vec<f32> { vec![*self as f32] } }
 impl UniformValue for i32 { fn floats(&self) -> Vec<f32> { vec![*self as f32] } }
@@ -48,11 +56,19 @@ impl PShader {
     pub fn set(&self, name: &str, v: impl UniformValue) {
         let mut all = shaders().lock();
         let Some(e) = all.get_mut(self.id.wrapping_sub(1)) else { return };
-        let vals = v.floats();
         if !e.cpu.has_uniform(name) {
             eprintln!("{}: set(\"{name}\"): the shader has no uniform called that", e.name);
             return;
         }
+        // a sampler2D takes an image; from Lua that arrives as its number
+        let sampler = e.cpu.uniforms.get(name).map(|u| u.1) == Some(glsl::Ty::Sampler);
+        let img = v.image().or_else(|| if sampler { v.floats().first().map(|x| *x as u64) } else { None });
+        if let Some(img) = img {
+            e.textures.insert(name.to_string(), img);
+            e.version += 1;
+            return;
+        }
+        let vals = v.floats();
         e.cpu.set_uniform(name, &vals);
         e.values.insert(name.to_string(), vals);
         e.version += 1;
@@ -91,7 +107,7 @@ fn shader_from_source_named(src: &str, name: &str) -> PShader {
     };
     let wgsl = glsl::to_wgsl(&prog);
     let mut all = shaders().lock();
-    all.push(Entry { cpu, wgsl, values: HashMap::new(), version: 0, name: name.to_string() });
+    all.push(Entry { cpu, wgsl, values: HashMap::new(), textures: HashMap::new(), version: 0, name: name.to_string() });
     PShader { id: all.len() }
 }
 #[inline] pub fn loadShader(path: &str) -> PShader { load_shader(path) }
@@ -115,10 +131,13 @@ pub(crate) fn apply(s: PShader) {
             let vals: Vec<(String, glsl::Ty, Vec<f32>)> = e.values.iter()
                 .filter_map(|(k, v)| e.cpu.uniforms.get(k).map(|(_, t)| (k.clone(), *t, v.clone())))
                 .collect();
-            (e.wgsl.clone(), vals, e.version, e.name.clone())
+            (e.wgsl.clone(), vals, e.version, (e.name.clone(), e.textures.clone()))
         };
+        let (src, values, version, name, textures) = (src, values, version, name.0, name.1);
+        let textures: Vec<(String, bevy::prelude::Entity)> = textures.iter()
+            .filter_map(|(n, id)| crate::render::lp_image(*id).map(|e| (format!("tex_{n}"), e))).collect();
         match src {
-            Ok(src) => crate::lp::filter_shader(s.id, &src, &values, version),
+            Ok(src) => crate::lp::filter_shader(s.id, &src, &values, &textures, version),
             Err(why) => {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -129,17 +148,28 @@ pub(crate) fn apply(s: PShader) {
         return;
     }
     let (w, h) = (crate::CANVAS_W.load(std::sync::atomic::Ordering::Relaxed) as usize, crate::CANVAS_H.load(std::sync::atomic::Ordering::Relaxed) as usize);
-    let mut cpu = {
+    let (mut cpu, textures) = {
         let all = shaders().lock();
         let Some(e) = all.get(s.id - 1) else { return };
-        e.cpu.clone()
+        (e.cpu.clone(), e.textures.clone())
     };
+    // the images, numbered from 1 (0 is the canvas)
+    let mut images = Vec::new();
+    for (name, id) in &textures {
+        let (iw, ih) = crate::render::image_size(*id);
+        let px: Vec<u32> = crate::render::image_pixels(*id).iter().map(|c| {
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+            (b(c.a) << 24) | (b(c.r) << 16) | (b(c.g) << 8) | b(c.b)
+        }).collect();
+        images.push((iw as usize, ih as usize, px));
+        cpu.set_uniform(name, &[images.len() as f32]);
+    }
     // Processing fills these in for filter shaders
     if !shaders().lock()[s.id - 1].values.contains_key("texOffset") { cpu.set_uniform("texOffset", &[1.0 / w as f32, 1.0 / h as f32]); }
     if !shaders().lock()[s.id - 1].values.contains_key("resolution") { cpu.set_uniform("resolution", &[w as f32, h as f32]); }
     let src = crate::render::copy_pixels();
     if src.len() < w * h { return; }
     let mut dst = vec![0u32; w * h];
-    cpu.run(w, h, &src, &mut dst);
+    cpu.run(w, h, &src, &mut dst, &images);
     crate::render::write_pixels(&dst);
 }
