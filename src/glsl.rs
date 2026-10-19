@@ -13,7 +13,7 @@ use std::collections::HashMap;
 // ── types and values ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Ty { Void, Float, Int, Bool, Vec(u8), Mat(u8), Sampler }
+pub enum Ty { Void, Float, Int, Bool, Vec(u8), Mat(u8), Sampler, Arr(u8, u16) }
 
 impl Ty {
     fn parse(s: &str) -> Option<Ty> {
@@ -30,10 +30,25 @@ impl Ty {
     fn size(self) -> usize {
         match self { Ty::Float | Ty::Int | Ty::Bool => 1, Ty::Vec(n) => n as usize, Ty::Mat(n) => (n * n) as usize, _ => 0 }
     }
+    /// An array of `len` of this type.
+    fn array(self, len: u16) -> Ty {
+        let code = match self { Ty::Float => 0, Ty::Int => 1, Ty::Bool => 2, Ty::Vec(n) => n + 1, Ty::Mat(n) => n + 4, _ => 0 };
+        Ty::Arr(code, len)
+    }
+    /// What an array holds.
+    pub fn elem(self) -> Ty {
+        match self {
+            Ty::Arr(c, _) => match c { 0 => Ty::Float, 1 => Ty::Int, 2 => Ty::Bool, 3..=5 => Ty::Vec(c - 1), _ => Ty::Mat(c - 4) },
+            t => t,
+        }
+    }
+    pub fn len(self) -> usize { if let Ty::Arr(_, n) = self { n as usize } else { 1 } }
+    pub fn size_pub(self) -> usize { self.size() }
     fn wgsl(self) -> String {
         match self {
             Ty::Float => "f32".into(), Ty::Int => "i32".into(), Ty::Bool => "bool".into(),
             Ty::Vec(n) => format!("vec{n}<f32>"), Ty::Mat(n) => format!("mat{n}x{n}<f32>"),
+            Ty::Arr(_, n) => format!("array<{}, {n}>", self.elem().wgsl()),
             Ty::Void | Ty::Sampler => String::new(),
         }
     }
@@ -188,6 +203,13 @@ pub enum Stmt {
     Continue,
     Discard,
     Block(Vec<Stmt>),
+    /// declarations from one line (`float a = 1.0, b[2];`), no new scope
+    Decls(Vec<Stmt>),
+}
+
+impl Stmt {
+    /// Several declarations from one line, kept in the enclosing scope.
+    fn flat(self) -> Stmt { if let Stmt::Block(v) = self { Stmt::Decls(v) } else { self } }
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +258,17 @@ impl P {
         if let Tok::Id(s) = self.peek() { if let Some(t) = Ty::parse(s) { self.i += 1; return Some(t); } }
         None
     }
+    /// `[N]` after a name or a type: the array's length.
+    fn array_len(&mut self) -> Result<Option<u16>, String> {
+        if !self.eat("[") { return Ok(None); }
+        let n = match self.next() {
+            Tok::Num(v, true) if v >= 1.0 && v <= 4096.0 => v as u16,
+            Tok::Op("]") => return self.err("an array needs its length here, like [9]"),
+            _ => { self.i -= 1; return self.err("an array's length has to be a whole number, like [9]"); }
+        };
+        self.expect("]")?;
+        Ok(Some(n))
+    }
 
     fn program(&mut self) -> Result<Program, String> {
         let mut p = Program::default();
@@ -249,17 +282,17 @@ impl P {
                 p.funcs.push(self.func(ty, name)?);
                 continue;
             }
-            let mut names = vec![(name, None)];
+            let mut names = vec![(name, None, ty)];
             loop {
-                if self.eat("[") { return self.err("arrays aren't supported in shaders yet"); }
+                if let Some(n) = self.array_len()? { names.last_mut().unwrap().2 = ty.array(n); }
                 if self.eat("=") { let e = self.expr()?; names.last_mut().unwrap().1 = Some(e); }
-                if self.eat(",") { names.push((self.ident()?, None)); continue; }
+                if self.eat(",") { names.push((self.ident()?, None, ty)); continue; }
                 self.expect(";")?;
                 break;
             }
-            for (n, init) in names {
+            for (n, init, t) in names {
                 if varying { continue; } // vertTexCoord and vertColor are built in
-                if uniform { p.uniforms.push((ty, n)); } else { p.globals.push((ty, n, init, constant)); }
+                if uniform { p.uniforms.push((t, n)); } else { p.globals.push((t, n, init, constant)); }
             }
         }
         if !p.funcs.iter().any(|f| f.name == "main") { return Err("the shader has no main()".into()); }
@@ -337,15 +370,20 @@ impl P {
     fn simple_stmt(&mut self) -> Result<Stmt, String> {
         let save = self.i;
         self.qualifiers();
-        if let Some(ty) = self.ty() {
+        if let Some(mut ty) = self.ty() {
+            // float[3] a = ...
+            if let Some(n) = self.array_len()? { ty = ty.array(n); }
             if let Tok::Id(_) = self.peek() {
-                let mut names = vec![(self.ident()?, None)];
+                let mut decls = Vec::new();
+                let mut name = self.ident()?;
                 loop {
-                    if self.is("[") { return self.err("arrays aren't supported in shaders yet"); }
-                    if self.eat("=") { let e = self.expr()?; names.last_mut().unwrap().1 = Some(e); }
-                    if self.eat(",") { names.push((self.ident()?, None)); continue; }
+                    let mut t = ty;
+                    if let Some(n) = self.array_len()? { t = ty.array(n); }
+                    let init = if self.eat("=") { Some(self.expr()?) } else { None };
+                    decls.push(Stmt::Decl(t, vec![(name, init)]));
+                    if self.eat(",") { name = self.ident()?; continue; }
                     self.expect(";")?;
-                    return Ok(Stmt::Decl(ty, names));
+                    return Ok(if decls.len() == 1 { decls.pop().unwrap() } else { Stmt::Block(decls).flat() });
                 }
             }
         }
@@ -419,6 +457,20 @@ impl P {
             Tok::Num(v, int) => Ok(Expr::Num(v, int)),
             Tok::Id(s) if s == "true" => Ok(Expr::Bool(true)),
             Tok::Id(s) if s == "false" => Ok(Expr::Bool(false)),
+            Tok::Id(s) if Ty::parse(&s).is_some() && self.is("[") => {
+                self.i += 1;
+                let n = if self.eat("]") { None } else {
+                    let n = match self.next() { Tok::Num(v, true) if v >= 1.0 => v as u16, _ => { self.i -= 1; return self.err("an array's length has to be a whole number"); } };
+                    self.expect("]")?;
+                    Some(n)
+                };
+                self.expect("(")?;
+                let mut args = Vec::new();
+                if !self.eat(")") { loop { args.push(self.assign()?); if self.eat(")") { break; } self.expect(",")?; } }
+                let n = n.unwrap_or(args.len() as u16);
+                if n as usize != args.len() { return self.err(&format!("{s}[{n}] needs {n} values, it has {}", args.len())); }
+                Ok(Expr::Call(format!("{s}[{n}]"), args))
+            }
             Tok::Id(s) => {
                 if self.eat("(") {
                     let mut args = Vec::new();
@@ -452,6 +504,13 @@ struct Scope { vars: Vec<HashMap<String, Ty>> }
 impl Scope {
     fn get(&self, n: &str) -> Option<Ty> { self.vars.iter().rev().find_map(|m| m.get(n).copied()) }
     fn set(&mut self, n: &str, t: Ty) { self.vars.last_mut().unwrap().insert(n.to_string(), t); }
+}
+
+/// "float[3]" -> an array type.
+fn array_ctor(name: &str) -> Option<Ty> {
+    let (base, rest) = name.split_once('[')?;
+    let n: u16 = rest.strip_suffix(']')?.parse().ok()?;
+    Some(Ty::parse(base)?.array(n))
 }
 
 fn swizzle_index(c: char) -> Option<usize> {
@@ -488,7 +547,7 @@ fn type_of(e: &Expr, sc: &Scope, prog: &Program) -> Result<Ty, String> {
                 _ => return Err(format!("no field '.{f}'")),
             }
         }
-        Expr::Index(b, _) => match type_of(b, sc, prog)? { Ty::Vec(_) => Ty::Float, Ty::Mat(n) => Ty::Vec(n), _ => return Err("only vectors and matrices take [ ]".into()) },
+        Expr::Index(b, _) => match type_of(b, sc, prog)? { Ty::Vec(_) => Ty::Float, Ty::Mat(n) => Ty::Vec(n), t @ Ty::Arr(..) => t.elem(), _ => return Err("only arrays, vectors and matrices take [ ]".into()) },
         Expr::Unary("!", _) => Ty::Bool,
         Expr::Unary(_, x) => { let t = type_of(x, sc, prog)?; if t == Ty::Bool { return Err("'-' on a bool".into()); } t }
         Expr::IncDec(_, _, x) => type_of(x, sc, prog)?,
@@ -508,6 +567,7 @@ fn type_of(e: &Expr, sc: &Scope, prog: &Program) -> Result<Ty, String> {
         }
         Expr::Call(name, args) => {
             if let Some(t) = Ty::parse(name) { return Ok(t); }
+            if let Some(t) = array_ctor(name) { return Ok(t); }
             let at = |i: usize| -> Result<Ty, String> { type_of(args.get(i).ok_or_else(|| format!("{name}() needs more arguments"))?, sc, prog) };
             match name.as_str() {
                 "texture2D" | "texture" => Ty::Vec(4),
@@ -576,6 +636,7 @@ fn check_stmt(s: &Stmt, sc: &mut Scope, prog: &Program) -> Result<(), String> {
         }
         Stmt::While(c, body) | Stmt::DoWhile(body, c) => { type_of(c, sc, prog)?; check_block(std::slice::from_ref(body), sc, prog)?; }
         Stmt::Block(b) => check_block(b, sc, prog)?,
+        Stmt::Decls(v) => for s in v { check_stmt(s, sc, prog)?; },
         _ => {}
     }
     Ok(())
@@ -606,16 +667,18 @@ enum C {
     Make(Ty, Vec<C>),
     Bi(Bi, Vec<C>),
     Call(usize, Vec<C>, Vec<(usize, LV)>), // function, args, out params copied back
+    ArrIdx(bool, usize, usize, Box<C>),    // local?, first slot, length, index
     Set(LV, &'static str, Box<C>, Ty),     // op ("=" or + - * /), value, type of the target
     IncDec(LV, bool, bool, Ty),            // +?, prefix?
 }
 #[derive(Clone, Debug)]
-struct LV { local: bool, slot: usize, path: Vec<Acc> }
+struct LV { local: bool, slot: usize, arr: Option<(usize, Box<C>)>, path: Vec<Acc> }
 
 #[derive(Clone, Debug)]
 enum S {
     E(C),
     Init(usize, C),
+    InitArr(usize, Vec<C>),
     Zero(usize, Ty),
     If(C, Vec<S>, Vec<S>),
     Loop(Vec<S>, Option<C>, Option<C>, Vec<S>, bool), // init, cond, step, body, cond at the end?
@@ -678,7 +741,7 @@ impl Comp<'_> {
     fn ty(&self, e: &Expr) -> Result<Ty, String> { type_of(e, &self.scope(), self.prog) }
     fn local(&mut self, n: &str, t: Ty) -> usize {
         let s = self.nslots;
-        self.nslots += 1;
+        self.nslots += t.len();
         self.scopes.last_mut().unwrap().insert(n.to_string(), (s, t));
         s
     }
@@ -688,9 +751,22 @@ impl Comp<'_> {
     }
     fn lvalue(&mut self, e: &Expr) -> Result<LV, String> {
         match e {
-            Expr::Var(n) => { let (local, slot, _) = self.find(n).ok_or_else(|| format!("unknown name '{n}'"))?; Ok(LV { local, slot, path: Vec::new() }) }
+            Expr::Var(n) => {
+                let (local, slot, t) = self.find(n).ok_or_else(|| format!("unknown name '{n}'"))?;
+                if matches!(t, Ty::Arr(..)) { return Err(format!("'{n}' is an array: assign to one item, like {n}[0]")); }
+                Ok(LV { local, slot, arr: None, path: Vec::new() })
+            }
             Expr::Field(b, f) => { let mut lv = self.lvalue(b)?; lv.path.push(swz(f)); Ok(lv) }
-            Expr::Index(b, i) => { let mut lv = self.lvalue(b)?; let i = self.expr(i)?; lv.path.push(Acc::Idx(Box::new(i))); Ok(lv) }
+            Expr::Index(b, i) => {
+                // an item of an array: a slot picked when it runs
+                if let Expr::Var(n) = &**b {
+                    if let Some((local, slot, t @ Ty::Arr(..))) = self.find(n) {
+                        let i = self.expr(i)?;
+                        return Ok(LV { local, slot, arr: Some((t.len(), Box::new(i))), path: Vec::new() });
+                    }
+                }
+                let mut lv = self.lvalue(b)?; let i = self.expr(i)?; lv.path.push(Acc::Idx(Box::new(i))); Ok(lv)
+            }
             _ => Err("this can't be assigned to".into()),
         }
     }
@@ -698,9 +774,19 @@ impl Comp<'_> {
         Ok(match e {
             Expr::Num(v, int) => C::K(if *int { Val::i(*v as i32) } else { Val::f(*v as f32) }),
             Expr::Bool(b) => C::K(Val::b(*b)),
-            Expr::Var(n) => match self.find(n) { Some((true, s, _)) => C::L(s), Some((false, s, _)) => C::G(s), None => return Err(format!("unknown name '{n}'")) },
+            Expr::Var(n) => match self.find(n) {
+                Some((_, _, Ty::Arr(..))) => return Err(format!("'{n}' is an array: use one item, like {n}[i]")),
+                Some((true, s, _)) => C::L(s), Some((false, s, _)) => C::G(s), None => return Err(format!("unknown name '{n}'")),
+            },
             Expr::Field(b, f) => { let t = self.ty(e)?; C::Acc(Box::new(self.expr(b)?), swz(f), t) }
-            Expr::Index(b, i) => { let t = self.ty(e)?; C::Acc(Box::new(self.expr(b)?), Acc::Idx(Box::new(self.expr(i)?)), t) }
+            Expr::Index(b, i) => {
+                if let Expr::Var(n) = &**b {
+                    if let Some((local, slot, t @ Ty::Arr(..))) = self.find(n) {
+                        return Ok(C::ArrIdx(local, slot, t.len(), Box::new(self.expr(i)?)));
+                    }
+                }
+                let t = self.ty(e)?; C::Acc(Box::new(self.expr(b)?), Acc::Idx(Box::new(self.expr(i)?)), t)
+            }
             Expr::Unary("!", x) => C::Not(Box::new(self.expr(x)?)),
             Expr::Unary(_, x) => C::Neg(Box::new(self.expr(x)?)),
             Expr::Binary("&&", a, b) => C::And(Box::new(self.expr(a)?), Box::new(self.expr(b)?)),
@@ -710,6 +796,7 @@ impl Comp<'_> {
             Expr::Assign(op, l, r) => { let t = self.ty(l)?; C::Set(self.lvalue(l)?, op, Box::new(self.expr(r)?), t) }
             Expr::IncDec(op, pre, x) => { let t = self.ty(x)?; C::IncDec(self.lvalue(x)?, *op == "+", *pre, t) }
             Expr::Call(name, args) => {
+                if array_ctor(name).is_some() { return Err("an array's values only go in its declaration: float w[3] = float[3](...)".into()); }
                 let ca: Vec<C> = args.iter().map(|a| self.expr(a)).collect::<Result<_, _>>()?;
                 if let Some(t) = Ty::parse(name) { return Ok(C::Make(t, ca)); }
                 if let Some(b) = bi(name, args.len()) {
@@ -725,6 +812,18 @@ impl Comp<'_> {
             }
         })
     }
+    /// The starting items of an array: from float[N](...), or zeros.
+    fn array_init(&mut self, t: Ty, init: Option<&Expr>) -> Result<Vec<C>, String> {
+        let et = t.elem();
+        match init {
+            None => Ok((0..t.len()).map(|_| C::K(Val::zero(et))).collect()),
+            Some(Expr::Call(name, args)) if array_ctor(name).is_some() => {
+                if args.len() != t.len() { return Err(format!("the array has {} items, {name} gives {}", t.len(), args.len())); }
+                args.iter().map(|a| Ok(C::Make(et, vec![self.expr(a)?]))).collect()
+            }
+            Some(_) => Err("an array starts from float[N](...) (or another array type's), not from another array".into()),
+        }
+    }
     fn block(&mut self, b: &[Stmt]) -> Result<Vec<S>, String> {
         self.scopes.push(HashMap::new());
         let r = b.iter().map(|s| self.stmt(s)).collect::<Result<Vec<_>, _>>();
@@ -736,11 +835,22 @@ impl Comp<'_> {
             Stmt::Decl(t, names) => {
                 let mut v = Vec::new();
                 for (n, init) in names {
+                    if let Ty::Arr(..) = t {
+                        let items = self.array_init(*t, init.as_ref())?;
+                        let slot = self.local(n, *t);
+                        v.push(S::InitArr(slot, items));
+                        continue;
+                    }
                     let c = match init { Some(e) => Some(self.expr(e)?), None => None };
                     let slot = self.local(n, *t);
                     v.push(match c { Some(c) => S::Init(slot, C::Make(*t, vec![c])), None => S::Zero(slot, *t) });
                 }
                 if v.len() == 1 { v.pop().unwrap() } else { S::If(C::K(Val::b(true)), v, Vec::new()) }
+            }
+            Stmt::Decls(list) => {
+                let mut v = Vec::new();
+                for d in list { v.push(self.stmt(d)?); }
+                S::If(C::K(Val::b(true)), v, Vec::new())
             }
             Stmt::Expr(e) => S::E(self.expr(e)?),
             Stmt::If(c, a, b) => S::If(self.expr(c)?, self.block(std::slice::from_ref(a))?, match b { Some(b) => self.block(std::slice::from_ref(b))?, None => Vec::new() }),
@@ -781,8 +891,8 @@ pub fn compile(prog: &Program) -> Result<Cpu, String> {
     for (t, name) in &prog.uniforms {
         globals.insert(name.clone(), (n, *t));
         uniforms.insert(name.clone(), (n, *t));
-        start.push(Val::zero(*t));
-        n += 1;
+        for _ in 0..t.len() { start.push(Val::zero(t.elem())); }
+        n += t.len();
     }
     let bodies: Vec<&Func> = prog.funcs.iter().filter(|f| !f.body.is_empty() || f.name == "main").collect();
     let fn_index: HashMap<String, usize> = bodies.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
@@ -790,9 +900,15 @@ pub fn compile(prog: &Program) -> Result<Cpu, String> {
     let mut global_init = Vec::new();
     for (t, name, init, _) in &prog.globals {
         let slot = c.nglobals;
-        c.nglobals += 1;
-        start.push(Val::zero(*t));
-        if let Some(e) = init { c.scopes.clear(); let ce = c.expr(e)?; global_init.push((slot, C::Make(*t, vec![ce]))); }
+        c.nglobals += t.len();
+        for _ in 0..t.len() { start.push(Val::zero(t.elem())); }
+        c.scopes.clear();
+        if let Ty::Arr(..) = t {
+            let items = c.array_init(*t, init.as_ref())?;
+            for (k, it) in items.into_iter().enumerate() { global_init.push((slot + k, it)); }
+        } else if let Some(e) = init {
+            let ce = c.expr(e)?; global_init.push((slot, C::Make(*t, vec![ce])));
+        }
         c.globals.insert(name.clone(), (slot, *t));
     }
     let mut funcs = Vec::new();
@@ -904,6 +1020,18 @@ fn convert(t: Ty, args: &[Val]) -> Val {
 impl Cpu {
     pub fn set_uniform(&mut self, name: &str, vals: &[f32]) -> bool {
         let Some(&(slot, t)) = self.uniforms.get(name) else { return false };
+        if let Ty::Arr(..) = t {
+            // the numbers fill the items in turn
+            let et = t.elem();
+            let k = et.size().max(1);
+            for i in 0..t.len() {
+                let mut v = Val::zero(et);
+                for j in 0..k { v.v[j] = vals.get(i * k + j).copied().unwrap_or(0.0); }
+                if et == Ty::Int { v.v[0] = v.v[0].trunc(); }
+                self.globals[slot + i] = v;
+            }
+            return true;
+        }
         let mut v = Val::zero(t);
         for (i, x) in vals.iter().take(t.size().max(1)).enumerate() { v.v[i] = *x; }
         if t == Ty::Int { v.v[0] = v.v[0].trunc(); }
@@ -1002,6 +1130,7 @@ impl Cpu {
         match s {
             S::E(e) => { self.eval(e, f, g, ctx); }
             S::Init(slot, e) => { let v = self.eval(e, f, g, ctx); f[*slot] = v; }
+            S::InitArr(slot, items) => for (k, e) in items.iter().enumerate() { let v = self.eval(e, f, g, ctx); f[*slot + k] = v; },
             S::Zero(slot, t) => f[*slot] = Val::zero(*t),
             S::If(c, a, b) => return if self.eval(c, f, g, ctx).truthy() { self.exec_block(a, f, g, ctx) } else { self.exec_block(b, f, g, ctx) },
             S::Loop(init, cond, step, body, cond_last) => {
@@ -1041,8 +1170,16 @@ impl Cpu {
             }
         }
     }
+    /// The slot an lvalue names, with an array's item picked.
+    fn lv_slot(&self, lv: &LV, f: &mut [Val], g: &mut Vec<Val>, ctx: &Ctx) -> usize {
+        match &lv.arr {
+            Some((len, i)) => lv.slot + (self.eval(i, f, g, ctx).x().max(0.0) as usize).min(len - 1),
+            None => lv.slot,
+        }
+    }
     fn get_lv(&self, lv: &LV, f: &mut [Val], g: &mut Vec<Val>, ctx: &Ctx) -> Val {
-        let mut v = if lv.local { f[lv.slot] } else { g[lv.slot] };
+        let slot = self.lv_slot(lv, f, g, ctx);
+        let mut v = if lv.local { f[slot] } else { g[slot] };
         for a in &lv.path {
             let ty = match (a, v.ty) { (Acc::Swz(_, 1), _) | (Acc::Idx(_), Ty::Vec(_)) => Ty::Float, (Acc::Swz(_, n), _) => Ty::Vec(*n), (Acc::Idx(_), Ty::Mat(n)) => Ty::Vec(n), _ => Ty::Float };
             v = self.read(v, a, ty, f, g, ctx);
@@ -1051,7 +1188,8 @@ impl Cpu {
     }
     fn set_lv(&self, lv: &LV, val: Val, f: &mut [Val], g: &mut Vec<Val>, ctx: &Ctx) {
         // walk down to find which components of the root the path names
-        let root = if lv.local { f[lv.slot] } else { g[lv.slot] };
+        let slot = self.lv_slot(lv, f, g, ctx);
+        let root = if lv.local { f[slot] } else { g[slot] };
         let mut comps: Vec<usize> = (0..root.n()).collect();
         let mut ty = root.ty;
         for a in &lv.path {
@@ -1065,7 +1203,7 @@ impl Cpu {
             }
         }
         let val = if val.n() == 1 && comps.len() > 1 { convert(ty, &[val]) } else { val };
-        let target = if lv.local { &mut f[lv.slot] } else { &mut g[lv.slot] };
+        let target = if lv.local { &mut f[slot] } else { &mut g[slot] };
         for (k, c) in comps.iter().enumerate() { target.v[*c] = val.v[k.min(15)]; }
         if lv.path.is_empty() && target.ty == Ty::Int { target.v[0] = target.v[0].trunc(); }
     }
@@ -1075,6 +1213,10 @@ impl Cpu {
             C::K(v) => *v,
             C::L(s) => f[*s],
             C::G(s) => g[*s],
+            C::ArrIdx(local, base, len, i) => {
+                let i = (self.eval(i, f, g, ctx).x().max(0.0) as usize).min(len - 1);
+                if *local { f[base + i] } else { g[base + i] }
+            }
             C::Acc(b, a, t) => { let b = self.eval(b, f, g, ctx); self.read(b, a, *t, f, g, ctx) }
             C::Neg(x) => { let mut v = self.eval(x, f, g, ctx); for i in 0..v.n() { v.v[i] = -v.v[i]; } v }
             C::Not(x) => Val::b(!self.eval(x, f, g, ctx).truthy()),
@@ -1260,7 +1402,7 @@ impl W<'_> {
                 "resolution" if self.target == Target::Filter => "resolution()".into(),
                 "texOffset" => "(1.0 / params.glsl_resolution)".into(),
                 "resolution" => "params.glsl_resolution".into(),
-                _ => match self.uniforms[n] { Ty::Bool => format!("(params.{n} != 0)"), _ => format!("params.{n}") },
+                _ => match self.uniforms[n] { Ty::Bool => format!("(params.{n} != 0)"), Ty::Arr(..) => format!("glsl_u_{n}"), _ => format!("params.{n}") },
             },
             _ if self.ptr_params.iter().any(|p| p == n) => format!("(*{})", wname(n)),
             _ => wname(n),
@@ -1307,6 +1449,11 @@ impl W<'_> {
         })
     }
     fn call(&mut self, name: &str, args: &[Expr]) -> Result<String, String> {
+        if let Some(t) = array_ctor(name) {
+            let et = t.elem();
+            let parts: Vec<String> = args.iter().map(|a| self.ex_as(a, et)).collect::<Result<_, _>>()?;
+            return Ok(format!("{}({})", t.wgsl(), parts.join(", ")));
+        }
         if let Some(t) = Ty::parse(name) {
             let n = t.size();
             // casts and constructors: everything inside is float, except int() and bool()
@@ -1446,6 +1593,7 @@ impl W<'_> {
                 self.sc.set(n, *t);
                 self.line(depth, &format!("var {}: {} = {v};", wname(n), t.wgsl()));
             },
+            Stmt::Decls(list) => for d in list { self.stmt(d, depth)?; },
             Stmt::Expr(e) => self.expr_stmt(e, depth)?,
             Stmt::If(c, a, b) => {
                 let c = self.ex_as(c, Ty::Bool)?;
@@ -1534,8 +1682,16 @@ pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
         w.out.push_str("struct GlslParams {\n");
         for (t, n) in &fields {
             if WGSL_RESERVED.contains(&n.as_str()) { return Err(format!("uniform `{n}`: that name is taken in WGSL, please rename it")); }
-            let ty = if *t == Ty::Bool { "i32".to_string() } else { t.wgsl() };
-            w.out.push_str(&format!("    {n}: {ty},\n"));
+            // an array is one field per item (name_0, name_1...): uniform
+            // arrays in WGSL need 16-byte steps, and items can be set by name
+            let items: Vec<(String, Ty)> = match t {
+                Ty::Arr(..) => (0..t.len()).map(|i| (format!("{n}_{i}"), t.elem())).collect(),
+                _ => vec![(n.clone(), *t)],
+            };
+            for (fname, ft) in items {
+                let ty = if ft == Ty::Bool { "i32".to_string() } else { ft.wgsl() };
+                w.out.push_str(&format!("    {fname}: {ty},\n"));
+            }
         }
         w.out.push_str(&format!("}}\n@group({group}) @binding(0) var<uniform> params: GlslParams;\n\n"));
     }
@@ -1561,6 +1717,9 @@ pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
     for (t, n, _, _) in &prog.globals {
         w.out.push_str(&format!("var<private> {}: {};\n", wname(n), t.wgsl()));
         w.sc.set(n, *t);
+    }
+    for (t, n) in &prog.uniforms {
+        if let Ty::Arr(..) = t { w.out.push_str(&format!("var<private> glsl_u_{n}: {};\n", t.wgsl())); }
     }
     w.out.push('\n');
     for f in prog.funcs.iter().filter(|f| !f.body.is_empty()) {
@@ -1594,6 +1753,12 @@ pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
         w.out.push_str("    glsl_vert_color = params.glsl_fill;\n");
     }
     w.out.push_str("    glsl_frag_color = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n");
+    for (t, n) in &prog.uniforms {
+        if let Ty::Arr(..) = t {
+            let items: Vec<String> = (0..t.len()).map(|i| if t.elem() == Ty::Bool { format!("(params.{n}_{i} != 0)") } else { format!("params.{n}_{i}") }).collect();
+            w.line(1, &format!("glsl_u_{n} = {}({});", t.wgsl(), items.join(", ")));
+        }
+    }
     let globals = prog.globals.clone();
     for (t, n, init, _) in &globals {
         if let Some(e) = init { let v = w.ex_as(e, *t)?; w.line(1, &format!("{} = {v};", wname(n))); }

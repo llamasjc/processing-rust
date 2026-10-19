@@ -239,3 +239,23 @@ pub(crate) fn active_cpu(w: usize, h: usize) -> Option<(glsl::Cpu, Vec<(usize, u
     if !e.values.contains_key("resolution") { cpu.set_uniform("resolution", &[w as f32, h as f32]); }
     Some((cpu, images))
 }
+
+/// Uniform values with arrays split into their items (`name_0`, `name_1`...),
+/// the way the WGSL in glsl.rs lays them out.
+#[cfg_attr(not(feature = "libprocessing"), allow(dead_code))]
+pub(crate) fn by_item(values: &[(String, glsl::Ty, Vec<f32>)]) -> Vec<(String, glsl::Ty, Vec<f32>)> {
+    let mut out = Vec::new();
+    for (n, t, v) in values {
+        if let glsl::Ty::Arr(..) = t {
+            let et = t.elem();
+            let k = et.size_pub().max(1);
+            for i in 0..t.len() {
+                let chunk: Vec<f32> = (0..k).map(|j| v.get(i * k + j).copied().unwrap_or(0.0)).collect();
+                out.push((format!("{n}_{i}"), et, chunk));
+            }
+        } else {
+            out.push((n.clone(), *t, v.clone()));
+        }
+    }
+    out
+}

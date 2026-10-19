@@ -241,7 +241,10 @@ so each keeps its own fill.)
 Supported: float, int, bool, vec2-4, mat2-4, functions (with `out` and `inout`
 parameters), if / for / while / do, `discard`, `const` and `#define`, the
 usual built-in functions, and images as `sampler2D` uniforms
-(`shader.set("other", img)`). Not yet: arrays and vertex shaders. A mistake
+(`shader.set("other", img)`), and arrays: `uniform float kernel[9]` (set with
+`shader.set("kernel", [..9 numbers..])`), `const vec2 offsets[9] =
+vec2[9](...)`, local arrays, indexed with any expression. An array can't be
+passed around whole yet (only its items). Not yet: vertex shaders. A mistake
 in a shader is reported with its line when it's loaded;
 `PROCESSING_SHADER_DEBUG=1` prints the WGSL libprocessing gets.
 

@@ -320,7 +320,8 @@ pub(crate) fn filter_shader(id: usize, src: &str, values: &[(String, crate::glsl
         }
     };
     if sent != version {
-        for (name, t, v) in values {
+        for (name, t, v) in crate::shader::by_item(values) {
+            let (name, t, v) = (&name, &t, &v);
             let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
             let val = match t {
                 Ty::Int | Ty::Bool => V::Int(g(0) as i32),
@@ -368,7 +369,8 @@ pub(crate) fn shape_shader(id: usize, src: &str, values: &[(String, crate::glsl:
         }
     };
     if sent != version {
-        for (name, t, v) in values {
+        for (name, t, v) in crate::shader::by_item(values) {
+            let (name, t, v) = (&name, &t, &v);
             if name == "resolution" || name == "texOffset" { continue; }
             let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
             let val = match t {
