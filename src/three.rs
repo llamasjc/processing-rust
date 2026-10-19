@@ -501,6 +501,10 @@ fn put(buf: &mut [u32], i: usize, c: Color, opaque_target: bool) {
     buf[i] = mix(c.r, 16) | mix(c.g, 8) | mix(c.b, 0) | (d & 0xFF00_0000);
 }
 
+thread_local! {
+    /// The pixel raster_tri_with is coloring, for shaders that need it.
+    static PIXEL: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
 fn raster_tri(a: SV, b: SV, c: SV, col: Color) {
     raster_tri_with(a, b, c, col.a < 0.999, &|_, _, _| col);
 }
@@ -533,6 +537,7 @@ fn raster_tri_with(a: SV, b: SV, c: SV, see_through: bool, color: &dyn Fn(f32, f
                     // weights in space, not on the screen, so textures don't swim
                     let (p0, p1, p2) = (w0 * a.iw, w1 * b.iw, w2 * c.iw);
                     let sum = p0 + p1 + p2;
+                    PIXEL.with(|p| p.set((x as usize, y as usize)));
                     let col = if sum > 0.0 { color(p0 / sum, p1 / sum, p2 / sum) } else { color(w0, w1, w2) };
                     if col.a <= 0.0 { continue; }
                     if !see_through && col.a >= 0.999 { depth[i] = z; }
@@ -577,8 +582,24 @@ fn draw_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], edges: Option<&[[usize; 2]
     let (fill, stroke, weight) = crate::render::style_pub();
     let (lights, mat) = S.with(|s| { let s = s.borrow(); (s.lights.clone(), s.material) });
     if let Some(fc) = fill {
+        // shader(): the shader colors each pixel, with the fill as vertColor
+        let shaded = crate::shader::active_cpu(w, h);
+        let px = shaded.as_ref().map(|(cpu, images)| {
+            let src: Vec<u32> = crate::pixel_buf().lock().iter().map(|p| 0xFF00_0000 | (p & 0x00FF_FFFF)).collect();
+            cpu.one_pixel(w, h, src, images.clone())
+        });
         for t in tris {
             let (Some(a), Some(b), Some(c)) = (screen[t[0]], screen[t[1]], screen[t[2]]) else { continue };
+            if let Some(px) = &px {
+                raster_tri_with(a, b, c, fc.a < 0.999, &|_, _, _| {
+                    let (x, y) = PIXEL.with(|p| p.get());
+                    match px.color(x, y, [fc.r, fc.g, fc.b, fc.a]) {
+                        Some(c) => Color::from_rgba(c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0), c[3].clamp(0.0, 1.0)),
+                        None => Color::from_rgba(0.0, 0.0, 0.0, 0.0),
+                    }
+                });
+                continue;
+            }
             let (pa, pb, pc) = (world[t[0]], world[t[1]], world[t[2]]);
             let n = norm(cross(sub(pb, pa), sub(pc, pa)));
             let center = [(pa[0] + pb[0] + pc[0]) / 3.0, (pa[1] + pb[1] + pc[1]) / 3.0, (pa[2] + pb[2] + pc[2]) / 3.0];

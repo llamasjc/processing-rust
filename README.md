@@ -232,11 +232,17 @@ renderer the shader runs on the CPU (an interpreter in `src/glsl.rs`, on every
 core); on libprocessing it is translated to WGSL and runs on the GPU. Both give
 the same picture.
 
+`shader(s)` colors the shapes drawn after it with the shader (its fragment
+part; `vertColor` is the shape's fill), until `reset_shader()`. On the default
+renderer that is every filled shape; on libprocessing 3D shapes (`box`,
+`sphere`) for now, since its 2D shapes can't take a custom material yet.
+
 Supported: float, int, bool, vec2-4, mat2-4, functions (with `out` and `inout`
-parameters), if / for / while / do, `discard`, `const` and `#define`, and the
-usual built-in functions. Not yet: arrays, other textures than the canvas, and
-`shader()` for shapes (a vertex and fragment pair); a mistake in a shader is
-reported with its line when it's loaded.
+parameters), if / for / while / do, `discard`, `const` and `#define`, the
+usual built-in functions, and images as `sampler2D` uniforms
+(`shader.set("other", img)`). Not yet: arrays and vertex shaders. A mistake
+in a shader is reported with its line when it's loaded;
+`PROCESSING_SHADER_DEBUG=1` prints the WGSL libprocessing gets.
 
 ### Lights, materials and the rest of the API
 

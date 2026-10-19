@@ -582,3 +582,6 @@ load_shader	FUNCTION1
 loadShader	FUNCTION1
 shader_from_source	FUNCTION1
 PShader	KEYWORD2
+shader	FUNCTION1
+reset_shader	FUNCTION1
+resetShader	FUNCTION1

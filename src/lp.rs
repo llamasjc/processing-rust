@@ -208,6 +208,7 @@ fn make_canvas(w: u32, h: u32) -> Option<(Entity, Entity)> {
     Some((canvas, main))
 }
 fn start_canvas(main: Entity) {
+    SHADING.with(|s| s.set(None));
     DRAWN.store(false, Ordering::Relaxed);
     let _ = pr::graphics_begin_draw(main);
     processing_coords();
@@ -341,6 +342,75 @@ pub(crate) fn filter_shader(id: usize, src: &str, values: &[(String, crate::glsl
     let _ = pr::graphics_flush(t);
     if let Err(e) = pr::graphics_apply_filter(t, filter) { fail("running a shader", e); }
     DIRTY.store(true, Ordering::Relaxed);
+}
+
+// ── shader(): shapes drawn with a shader ─────────────────────────────────
+// The shader becomes a libprocessing custom material. That draws 3D shapes
+// (box, sphere); libprocessing's 2D shapes have no normals or texture
+// coordinates, which its custom materials need, so 2D shapes stay plain.
+thread_local! {
+    /// engine shader id -> (libprocessing material, values version sent)
+    static MATERIALS: RefCell<HashMap<usize, (Entity, u64)>> = RefCell::new(HashMap::new());
+    static SHADING: std::cell::Cell<Option<Entity>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn shape_shader(id: usize, src: &str, values: &[(String, crate::glsl::Ty, Vec<f32>)], textures: &[(String, Entity)], version: u64) {
+    use crate::glsl::Ty;
+    use pr::shader_value::ShaderValue as V;
+    ensure_open();
+    let made = MATERIALS.with(|m| m.borrow().get(&id).copied());
+    let (mat, sent) = match made {
+        Some(x) => x,
+        None => {
+            let shader = match pr::shader_create(src) { Ok(s) => s, Err(e) => { fail("making a shader", e); return; } };
+            let m = match pr::material_create_custom(shader) { Ok(m) => m, Err(e) => { fail("making a shader material", e); return; } };
+            MATERIALS.with(|x| x.borrow_mut().insert(id, (m, u64::MAX)));
+            (m, u64::MAX)
+        }
+    };
+    if sent != version {
+        for (name, t, v) in values {
+            if name == "resolution" || name == "texOffset" { continue; }
+            let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
+            let val = match t {
+                Ty::Int | Ty::Bool => V::Int(g(0) as i32),
+                Ty::Vec(2) => V::Float2([g(0), g(1)]),
+                Ty::Vec(3) => V::Float3([g(0), g(1), g(2)]),
+                Ty::Vec(4) => V::Float4([g(0), g(1), g(2), g(3)]),
+                Ty::Mat(4) => { let mut m = [0.0; 16]; for (i, x) in v.iter().take(16).enumerate() { m[i] = *x; } V::Mat4(m) }
+                _ => V::Float(g(0)),
+            };
+            if let Err(e) = pr::material_set(mat, name.as_str(), val) { fail("setting a shader uniform", e); }
+        }
+        MATERIALS.with(|m| { if let Some(x) = m.borrow_mut().get_mut(&id) { x.1 = version; } });
+    }
+    if let Some((w, h)) = target_size() {
+        let _ = pr::material_set(mat, "glsl_resolution", V::Float2([w as f32, h as f32]));
+    }
+    for (name, e) in textures {
+        let _ = pr::material_set(mat, format!("tex_{name}").as_str(), V::Texture(*e));
+        let _ = pr::material_set(mat, format!("smp_{name}").as_str(), V::Texture(*e));
+    }
+    cmd(DrawCommand::Material(mat));
+    SHADING.with(|s| s.set(Some(mat)));
+}
+pub(crate) fn reset_shape_shader() {
+    SHADING.with(|s| s.set(None));
+    cmd(DrawCommand::Unlit);
+    if LIT.with(|l| l.get()) { cmd(DrawCommand::Roughness(0.9)); cmd(DrawCommand::Metallic(0.0)); send_material(); }
+}
+/// Before a 3D shape with shader() on: its fill, as vertColor. The shape is
+/// rendered right after, so each keeps its own fill.
+fn shaded_3d(draw: DrawCommand) -> bool {
+    let Some(mat) = SHADING.with(|s| s.get()) else { return false };
+    let c = crate::render::style_pub().0.unwrap_or(Color::from_rgb(1.0, 1.0, 1.0));
+    let _ = pr::material_set(mat, "glsl_fill", pr::shader_value::ShaderValue::Float4([c.r, c.g, c.b, c.a]));
+    cmd(draw);
+    if let Some(t) = target() { let _ = pr::graphics_flush(t); }
+    true
+}
+/// A 2D shape with shader() on: drawn plainly, and said once.
+fn shaded_2d_note() {
+    if SHADING.with(|s| s.get()).is_some() { missing("shader() on 2D shapes (it colors 3D shapes like box() and sphere() on libprocessing)"); }
 }
 
 pub(crate) fn window_move(x: i32, y: i32) {
@@ -618,8 +688,8 @@ fn corner_modes() {
 }
 
 // ── shapes ───────────────────────────────────────────────────────────────
-pub(crate) fn rect(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) { cmd(DrawCommand::Rect { x, y, w, h, radii }); }
-pub(crate) fn ellipse(cx: f32, cy: f32, w: f32, h: f32) { cmd(DrawCommand::Ellipse { cx, cy, w, h }); }
+pub(crate) fn rect(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) { shaded_2d_note(); cmd(DrawCommand::Rect { x, y, w, h, radii }); }
+pub(crate) fn ellipse(cx: f32, cy: f32, w: f32, h: f32) { shaded_2d_note(); cmd(DrawCommand::Ellipse { cx, cy, w, h }); }
 /// Lines and points of an odd width sit in the middle of a pixel row, like
 /// the other renderer, so a 1-pixel line on whole coordinates is one crisp row.
 fn pixel_center() -> f32 {
@@ -694,8 +764,14 @@ fn base_coords(t: Entity) {
     record(t, DrawCommand::Translate(Vec3::new(-(w as f32) / 2.0, -(h as f32) / 2.0, 0.0)));
 }
 
-pub(crate) fn box_3d(w: f32, h: f32, d: f32) { cmd(DrawCommand::Box { width: w, height: h, depth: d }); }
-pub(crate) fn sphere(r: f32, sectors: u32, stacks: u32) { cmd(DrawCommand::Sphere { radius: r, sectors, stacks }); }
+pub(crate) fn box_3d(w: f32, h: f32, d: f32) {
+    let c = DrawCommand::Box { width: w, height: h, depth: d };
+    if !shaded_3d(c.clone()) { cmd(c); }
+}
+pub(crate) fn sphere(r: f32, sectors: u32, stacks: u32) {
+    let c = DrawCommand::Sphere { radius: r, sectors, stacks };
+    if !shaded_3d(c.clone()) { cmd(c); }
+}
 /// camera(eye, center, up) in Processing's coordinates (see processing_coords).
 pub(crate) fn camera(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) {
     let Some((w, h)) = LP.with(|l| l.borrow().as_ref().map(|l| l.size)) else { return };

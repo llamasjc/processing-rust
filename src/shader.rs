@@ -15,6 +15,9 @@ pub(crate) struct Entry {
     pub cpu: glsl::Cpu,
     #[cfg_attr(not(feature = "libprocessing"), allow(dead_code))]
     pub wgsl: Result<String, String>,
+    /// the same shader as a material, for shader()
+    #[cfg_attr(not(feature = "libprocessing"), allow(dead_code))]
+    pub material: Result<String, String>,
     pub values: HashMap<String, Vec<f32>>,
     /// images set on sampler2D uniforms
     pub textures: HashMap<String, u64>,
@@ -106,8 +109,14 @@ fn shader_from_source_named(src: &str, name: &str) -> PShader {
         Err(e) => { eprintln!("loadShader(\"{name}\"): {e}"); return PShader::default(); }
     };
     let wgsl = glsl::to_wgsl(&prog);
+    let material = glsl::to_wgsl_for(&prog, glsl::Target::Material);
+    // PROCESSING_SHADER_DEBUG=1 prints what libprocessing gets
+    if std::env::var_os("PROCESSING_SHADER_DEBUG").is_some() {
+        eprintln!("── {name} as a filter ──\n{}", wgsl.as_ref().map(|s| s.as_str()).unwrap_or_else(|e| e));
+        eprintln!("── {name} as a material ──\n{}", material.as_ref().map(|s| s.as_str()).unwrap_or_else(|e| e));
+    }
     let mut all = shaders().lock();
-    all.push(Entry { cpu, wgsl, values: HashMap::new(), textures: HashMap::new(), version: 0, name: name.to_string() });
+    all.push(Entry { cpu, wgsl, material, values: HashMap::new(), textures: HashMap::new(), version: 0, name: name.to_string() });
     PShader { id: all.len() }
 }
 #[inline] pub fn loadShader(path: &str) -> PShader { load_shader(path) }
@@ -172,4 +181,61 @@ pub(crate) fn apply(s: PShader) {
     let mut dst = vec![0u32; w * h];
     cpu.run(w, h, &src, &mut dst, &images);
     crate::render::write_pixels(&dst);
+}
+
+// ── shader(): shapes drawn with a shader ─────────────────────────────────
+
+static ACTIVE: Mutex<Option<PShader>> = Mutex::new(None);
+
+/// shader(s): shapes drawn after it are colored by the shader (its fragment
+/// part: vertColor is the fill). reset_shader() goes back to plain fills.
+pub fn shader(s: impl std::borrow::Borrow<PShader>) {
+    let s = *s.borrow();
+    if s.id == 0 { return; }
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() {
+        let (src, values, textures, version) = {
+            let all = shaders().lock();
+            let Some(e) = all.get(s.id - 1) else { return };
+            let vals: Vec<(String, glsl::Ty, Vec<f32>)> = e.values.iter()
+                .filter_map(|(k, v)| e.cpu.uniforms.get(k).map(|(_, t)| (k.clone(), *t, v.clone()))).collect();
+            (e.material.clone(), vals, e.textures.clone(), e.version)
+        };
+        let textures: Vec<(String, bevy::prelude::Entity)> = textures.iter()
+            .filter_map(|(n, id)| crate::render::lp_image(*id).map(|e| (n.clone(), e))).collect();
+        match src {
+            Ok(src) => crate::lp::shape_shader(s.id, &src, &values, &textures, version),
+            Err(why) => eprintln!("shader(): can't run on libprocessing: {why}"),
+        }
+        return;
+    }
+    *ACTIVE.lock() = Some(s);
+}
+/// reset_shader(): shapes are plainly filled again.
+pub fn reset_shader() {
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() { crate::lp::reset_shape_shader(); return; }
+    *ACTIVE.lock() = None;
+}
+#[inline] pub fn resetShader() { reset_shader() }
+
+/// The shader shapes are drawn with now, ready to run (software renderer).
+pub(crate) fn active_cpu(w: usize, h: usize) -> Option<(glsl::Cpu, Vec<(usize, usize, Vec<u32>)>)> {
+    let s = (*ACTIVE.lock())?;
+    let all = shaders().lock();
+    let e = all.get(s.id - 1)?;
+    let mut cpu = e.cpu.clone();
+    let mut images = Vec::new();
+    for (name, id) in &e.textures {
+        let (iw, ih) = crate::render::image_size(*id);
+        let px: Vec<u32> = crate::render::image_pixels(*id).iter().map(|c| {
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+            (b(c.a) << 24) | (b(c.r) << 16) | (b(c.g) << 8) | b(c.b)
+        }).collect();
+        images.push((iw as usize, ih as usize, px));
+        cpu.set_uniform(name, &[images.len() as f32]);
+    }
+    if !e.values.contains_key("texOffset") { cpu.set_uniform("texOffset", &[1.0 / w as f32, 1.0 / h as f32]); }
+    if !e.values.contains_key("resolution") { cpu.set_uniform("resolution", &[w as f32, h as f32]); }
+    Some((cpu, images))
 }

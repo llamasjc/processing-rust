@@ -857,7 +857,33 @@ mod render {
     /// when its centre is inside, and is written exactly once, so shapes that
     /// share an edge don't overlap and translucent fills have no seams.
     fn fill_poly(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], col: Color) {
+        if let Some((cpu, images)) = crate::shader::active_cpu(w, h) { return fill_poly_shaded(buf, w, h, pts, col, &cpu, &images); }
         if smooth_on() { fill_poly_smooth(buf, w, h, pts, col) } else { fill_poly_hard(buf, w, h, pts, col) }
+    }
+    /// A fill with shader() on: find which pixels the shape covers (and how
+    /// much, at smooth edges), then let the shader color each of them.
+    fn fill_poly_shaded(buf: &mut Vec<u32>, w: usize, h: usize, pts: &[(f32, f32)], col: Color,
+                        cpu: &crate::glsl::Cpu, images: &[(usize, usize, Vec<u32>)]) {
+        let mut cover = vec![0u32; w * h];
+        let (old_mode, old_alpha) = (BLEND_MODE.swap(0, Ordering::Relaxed), ALPHA_TARGET.swap(false, Ordering::Relaxed));
+        let white = Color::from_rgba(1.0, 1.0, 1.0, 1.0);
+        if smooth_on() { fill_poly_smooth(&mut cover, w, h, pts, white) } else { fill_poly_hard(&mut cover, w, h, pts, white) }
+        BLEND_MODE.store(old_mode, Ordering::Relaxed);
+        ALPHA_TARGET.store(old_alpha, Ordering::Relaxed);
+        let mut at = Vec::new();
+        let mut amount = Vec::new();
+        for (i, p) in cover.iter().enumerate() {
+            let k = (p >> 16) & 255;
+            if k > 0 { at.push((i % w, i / w)); amount.push(k as f32 / 255.0); }
+        }
+        if at.is_empty() { return; }
+        let src: Vec<u32> = buf.iter().map(|p| 0xFF00_0000 | (p & 0x00FF_FFFF)).collect();
+        let out = cpu.run_points(w, h, &src, images, &at, [col.r, col.g, col.b, col.a]);
+        for ((&(x, y), k), c) in at.iter().zip(&amount).zip(out) {
+            let Some(c) = c else { continue };
+            let i = y * w + x;
+            buf[i] = blend(buf[i], Color::from_rgba(c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0), (c[3] * k).clamp(0.0, 1.0)));
+        }
     }
 
     /// Anti-aliased fill. Each pixel row is sampled on SUB lines; along a
@@ -4884,7 +4910,8 @@ pub fn random_gaussian() -> f32 {
 // Files, JSON and tables (see data.rs).
 mod glsl;
 mod shader;
-pub use shader::{PShader, load_shader, loadShader, load_shader_vf, shader_from_source, UniformValue, FilterKind};
+pub use shader::{PShader, load_shader, loadShader, load_shader_vf, shader_from_source, UniformValue, FilterKind,
+                 shader, reset_shader, resetShader};
 mod extra;
 pub use extra::*;
 mod data;

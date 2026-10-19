@@ -809,6 +809,34 @@ pub fn compile(prog: &Program) -> Result<Cpu, String> {
 
 enum Flow { Go, Brk, Cont, Ret(Val), Discard }
 
+/// See Cpu::one_pixel.
+pub struct OnePixel<'a> {
+    cpu: &'a Cpu,
+    w: usize,
+    h: usize,
+    src: Vec<u32>,
+    images: Vec<(usize, usize, Vec<u32>)>,
+    g: std::cell::RefCell<(Vec<Val>, Vec<Val>)>,
+}
+impl OnePixel<'_> {
+    /// The shader's color at pixel (x, y) for a shape of color `vert`, or
+    /// None if it discarded the pixel.
+    pub fn color(&self, x: usize, y: usize, vert: [f32; 4]) -> Option<[f32; 4]> {
+        let (w, h) = (self.w, self.h);
+        let ctx = Ctx { w, h, px: &self.src, images: &self.images };
+        let mut st = self.g.borrow_mut();
+        let (g, frame) = &mut *st;
+        g[G_FRAGCOORD] = Val::vec(&[x as f32 + 0.5, h.saturating_sub(1 + y) as f32 + 0.5, 0.0, 1.0]);
+        g[G_TEXCOORD] = Val::vec(&[(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, 0.0, 1.0]);
+        g[G_VERTCOLOR] = Val::vec(&vert);
+        g[G_FRAGCOLOR] = Val::vec(&vert);
+        match self.cpu.exec_block(&self.cpu.funcs[self.cpu.main].body, frame, g, &ctx) {
+            Flow::Discard => None,
+            _ => { let c = g[G_FRAGCOLOR].v; Some([c[0], c[1], c[2], c[3]]) }
+        }
+    }
+}
+
 /// What a running shader can see: the canvas to sample.
 pub struct Ctx<'a> { pub w: usize, pub h: usize, pub px: &'a [u32], pub images: &'a [(usize, usize, Vec<u32>)] }
 
@@ -918,6 +946,50 @@ impl Cpu {
                 });
             }
         });
+    }
+
+    /// Runs the shader for some pixels of a shape (shader() in Processing):
+    /// vertColor is the fill, the canvas `src` is what texture2D sees. None
+    /// for a pixel the shader discarded.
+    pub fn run_points(&self, w: usize, h: usize, src: &[u32], images: &[(usize, usize, Vec<u32>)],
+                      pts: &[(usize, usize)], vert_color: [f32; 4]) -> Vec<Option<[f32; 4]>> {
+        let ctx = Ctx { w, h, px: src, images };
+        let mut g = self.globals.clone();
+        for (slot, e) in &self.global_init { let v = self.eval(e, &mut [], &mut g, &ctx); g[*slot] = v; }
+        let mut out = vec![None; pts.len()];
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
+        let per = pts.len().div_ceil(threads).max(256);
+        std::thread::scope(|s| {
+            for (chunk, outs) in pts.chunks(per).zip(out.chunks_mut(per)) {
+                let (ctx, g0) = (&ctx, &g);
+                s.spawn(move || {
+                    let mut g = g0.clone();
+                    let mut frame = vec![Val::zero(Ty::Float); self.funcs[self.main].slots];
+                    for (&(x, y), o) in chunk.iter().zip(outs.iter_mut()) {
+                        g[G_FRAGCOORD] = Val::vec(&[x as f32 + 0.5, (h - 1 - y) as f32 + 0.5, 0.0, 1.0]);
+                        g[G_TEXCOORD] = Val::vec(&[(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, 0.0, 1.0]);
+                        g[G_VERTCOLOR] = Val::vec(&vert_color);
+                        g[G_FRAGCOLOR] = Val::vec(&vert_color);
+                        *o = match self.exec_block(&self.funcs[self.main].body, &mut frame, &mut g, ctx) {
+                            Flow::Discard => None,
+                            _ => { let c = g[G_FRAGCOLOR].v; Some([c[0], c[1], c[2], c[3]]) }
+                        };
+                    }
+                });
+            }
+        });
+        out
+    }
+
+    /// A shader ready to color one pixel at a time (3D triangles).
+    pub fn one_pixel(&self, w: usize, h: usize, src: Vec<u32>, images: Vec<(usize, usize, Vec<u32>)>) -> OnePixel<'_> {
+        let mut g = self.globals.clone();
+        {
+            let ctx = Ctx { w, h, px: &src, images: &images };
+            for (slot, e) in &self.global_init { let v = self.eval(e, &mut [], &mut g, &ctx); g[*slot] = v; }
+        }
+        let frame = vec![Val::zero(Ty::Float); self.funcs[self.main].slots];
+        OnePixel { cpu: self, w, h, src, images, g: std::cell::RefCell::new((g, frame)) }
     }
 
     fn exec_block(&self, b: &[S], f: &mut [Val], g: &mut Vec<Val>, ctx: &Ctx) -> Flow {
@@ -1144,7 +1216,12 @@ fn wname(n: &str) -> String {
     if WGSL_RESERVED.contains(&n) || n.starts_with("__") { format!("g_{n}") } else { n.to_string() }
 }
 
+/// What the WGSL is for: a filter over the canvas, or a material for shapes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Target { Filter, Material }
+
 struct W<'a> {
+    target: Target,
     prog: &'a Program,
     sc: Scope,
     uniforms: HashMap<String, Ty>,
@@ -1177,10 +1254,12 @@ impl W<'_> {
             "gl_FragColor" => "glsl_frag_color".into(),
             "gl_FragCoord" => "glsl_frag_coord".into(),
             "vertTexCoord" => "glsl_tex_coord".into(),
-            "vertColor" => "vec4<f32>(1.0)".into(),
+            "vertColor" => if self.target == Target::Material { "glsl_vert_color".into() } else { "vec4<f32>(1.0)".into() },
             _ if self.uniforms.contains_key(n) && !self.sc.vars.iter().skip(1).any(|m| m.contains_key(n)) => match n {
-                "texOffset" => "texel_size()".into(),
-                "resolution" => "resolution()".into(),
+                "texOffset" if self.target == Target::Filter => "texel_size()".into(),
+                "resolution" if self.target == Target::Filter => "resolution()".into(),
+                "texOffset" => "(1.0 / params.glsl_resolution)".into(),
+                "resolution" => "params.glsl_resolution".into(),
                 _ => match self.uniforms[n] { Ty::Bool => format!("(params.{n} != 0)"), _ => format!("params.{n}") },
             },
             _ if self.ptr_params.iter().any(|p| p == n) => format!("(*{})", wname(n)),
@@ -1262,9 +1341,9 @@ impl W<'_> {
             "texture2D" | "texture" => {
                 let uv = arg_as(self, 1, Ty::Vec(2))?;
                 match args.first() {
-                    Some(Expr::Var(s)) if s == "texture" => format!("glsl_sample({uv})"),
+                    Some(Expr::Var(s)) if s == "texture" && self.target == Target::Filter => format!("glsl_sample({uv})"),
                     Some(Expr::Var(s)) if self.uniforms.get(s.as_str()) == Some(&Ty::Sampler) =>
-                        format!("textureSampleLevel(tex_{s}, texture_sampler, {uv}, 0.0)"),
+                        format!("textureSampleLevel(tex_{s}, {}, {uv}, 0.0)", if self.target == Target::Filter { "texture_sampler".to_string() } else { format!("smp_{s}") }),
                     _ => return Err("texture2D() takes a sampler2D uniform".into()),
                 }
             }
@@ -1425,13 +1504,28 @@ impl W<'_> {
 /// to_wgsl(program): a libprocessing filter that does what the GLSL shader does.
 /// Uniforms other than texture, texOffset and resolution become fields of
 /// `params`, settable by their own names.
-pub fn to_wgsl(prog: &Program) -> Result<String, String> {
+pub fn to_wgsl(prog: &Program) -> Result<String, String> { to_wgsl_for(prog, Target::Filter) }
+
+/// to_wgsl_for(program, target): as a filter, or as a material for shapes
+/// (shader() in Processing), where vertColor is the shape's fill and
+/// vertTexCoord its texture coordinates.
+pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
     check(prog)?;
-    let mut w = W { prog, sc: Scope { vars: vec![HashMap::new()] }, uniforms: HashMap::new(), ptr_params: Vec::new(), out: String::new(), tmp: 0 };
-    w.out.push_str("import processing::filter::{screen_texture, texture_sampler, texel_size, resolution, FullscreenVertexOutput};\n\n");
-    let fields: Vec<(Ty, String)> = prog.uniforms.iter()
+    let mut w = W { target, prog, sc: Scope { vars: vec![HashMap::new()] }, uniforms: HashMap::new(), ptr_params: Vec::new(), out: String::new(), tmp: 0 };
+    let group = if target == Target::Filter { 1 } else { 3 };
+    if target == Target::Filter {
+        w.out.push_str("import processing::filter::{screen_texture, texture_sampler, texel_size, resolution, FullscreenVertexOutput};\n\n");
+    } else {
+        w.out.push_str("import processing::VertexOutput;\n\n");
+    }
+    let mut fields: Vec<(Ty, String)> = prog.uniforms.iter()
         .filter(|(t, n)| *t != Ty::Sampler && n != "texOffset" && n != "resolution")
         .cloned().collect();
+    // a material doesn't know the canvas size: it's a uniform of its own
+    if target == Target::Material {
+        fields.push((Ty::Vec(2), "glsl_resolution".into()));
+        fields.push((Ty::Vec(4), "glsl_fill".into()));
+    }
     for (t, n) in &prog.uniforms {
         w.uniforms.insert(n.clone(), *t);
         w.sc.set(n, *t);
@@ -1443,18 +1537,25 @@ pub fn to_wgsl(prog: &Program) -> Result<String, String> {
             let ty = if *t == Ty::Bool { "i32".to_string() } else { t.wgsl() };
             w.out.push_str(&format!("    {n}: {ty},\n"));
         }
-        w.out.push_str("}\n@group(1) @binding(0) var<uniform> params: GlslParams;\n\n");
+        w.out.push_str(&format!("}}\n@group({group}) @binding(0) var<uniform> params: GlslParams;\n\n"));
     }
-    // images set as uniforms: one texture each, named after the uniform
+    // images set as uniforms: one texture each, named after the uniform (and
+    // its own sampler in a material)
     let mut binding = 1;
     for (t, n) in &prog.uniforms {
-        if *t == Ty::Sampler && n != "texture" {
-            w.out.push_str(&format!("@group(1) @binding({binding}) var tex_{n}: texture_2d<f32>;\n"));
+        if *t == Ty::Sampler && (n != "texture" || target == Target::Material) {
+            w.out.push_str(&format!("@group({group}) @binding({binding}) var tex_{n}: texture_2d<f32>;\n"));
             binding += 1;
+            if target == Target::Material {
+                w.out.push_str(&format!("@group({group}) @binding({binding}) var smp_{n}: sampler;\n"));
+                binding += 1;
+            }
         }
     }
-    w.out.push_str("var<private> glsl_frag_color: vec4<f32>;\nvar<private> glsl_frag_coord: vec4<f32>;\nvar<private> glsl_tex_coord: vec4<f32>;\n");
-    w.out.push_str("fn glsl_sample(uv: vec2<f32>) -> vec4<f32> { return textureSampleLevel(screen_texture, texture_sampler, uv, 0.0); }\n");
+    w.out.push_str("var<private> glsl_frag_color: vec4<f32>;\nvar<private> glsl_frag_coord: vec4<f32>;\nvar<private> glsl_tex_coord: vec4<f32>;\nvar<private> glsl_vert_color: vec4<f32>;\n");
+    if target == Target::Filter {
+        w.out.push_str("fn glsl_sample(uv: vec2<f32>) -> vec4<f32> { return textureSampleLevel(screen_texture, texture_sampler, uv, 0.0); }\n");
+    }
     w.out.push_str("fn glsl_mod(x: f32, y: f32) -> f32 { return x - y * floor(x / y); }\n");
     for n in 2..=4 { w.out.push_str(&format!("fn glsl_mod{n}(x: vec{n}<f32>, y: vec{n}<f32>) -> vec{n}<f32> {{ return x - y * floor(x / y); }}\n")); }
     for (t, n, _, _) in &prog.globals {
@@ -1481,9 +1582,17 @@ pub fn to_wgsl(prog: &Program) -> Result<String, String> {
         w.out.push_str("}\n\n");
         w.sc.vars.pop();
     }
-    w.out.push_str("@fragment\nfn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {\n");
-    w.out.push_str("    glsl_frag_coord = vec4<f32>(in.position.x, resolution().y - in.position.y, in.position.z, 1.0);\n");
-    w.out.push_str("    glsl_tex_coord = vec4<f32>(in.uv, 0.0, 1.0);\n");
+    if target == Target::Filter {
+        w.out.push_str("@fragment\nfn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {\n");
+        w.out.push_str("    glsl_frag_coord = vec4<f32>(in.position.x, resolution().y - in.position.y, in.position.z, 1.0);\n");
+        w.out.push_str("    glsl_tex_coord = vec4<f32>(in.uv, 0.0, 1.0);\n");
+        w.out.push_str("    glsl_vert_color = vec4<f32>(1.0);\n");
+    } else {
+        w.out.push_str("@fragment\nfn fragment(in: VertexOutput) -> @location(0) vec4<f32> {\n");
+        w.out.push_str("    glsl_frag_coord = vec4<f32>(in.position.x, params.glsl_resolution.y - in.position.y, in.position.z, 1.0);\n");
+        w.out.push_str("    glsl_tex_coord = vec4<f32>(in.uv, 0.0, 1.0);\n");
+        w.out.push_str("    glsl_vert_color = params.glsl_fill;\n");
+    }
     w.out.push_str("    glsl_frag_color = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n");
     let globals = prog.globals.clone();
     for (t, n, init, _) in &globals {
