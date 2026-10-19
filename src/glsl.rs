@@ -1376,13 +1376,13 @@ const WGSL_RESERVED: &[&str] = &["array", "atomic", "bitcast", "break", "case", 
     "sampler", "storage", "struct", "switch", "texture", "type", "uniform", "var", "while", "workgroup", "alias", "diagnostic",
     "requires", "module", "self", "super", "target", "params", "sample", "fragment", "in", "out", "f32", "i32", "u32", "bool"];
 
-/// A GLSL name that is also a WGSL word gets a prefix; uniforms keep theirs
-/// only when they can.
 thread_local! {
     /// Put before every name of the shader being written: "vs_" for the
     /// vertex part when both parts go in one WGSL module.
     static WPREFIX: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
+/// A GLSL name that is also a WGSL word gets a prefix; uniforms keep theirs
+/// only when they can.
 fn wname(n: &str) -> String {
     let p = WPREFIX.with(|c| c.get());
     if WGSL_RESERVED.contains(&n) || n.starts_with("__") { format!("g_{p}{n}") } else { format!("{p}{n}") }

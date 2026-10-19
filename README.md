@@ -238,6 +238,17 @@ renderer and on libprocessing that is every filled shape, 2D and 3D. (On
 libprocessing a shape drawn with a shader is rendered as soon as it's drawn,
 so each keeps its own fill.)
 
+`load_shader_vf("frag.glsl", "vert.glsl")` (or `shader_from_source_vf(frag,
+vert)`) adds a vertex shader. It gets Processing's attributes (`position`,
+`color`, `normal`, `texCoord`) and matrices (`transform`, `modelview`,
+`projection`, `normalMatrix`, `texMatrix`), writes `gl_Position`, and its
+varyings reach the fragment shader, blended across each triangle. While one is
+active every shape goes through the 3D path, as in P3D. On the default renderer
+it also gets `lightCount`, `lightPosition[8]` and the other light uniforms. On
+libprocessing it needs the lp-fork (its `processing::vertex` module); there
+`color` is the shape's fill, `normalMatrix` assumes even scaling, varyings are
+floats or vecs, and the vertex shader can't read images yet.
+
 Supported: float, int, bool, vec2-4, mat2-4, functions (with `out` and `inout`
 parameters), if / for / while / do, `discard`, `const` and `#define`, the
 usual built-in functions, and images as `sampler2D` uniforms
