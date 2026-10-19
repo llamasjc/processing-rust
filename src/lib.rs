@@ -4910,7 +4910,7 @@ pub fn random_gaussian() -> f32 {
 // Files, JSON and tables (see data.rs).
 mod glsl;
 mod shader;
-pub use shader::{PShader, load_shader, loadShader, load_shader_vf, shader_from_source, UniformValue, FilterKind,
+pub use shader::{PShader, load_shader, loadShader, load_shader_vf, shader_from_source, shader_from_source_vf, UniformValue, FilterKind,
                  shader, reset_shader, resetShader};
 mod extra;
 pub use extra::*;

@@ -221,6 +221,8 @@ pub struct Program {
     pub uniforms: Vec<(Ty, String)>,
     pub globals: Vec<(Ty, String, Option<Expr>, bool)>, // const?
     pub funcs: Vec<Func>,
+    /// varyings, attributes, ins and outs that aren't built in, in order
+    pub varyings: Vec<(Ty, String)>,
 }
 
 struct P { t: Vec<(Tok, usize)>, i: usize }
@@ -275,7 +277,7 @@ impl P {
         while *self.peek() != Tok::End {
             if self.eat(";") { continue; }
             if self.is_word("precision") { while !self.eat(";") { if *self.peek() == Tok::End { break; } self.i += 1; } continue; }
-            let (uniform, constant, varying, _) = self.qualifiers();
+            let (uniform, constant, varying, out_q) = self.qualifiers();
             let Some(ty) = self.ty() else { return self.err("expected a type") };
             let name = self.ident()?;
             if self.is("(") {
@@ -291,7 +293,14 @@ impl P {
                 break;
             }
             for (n, init, t) in names {
-                if varying { continue; } // vertTexCoord and vertColor are built in
+                if varying || out_q {
+                    // vertTexCoord, vertColor and the gl_ names are built in;
+                    // the rest are plain globals the stages pass along
+                    if builtin_var(&n).is_some() { continue; }
+                    p.varyings.push((t, n.clone()));
+                    p.globals.push((t, n, None, false));
+                    continue;
+                }
                 if uniform { p.uniforms.push((t, n)); } else { p.globals.push((t, n, init, constant)); }
             }
         }
@@ -520,7 +529,8 @@ fn swizzle_index(c: char) -> Option<usize> {
 /// The built-in names a filter shader can use.
 fn builtin_var(n: &str) -> Option<Ty> {
     Some(match n {
-        "gl_FragColor" | "gl_FragCoord" | "vertTexCoord" | "vertColor" => Ty::Vec(4),
+        "gl_FragColor" | "gl_FragCoord" | "vertTexCoord" | "vertColor" | "gl_Position" => Ty::Vec(4),
+        "gl_PointSize" => Ty::Float,
         _ => return None,
     })
 }
@@ -699,6 +709,12 @@ pub struct Cpu {
     globals: Vec<Val>,          // starting values
     global_init: Vec<(usize, C)>,
     pub uniforms: HashMap<String, (usize, Ty)>,
+    /// every global by name (built-ins, uniforms, varyings, the rest)
+    pub names: HashMap<String, (usize, Ty)>,
+    /// the varyings / ins / outs the shader declared
+    pub varyings: Vec<String>,
+    /// uniforms the sketch set itself
+    pub set_names: Vec<String>,
 }
 
 // builtin variables live in the first global slots
@@ -706,6 +722,9 @@ const G_FRAGCOLOR: usize = 0;
 const G_FRAGCOORD: usize = 1;
 const G_TEXCOORD: usize = 2;
 const G_VERTCOLOR: usize = 3;
+const G_POSITION: usize = 4;
+const BUILTINS: [(&str, Ty); 6] = [("gl_FragColor", Ty::Vec(4)), ("gl_FragCoord", Ty::Vec(4)), ("vertTexCoord", Ty::Vec(4)),
+    ("vertColor", Ty::Vec(4)), ("gl_Position", Ty::Vec(4)), ("gl_PointSize", Ty::Float)];
 
 struct Comp<'a> {
     prog: &'a Program,
@@ -884,10 +903,10 @@ fn swz(f: &str) -> Acc {
 pub fn compile(prog: &Program) -> Result<Cpu, String> {
     check(prog)?;
     let mut globals = HashMap::new();
-    for (i, n) in ["gl_FragColor", "gl_FragCoord", "vertTexCoord", "vertColor"].iter().enumerate() { globals.insert(n.to_string(), (i, Ty::Vec(4))); }
-    let mut n = 4;
+    let mut start = Vec::new();
+    for (i, (n, t)) in BUILTINS.iter().enumerate() { globals.insert(n.to_string(), (i, *t)); start.push(Val::zero(*t)); }
+    let mut n = BUILTINS.len();
     let mut uniforms = HashMap::new();
-    let mut start = vec![Val::zero(Ty::Vec(4)); 4];
     for (t, name) in &prog.uniforms {
         globals.insert(name.clone(), (n, *t));
         uniforms.insert(name.clone(), (n, *t));
@@ -920,7 +939,8 @@ pub fn compile(prog: &Program) -> Result<Cpu, String> {
         funcs.push(CFunc { slots: c.nslots, params: f.params.len(), ret: f.ret, body });
     }
     let main = c.fn_index["main"];
-    Ok(Cpu { funcs, main, globals: start, global_init, uniforms })
+    let varyings = prog.varyings.iter().map(|(_, n)| n.clone()).collect();
+    Ok(Cpu { funcs, main, globals: start, global_init, uniforms, names: c.globals, varyings, set_names: Vec::new() })
 }
 
 enum Flow { Go, Brk, Cont, Ret(Val), Discard }
@@ -937,7 +957,9 @@ pub struct OnePixel<'a> {
 impl OnePixel<'_> {
     /// The shader's color at pixel (x, y) for a shape of color `vert`, or
     /// None if it discarded the pixel.
-    pub fn color(&self, x: usize, y: usize, vert: [f32; 4]) -> Option<[f32; 4]> {
+    pub fn color(&self, x: usize, y: usize, vert: [f32; 4]) -> Option<[f32; 4]> { self.color_with(x, y, vert, &[]) }
+    /// color() with values the vertex stage passed: (global slot, values).
+    pub fn color_with(&self, x: usize, y: usize, vert: [f32; 4], vary: &[(usize, Ty, &[f32])]) -> Option<[f32; 4]> {
         let (w, h) = (self.w, self.h);
         let ctx = Ctx { w, h, px: &self.src, images: &self.images };
         let mut st = self.g.borrow_mut();
@@ -945,7 +967,8 @@ impl OnePixel<'_> {
         g[G_FRAGCOORD] = Val::vec(&[x as f32 + 0.5, h.saturating_sub(1 + y) as f32 + 0.5, 0.0, 1.0]);
         g[G_TEXCOORD] = Val::vec(&[(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, 0.0, 1.0]);
         g[G_VERTCOLOR] = Val::vec(&vert);
-        g[G_FRAGCOLOR] = Val::vec(&vert);
+        for (slot, t, v) in vary { let mut x = Val::zero(*t); let k = t.size().max(1).min(16); x.v[..k.min(v.len())].copy_from_slice(&v[..k.min(v.len())]); g[*slot] = x; }
+        g[G_FRAGCOLOR] = g[G_VERTCOLOR];
         match self.cpu.exec_block(&self.cpu.funcs[self.cpu.main].body, frame, g, &ctx) {
             Flow::Discard => None,
             _ => { let c = g[G_FRAGCOLOR].v; Some([c[0], c[1], c[2], c[3]]) }
@@ -1020,6 +1043,7 @@ fn convert(t: Ty, args: &[Val]) -> Val {
 impl Cpu {
     pub fn set_uniform(&mut self, name: &str, vals: &[f32]) -> bool {
         let Some(&(slot, t)) = self.uniforms.get(name) else { return false };
+        if !self.set_names.iter().any(|n| n == name) && !self.funcs.is_empty() { self.set_names.push(name.to_string()); }
         if let Ty::Arr(..) = t {
             // the numbers fill the items in turn
             let et = t.elem();
@@ -1354,8 +1378,14 @@ const WGSL_RESERVED: &[&str] = &["array", "atomic", "bitcast", "break", "case", 
 
 /// A GLSL name that is also a WGSL word gets a prefix; uniforms keep theirs
 /// only when they can.
+thread_local! {
+    /// Put before every name of the shader being written: "vs_" for the
+    /// vertex part when both parts go in one WGSL module.
+    static WPREFIX: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
 fn wname(n: &str) -> String {
-    if WGSL_RESERVED.contains(&n) || n.starts_with("__") { format!("g_{n}") } else { n.to_string() }
+    let p = WPREFIX.with(|c| c.get());
+    if WGSL_RESERVED.contains(&n) || n.starts_with("__") { format!("g_{p}{n}") } else { format!("{p}{n}") }
 }
 
 /// What the WGSL is for: a filter over the canvas, or a material for shapes.
@@ -1395,6 +1425,8 @@ impl W<'_> {
         match n {
             "gl_FragColor" => "glsl_frag_color".into(),
             "gl_FragCoord" => "glsl_frag_coord".into(),
+            "gl_Position" => "glsl_position".into(),
+            "gl_PointSize" => "glsl_point_size".into(),
             "vertTexCoord" => "glsl_tex_coord".into(),
             "vertColor" => if self.target == Target::Material { "glsl_vert_color".into() } else { "vec4<f32>(1.0)".into() },
             _ if self.uniforms.contains_key(n) && !self.sc.vars.iter().skip(1).any(|m| m.contains_key(n)) => match n {
@@ -1658,15 +1690,52 @@ pub fn to_wgsl(prog: &Program) -> Result<String, String> { to_wgsl_for(prog, Tar
 /// (shader() in Processing), where vertColor is the shape's fill and
 /// vertTexCoord its texture coordinates.
 pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
+    WPREFIX.with(|c| c.set(""));
+    emit_wgsl(prog, target, None)
+}
+
+/// The matrices Processing gives a vertex shader; on the GPU they come from
+/// the camera and the shape's own transform.
+const VERTEX_MATRICES: [&str; 8] = ["transform", "modelview", "modelviewMatrix", "projection", "projectionMatrix",
+    "projmodelviewMatrix", "normalMatrix", "texMatrix"];
+
+/// A material with a vertex stage: the fragment and vertex shaders as one
+/// WGSL module for libprocessing.
+pub fn to_wgsl_material_vf(frag: &Program, vert: &Program) -> Result<String, String> {
+    check(vert)?;
+    if vert.uniforms.iter().any(|(t, _)| *t == Ty::Sampler) { return Err("a vertex shader can't read images on libprocessing yet".into()); }
+    // the matrices are made in the vertex stage, not set by the sketch
+    let mut v = vert.clone();
+    let mats: Vec<(Ty, String)> = v.uniforms.iter().filter(|(_, n)| VERTEX_MATRICES.contains(&n.as_str())).cloned().collect();
+    v.uniforms.retain(|(_, n)| !VERTEX_MATRICES.contains(&n.as_str()));
+    for (t, n) in mats { v.globals.push((t, n, None, false)); }
+    for (t, n) in &frag.varyings {
+        if v.varyings.iter().any(|(_, m)| m == n) && !matches!(t, Ty::Float | Ty::Vec(_)) {
+            return Err(format!("varying `{n}`: only float and vec varyings work on libprocessing"));
+        }
+    }
+    let r = emit_wgsl(frag, Target::Material, Some(&v));
+    WPREFIX.with(|c| c.set(""));
+    r
+}
+
+fn emit_wgsl(prog: &Program, target: Target, vert: Option<&Program>) -> Result<String, String> {
     check(prog)?;
+    WPREFIX.with(|c| c.set(""));
     let mut w = W { target, prog, sc: Scope { vars: vec![HashMap::new()] }, uniforms: HashMap::new(), ptr_params: Vec::new(), out: String::new(), tmp: 0 };
     let group = if target == Target::Filter { 1 } else { 3 };
     if target == Target::Filter {
         w.out.push_str("import processing::filter::{screen_texture, texture_sampler, texel_size, resolution, FullscreenVertexOutput};\n\n");
+    } else if vert.is_some() {
+        w.out.push_str("import processing::vertex::{view, world_from_local};\n\n");
     } else {
         w.out.push_str("import processing::VertexOutput;\n\n");
     }
-    let mut fields: Vec<(Ty, String)> = prog.uniforms.iter()
+    let mut all_uniforms = prog.uniforms.clone();
+    if let Some(v) = vert {
+        for u in &v.uniforms { if !all_uniforms.iter().any(|(_, n)| *n == u.1) { all_uniforms.push(u.clone()); } }
+    }
+    let mut fields: Vec<(Ty, String)> = all_uniforms.iter()
         .filter(|(t, n)| *t != Ty::Sampler && n != "texOffset" && n != "resolution")
         .cloned().collect();
     // a material doesn't know the canvas size: it's a uniform of its own
@@ -1674,7 +1743,7 @@ pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
         fields.push((Ty::Vec(2), "glsl_resolution".into()));
         fields.push((Ty::Vec(4), "glsl_fill".into()));
     }
-    for (t, n) in &prog.uniforms {
+    for (t, n) in &all_uniforms {
         w.uniforms.insert(n.clone(), *t);
         w.sc.set(n, *t);
     }
@@ -1708,7 +1777,7 @@ pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
             }
         }
     }
-    w.out.push_str("var<private> glsl_frag_color: vec4<f32>;\nvar<private> glsl_frag_coord: vec4<f32>;\nvar<private> glsl_tex_coord: vec4<f32>;\nvar<private> glsl_vert_color: vec4<f32>;\n");
+    w.out.push_str("var<private> glsl_frag_color: vec4<f32>;\nvar<private> glsl_frag_coord: vec4<f32>;\nvar<private> glsl_tex_coord: vec4<f32>;\nvar<private> glsl_vert_color: vec4<f32>;\nvar<private> glsl_position: vec4<f32>;\nvar<private> glsl_point_size: f32;\n");
     if target == Target::Filter {
         w.out.push_str("fn glsl_sample(uv: vec2<f32>) -> vec4<f32> { return textureSampleLevel(screen_texture, texture_sampler, uv, 0.0); }\n");
     }
@@ -1718,7 +1787,7 @@ pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
         w.out.push_str(&format!("var<private> {}: {};\n", wname(n), t.wgsl()));
         w.sc.set(n, *t);
     }
-    for (t, n) in &prog.uniforms {
+    for (t, n) in &all_uniforms {
         if let Ty::Arr(..) = t { w.out.push_str(&format!("var<private> glsl_u_{n}: {};\n", t.wgsl())); }
     }
     w.out.push('\n');
@@ -1741,7 +1810,95 @@ pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
         w.out.push_str("}\n\n");
         w.sc.vars.pop();
     }
-    if target == Target::Filter {
+    // the vertex part, its names starting vs_
+    let shared: Vec<(Ty, String)> = match vert {
+        Some(v) => prog.varyings.iter().filter(|(_, n)| v.varyings.iter().any(|(_, m)| m == n)).cloned().collect(),
+        None => Vec::new(),
+    };
+    if let Some(v) = vert {
+        let mut vw = W { target, prog: v, sc: Scope { vars: vec![HashMap::new()] }, uniforms: w.uniforms.clone(), ptr_params: Vec::new(), out: String::new(), tmp: 0 };
+        for (t, n) in &all_uniforms { vw.sc.set(n, *t); }
+        WPREFIX.with(|c| c.set("vs_"));
+        for (t, n, _, _) in &v.globals {
+            vw.out.push_str(&format!("var<private> {}: {};\n", wname(n), t.wgsl()));
+            vw.sc.set(n, *t);
+        }
+        for f in v.funcs.iter().filter(|f| !f.body.is_empty()) {
+            vw.sc.vars.push(HashMap::new());
+            vw.ptr_params.clear();
+            let mut ps = Vec::new();
+            for (t, n, out) in &f.params {
+                vw.sc.set(n, *t);
+                if *out { vw.ptr_params.push(n.clone()); ps.push(format!("{}: ptr<function, {}>", wname(n), t.wgsl())); }
+                else { ps.push(format!("{}_in: {}", wname(n), t.wgsl())); }
+            }
+            vw.sc.set("__ret", f.ret);
+            let name = if f.name == "main" { "glsl_vmain".to_string() } else { wname(&f.name) };
+            let ret = if f.ret == Ty::Void { String::new() } else { format!(" -> {}", f.ret.wgsl()) };
+            vw.out.push_str(&format!("fn {name}({}){ret} {{\n", ps.join(", ")));
+            for (t, n, out) in &f.params { if !*out { let line = format!("var {0}: {1} = {0}_in;", wname(n), t.wgsl()); vw.line(1, &line); } }
+            vw.block(&f.body, 1)?;
+            vw.out.push_str("}\n\n");
+            vw.sc.vars.pop();
+        }
+        // what the vertex stage gets and gives
+        let has = |n: &str| v.globals.iter().any(|g| g.1 == n);
+        let ty_of = |n: &str| v.globals.iter().find(|g| g.1 == n).map(|g| g.0);
+        vw.out.push_str("struct GlslIn {\n    @builtin(instance_index) instance_index: u32,\n    @location(0) position: vec3<f32>,\n");
+        if has("normal") { vw.out.push_str("    @location(1) normal: vec3<f32>,\n"); }
+        if has("texCoord") { vw.out.push_str("    @location(2) uv: vec2<f32>,\n"); }
+        vw.out.push_str("}\nstruct GlslVary {\n    @builtin(position) position: vec4<f32>,\n    @location(0) vert_color: vec4<f32>,\n    @location(1) tex_coord: vec4<f32>,\n");
+        for (i, (t, n)) in shared.iter().enumerate() { vw.out.push_str(&format!("    @location({}) vy_{n}: {},\n", i + 2, t.wgsl())); }
+        vw.out.push_str("}\n\n@vertex\nfn vertex(in: GlslIn) -> GlslVary {\n");
+        vw.out.push_str("    let model = world_from_local(in.instance_index);\n    let mv = view.view_from_world * model;\n");
+        let fit = |e: &str, t: Option<Ty>| -> String {
+            match t { Some(Ty::Vec(3)) => format!("({e}).xyz"), Some(Ty::Vec(2)) => format!("({e}).xy"), Some(Ty::Float) => format!("({e}).x"), _ => e.to_string() }
+        };
+        let uv = if has("texCoord") { "vec4<f32>(in.uv, 0.0, 1.0)" } else { "vec4<f32>(0.0, 0.0, 0.0, 1.0)" };
+        // the fill is set for every shape; not every mesh has colors
+        let col = "params.glsl_fill";
+        for (n, e) in [("position", "vec4<f32>(in.position, 1.0)".to_string()), ("vertex", "vec4<f32>(in.position, 1.0)".to_string()),
+                       ("normal", if has("normal") { "vec4<f32>(in.normal, 0.0)".to_string() } else { "vec4<f32>(0.0, 0.0, 1.0, 0.0)".to_string() }),
+                       ("texCoord", uv.to_string()), ("color", col.to_string())] {
+            if has(n) { vw.line(1, &format!("vs_{n} = {};", fit(&e, ty_of(n)))); }
+        }
+        for (n, e) in [("transform", "view.clip_from_world * model"), ("projmodelviewMatrix", "view.clip_from_world * model"),
+                       ("modelview", "mv"), ("modelviewMatrix", "mv"), ("projection", "view.clip_from_view"),
+                       ("projectionMatrix", "view.clip_from_view"),
+                       ("normalMatrix", "mat3x3<f32>(normalize(mv[0].xyz), normalize(mv[1].xyz), normalize(mv[2].xyz))"),
+                       ("texMatrix", "mat4x4<f32>(vec4<f32>(1.0, 0.0, 0.0, 0.0), vec4<f32>(0.0, 1.0, 0.0, 0.0), vec4<f32>(0.0, 0.0, 1.0, 0.0), vec4<f32>(0.0, 0.0, 0.0, 1.0))")] {
+            if has(n) { vw.line(1, &format!("vs_{n} = {e};")); }
+        }
+        vw.line(1, &format!("glsl_vert_color = {col};"));
+        vw.line(1, &format!("glsl_tex_coord = {uv};"));
+        vw.line(1, "glsl_position = vec4<f32>(0.0, 0.0, 0.0, 1.0);");
+        for (t, n) in &all_uniforms {
+            if let Ty::Arr(..) = t {
+                let items: Vec<String> = (0..t.len()).map(|i| if t.elem() == Ty::Bool { format!("(params.{n}_{i} != 0)") } else { format!("params.{n}_{i}") }).collect();
+                vw.line(1, &format!("glsl_u_{n} = {}({});", t.wgsl(), items.join(", ")));
+            }
+        }
+        for (t, n, init, _) in &v.globals.clone() {
+            if let Some(e) = init { let x = vw.ex_as(e, *t)?; vw.line(1, &format!("{} = {x};", wname(n))); }
+        }
+        vw.line(1, "glsl_vmain();");
+        vw.line(1, "var out: GlslVary;");
+        vw.line(1, "out.position = glsl_position;");
+        vw.line(1, "out.vert_color = glsl_vert_color;");
+        vw.line(1, "out.tex_coord = glsl_tex_coord;");
+        for (_, n) in &shared { vw.line(1, &format!("out.vy_{n} = {};", wname(n))); }
+        vw.line(1, "return out;");
+        vw.out.push_str("}\n\n");
+        WPREFIX.with(|c| c.set(""));
+        w.out.push_str(&vw.out);
+    }
+    if vert.is_some() {
+        w.out.push_str("@fragment\nfn fragment(in: GlslVary) -> @location(0) vec4<f32> {\n");
+        w.out.push_str("    glsl_frag_coord = vec4<f32>(in.position.x, params.glsl_resolution.y - in.position.y, in.position.z, 1.0);\n");
+        w.out.push_str("    glsl_tex_coord = in.tex_coord;\n");
+        w.out.push_str("    glsl_vert_color = in.vert_color;\n");
+        for (_, n) in &shared { let line = format!("{} = in.vy_{n};", wname(n)); w.line(1, &line); }
+    } else if target == Target::Filter {
         w.out.push_str("@fragment\nfn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {\n");
         w.out.push_str("    glsl_frag_coord = vec4<f32>(in.position.x, resolution().y - in.position.y, in.position.z, 1.0);\n");
         w.out.push_str("    glsl_tex_coord = vec4<f32>(in.uv, 0.0, 1.0);\n");
@@ -1767,3 +1924,56 @@ pub fn to_wgsl_for(prog: &Program, target: Target) -> Result<String, String> {
     Ok(w.out)
 }
 
+
+/// A vertex shader ready to run once per corner (see Cpu::vertex).
+pub struct VertexRun<'a> {
+    cpu: &'a Cpu,
+    g: Vec<Val>,
+    frame: Vec<Val>,
+    set_by_sketch: Vec<String>,
+}
+impl VertexRun<'_> {
+    /// A uniform, unless the sketch set it with shader.set (then it stays).
+    pub fn set_uniform(&mut self, name: &str, vals: &[f32]) {
+        if self.was_set(name) || !self.cpu.uniforms.contains_key(name) { return; }
+        let mut c = Cpu { funcs: Vec::new(), main: 0, globals: std::mem::take(&mut self.g), global_init: Vec::new(),
+                          uniforms: self.cpu.uniforms.clone(), names: HashMap::new(), varyings: Vec::new(), set_names: Vec::new() };
+        c.set_uniform(name, vals);
+        self.g = c.globals;
+    }
+    pub fn was_set(&self, name: &str) -> bool { self.set_by_sketch.iter().any(|n| n == name) }
+    /// Sets an attribute (or anything global) by name before run().
+    pub fn set(&mut self, name: &str, vals: &[f32]) {
+        let Some(&(slot, t)) = self.cpu.names.get(name) else { return };
+        if matches!(t, Ty::Arr(..)) { return; }
+        let mut v = Val::zero(t);
+        for (i, x) in vals.iter().take(t.size().max(1)).enumerate() { v.v[i] = *x; }
+        self.g[slot] = v;
+    }
+    /// Runs main(); gives gl_Position and the values of `outs`, one after
+    /// another (each as many numbers as its type has).
+    pub fn run(&mut self, outs: &[String]) -> Option<([f32; 4], Vec<f32>)> {
+        let empty: [u32; 0] = [];
+        let ctx = Ctx { w: 1, h: 1, px: &empty, images: &[] };
+        let cpu = self.cpu;
+        if let Flow::Discard = cpu.exec_block(&cpu.funcs[cpu.main].body, &mut self.frame, &mut self.g, &ctx) { return None; }
+        let p = self.g[G_POSITION].v;
+        let mut o = Vec::new();
+        for n in outs {
+            if let Some(&(slot, t)) = cpu.names.get(n) { o.extend_from_slice(&self.g[slot].v[..t.size().max(1)]); }
+        }
+        Some(([p[0], p[1], p[2], p[3]], o))
+    }
+}
+impl Cpu {
+    /// Ready to run as a vertex shader.
+    pub fn vertex(&self) -> VertexRun<'_> {
+        let mut g = self.globals.clone();
+        let empty: [u32; 0] = [];
+        let ctx = Ctx { w: 1, h: 1, px: &empty, images: &[] };
+        for (slot, e) in &self.global_init { let v = self.eval(e, &mut [], &mut g, &ctx); g[*slot] = v; }
+        VertexRun { cpu: self, g, frame: vec![Val::zero(Ty::Float); self.funcs[self.main].slots], set_by_sketch: self.set_names.clone() }
+    }
+    /// A global's slot and type by name.
+    pub fn global(&self, name: &str) -> Option<(usize, Ty)> { self.names.get(name).copied() }
+}

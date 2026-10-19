@@ -13,6 +13,14 @@ use std::collections::HashMap;
 
 pub(crate) struct Entry {
     pub cpu: glsl::Cpu,
+    /// the vertex shader, when load_shader_vf gave one
+    pub vert: Option<glsl::Cpu>,
+    /// its GLSL, for libprocessing
+    #[cfg_attr(not(feature = "libprocessing"), allow(dead_code))]
+    pub vert_prog: Option<glsl::Program>,
+    /// the fragment shader's GLSL, to remake the material with a vertex stage
+    #[cfg_attr(not(feature = "libprocessing"), allow(dead_code))]
+    pub frag_prog: glsl::Program,
     #[cfg_attr(not(feature = "libprocessing"), allow(dead_code))]
     pub wgsl: Result<String, String>,
     /// the same shader as a material, for shader()
@@ -57,14 +65,21 @@ impl UniformValue for crate::Color { fn floats(&self) -> Vec<f32> { vec![self.r,
 impl PShader {
     /// set("name", value): a uniform. Numbers, bools, [f32; 2..4], tuples, colors.
     pub fn set(&self, name: &str, v: impl UniformValue) {
+        self.set_value(name, v);
+        // the shader shapes are using now takes it from the next shape on
+        #[cfg(feature = "libprocessing")]
+        if crate::lp::on() && *LP_ACTIVE.lock() == Some(*self) { shader(*self); }
+    }
+    fn set_value(&self, name: &str, v: impl UniformValue) {
         let mut all = shaders().lock();
         let Some(e) = all.get_mut(self.id.wrapping_sub(1)) else { return };
-        if !e.cpu.has_uniform(name) {
+        let in_vert = e.vert.as_ref().is_some_and(|v| v.has_uniform(name));
+        if !e.cpu.has_uniform(name) && !in_vert {
             eprintln!("{}: set(\"{name}\"): the shader has no uniform called that", e.name);
             return;
         }
         // a sampler2D takes an image; from Lua that arrives as its number
-        let sampler = e.cpu.uniforms.get(name).map(|u| u.1) == Some(glsl::Ty::Sampler);
+        let sampler = e.cpu.uniforms.get(name).or_else(|| e.vert.as_ref().and_then(|v| v.uniforms.get(name))).map(|u| u.1) == Some(glsl::Ty::Sampler);
         let img = v.image().or_else(|| if sampler { v.floats().first().map(|x| *x as u64) } else { None });
         if let Some(img) = img {
             e.textures.insert(name.to_string(), img);
@@ -94,8 +109,45 @@ pub fn load_shader(path: &str) -> PShader {
     };
     shader_from_source_named(&text, path)
 }
-/// load_shader_vf(frag, vert): the vertex shader isn't used (filters don't need one).
-pub fn load_shader_vf(frag: &str, _vert: &str) -> PShader { load_shader(frag) }
+/// load_shader_vf(frag, vert): a fragment and a vertex shader, for shader().
+/// The vertex shader gets Processing's attributes (position, color, normal,
+/// texCoord) and matrices (transform, modelview, projection, normalMatrix,
+/// texMatrix), and its varyings reach the fragment shader.
+pub fn load_shader_vf(frag: &str, vert: &str) -> PShader {
+    let s = load_shader(frag);
+    if s.id == 0 { return s; }
+    let file = if std::path::Path::new(vert).is_file() { vert.to_string() } else { format!("data/{vert}") };
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("loadShader(\"{vert}\"): {e}"); return s; }
+    };
+    let prog = match glsl::parse(&text) { Ok(p) => p, Err(e) => { eprintln!("loadShader(\"{vert}\"): {e}"); return s; } };
+    let cpu = match glsl::compile(&prog) { Ok(c) => c, Err(e) => { eprintln!("loadShader(\"{vert}\"): {e}"); return s; } };
+    let mut all = shaders().lock();
+    let e = &mut all[s.id - 1];
+    attach_vertex(e, cpu, prog);
+    s
+}
+fn attach_vertex(e: &mut Entry, cpu: glsl::Cpu, prog: glsl::Program) {
+    e.material = glsl::to_wgsl_material_vf(&e.frag_prog, &prog);
+    if std::env::var_os("PROCESSING_SHADER_DEBUG").is_some() {
+        eprintln!("── {} with its vertex shader ──\n{}", e.name, e.material.as_ref().map(|s| s.as_str()).unwrap_or_else(|e| e));
+    }
+    e.vert = Some(cpu);
+    e.vert_prog = Some(prog);
+    e.version += 1;
+}
+/// load_shader_vf with GLSL text: fragment, then vertex.
+pub fn shader_from_source_vf(frag: &str, vert: &str) -> PShader {
+    let s = shader_from_source(frag);
+    if s.id == 0 { return s; }
+    let prog = match glsl::parse(vert) { Ok(p) => p, Err(e) => { eprintln!("vertex shader: {e}"); return s; } };
+    let cpu = match glsl::compile(&prog) { Ok(c) => c, Err(e) => { eprintln!("vertex shader: {e}"); return s; } };
+    let mut all = shaders().lock();
+    let e = &mut all[s.id - 1];
+    attach_vertex(e, cpu, prog);
+    s
+}
 /// A shader from GLSL text in the sketch.
 pub fn shader_from_source(src: &str) -> PShader { shader_from_source_named(src, "shader") }
 
@@ -116,7 +168,7 @@ fn shader_from_source_named(src: &str, name: &str) -> PShader {
         eprintln!("── {name} as a material ──\n{}", material.as_ref().map(|s| s.as_str()).unwrap_or_else(|e| e));
     }
     let mut all = shaders().lock();
-    all.push(Entry { cpu, wgsl, material, values: HashMap::new(), textures: HashMap::new(), version: 0, name: name.to_string() });
+    all.push(Entry { cpu, vert: None, vert_prog: None, frag_prog: prog, wgsl, material, values: HashMap::new(), textures: HashMap::new(), version: 0, name: name.to_string() });
     PShader { id: all.len() }
 }
 #[inline] pub fn loadShader(path: &str) -> PShader { load_shader(path) }
@@ -186,6 +238,9 @@ pub(crate) fn apply(s: PShader) {
 // ── shader(): shapes drawn with a shader ─────────────────────────────────
 
 static ACTIVE: Mutex<Option<PShader>> = Mutex::new(None);
+/// The shader shapes use on libprocessing, so set() on it reaches the GPU.
+#[cfg(feature = "libprocessing")]
+static LP_ACTIVE: Mutex<Option<PShader>> = Mutex::new(None);
 
 /// shader(s): shapes drawn after it are colored by the shader (its fragment
 /// part: vertColor is the fill). reset_shader() goes back to plain fills.
@@ -198,11 +253,13 @@ pub fn shader(s: impl std::borrow::Borrow<PShader>) {
             let all = shaders().lock();
             let Some(e) = all.get(s.id - 1) else { return };
             let vals: Vec<(String, glsl::Ty, Vec<f32>)> = e.values.iter()
-                .filter_map(|(k, v)| e.cpu.uniforms.get(k).map(|(_, t)| (k.clone(), *t, v.clone()))).collect();
+                .filter_map(|(k, v)| e.cpu.uniforms.get(k).or_else(|| e.vert.as_ref().and_then(|vc| vc.uniforms.get(k)))
+                    .map(|(_, t)| (k.clone(), *t, v.clone()))).collect();
             (e.material.clone(), vals, e.textures.clone(), e.version)
         };
         let textures: Vec<(String, bevy::prelude::Entity)> = textures.iter()
             .filter_map(|(n, id)| crate::render::lp_image(*id).map(|e| (n.clone(), e))).collect();
+        *LP_ACTIVE.lock() = Some(s);
         match src {
             Ok(src) => crate::lp::shape_shader(s.id, &src, &values, &textures, version),
             Err(why) => eprintln!("shader(): can't run on libprocessing: {why}"),
@@ -214,10 +271,25 @@ pub fn shader(s: impl std::borrow::Borrow<PShader>) {
 /// reset_shader(): shapes are plainly filled again.
 pub fn reset_shader() {
     #[cfg(feature = "libprocessing")]
-    if crate::lp::on() { crate::lp::reset_shape_shader(); return; }
+    if crate::lp::on() { *LP_ACTIVE.lock() = None; crate::lp::reset_shape_shader(); return; }
     *ACTIVE.lock() = None;
 }
 #[inline] pub fn resetShader() { reset_shader() }
+
+/// The active shader's vertex stage, with its uniforms set (software renderer).
+pub(crate) fn active_vertex() -> Option<glsl::Cpu> {
+    let s = (*ACTIVE.lock())?;
+    let all = shaders().lock();
+    let e = all.get(s.id - 1)?;
+    let mut v = e.vert.clone()?;
+    for (k, vals) in &e.values { v.set_uniform(k, vals); }
+    Some(v)
+}
+/// Is a shader with a vertex stage active? Then every shape goes through 3D.
+pub(crate) fn vertex_active() -> bool {
+    let Some(s) = *ACTIVE.lock() else { return false };
+    shaders().lock().get(s.id - 1).is_some_and(|e| e.vert.is_some())
+}
 
 /// The shader shapes are drawn with now, ready to run (software renderer).
 pub(crate) fn active_cpu(w: usize, h: usize) -> Option<(glsl::Cpu, Vec<(usize, usize, Vec<u32>)>)> {

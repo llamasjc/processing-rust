@@ -573,6 +573,7 @@ fn raster_line(a: SV, b: SV, col: Color, weight: f32) {
 /// Fills and outlines triangles given in model space, with the current style.
 /// `edges` are pairs of vertex indexes to outline (None: every triangle edge).
 fn draw_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], edges: Option<&[[usize; 2]]>) {
+    if let Some(vs) = crate::shader::active_vertex() { return draw_mesh_vs(&vs, verts, None, tris, edges); }
     let (m, view, proj, eye) = matrices();
     let (w, h) = dims();
     let (wf, hf) = (w as f32, h as f32);
@@ -620,6 +621,7 @@ fn draw_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], edges: Option<&[[usize; 2]
 /// A begin_shape / vertex / end_shape made in 3D (or textured in 3D):
 /// filled with the texture or the fill, lit, and outlined along `edges`.
 pub(crate) fn draw_mesh_uv(verts: &[[f32; 3]], uvs: &[(f32, f32)], tris: &[[usize; 3]], edges: &[[usize; 2]], tex: Option<u64>) {
+    if let Some(vs) = crate::shader::active_vertex() { return draw_mesh_vs(&vs, verts, Some(uvs), tris, Some(edges)); }
     let Some(tex) = tex else { return draw_mesh(verts, tris, Some(edges)) };
     let (m, view, proj, eye) = matrices();
     let (w, h) = dims();
@@ -648,6 +650,123 @@ pub(crate) fn draw_mesh_uv(verts: &[[f32; 3]], uvs: &[(f32, f32)], tris: &[[usiz
     }
 }
 
+fn mat3_of(m: &M4) -> [f32; 9] { [m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]] }
+fn transpose(m: &M4) -> M4 { let mut t = [0.0; 16]; for c in 0..4 { for r in 0..4 { t[c * 4 + r] = m[r * 4 + c]; } } t }
+
+/// Processing's light uniforms (lightCount, lightPosition[8], ...) in eye space.
+fn light_uniforms(vs: &mut crate::glsl::VertexRun, view: &M4, lights: &[Light]) {
+    let n = lights.len().min(8);
+    let (mut pos, mut nrm, mut amb, mut dif, mut spe, mut fal, mut spot) =
+        (vec![0.0; 32], vec![0.0; 24], vec![0.0; 24], vec![0.0; 24], vec![0.0; 24], vec![0.0; 24], vec![0.0; 16]);
+    let dir_eye = |d: [f32; 3]| { let q = apply(view, d); let o = apply(view, [0.0; 3]); norm([q[0] - o[0], q[1] - o[1], q[2] - o[2]]) };
+    for (i, l) in lights.iter().take(8).enumerate() {
+        let (p, d): ([f32; 4], [f32; 3]) = match l.kind {
+            Kind::Ambient => ([0.0, 0.0, 0.0, 1.0], [0.0; 3]),
+            Kind::Directional(d) => ([0.0, 0.0, 0.0, 0.0], dir_eye(d)),
+            Kind::Point(p) => { let q = apply(view, p); ([q[0], q[1], q[2], 1.0], [0.0; 3]) }
+            Kind::Spot { pos, dir, cos_angle, conc } => {
+                spot[i * 2] = cos_angle; spot[i * 2 + 1] = conc;
+                let q = apply(view, pos); ([q[0], q[1], q[2], 1.0], dir_eye(dir))
+            }
+        };
+        pos[i * 4..i * 4 + 4].copy_from_slice(&p);
+        nrm[i * 3..i * 3 + 3].copy_from_slice(&d);
+        if matches!(l.kind, Kind::Ambient) { amb[i * 3..i * 3 + 3].copy_from_slice(&l.c); } else { dif[i * 3..i * 3 + 3].copy_from_slice(&l.c); }
+        spe[i * 3..i * 3 + 3].copy_from_slice(&l.spec);
+        fal[i * 3..i * 3 + 3].copy_from_slice(&l.fall);
+    }
+    vs.set_uniform("lightCount", &[n as f32]);
+    for (name, v) in [("lightPosition", &pos), ("lightNormal", &nrm), ("lightAmbient", &amb), ("lightDiffuse", &dif),
+                      ("lightSpecular", &spe), ("lightFalloff", &fal), ("lightSpot", &spot)] {
+        vs.set_uniform(name, v);
+    }
+}
+
+/// Shapes drawn with a shader that has a vertex stage: it places each corner
+/// (gl_Position) and what it passes along is blended across the triangle
+/// for the fragment stage.
+fn draw_mesh_vs(vcpu: &crate::glsl::Cpu, verts: &[[f32; 3]], uvs: Option<&[(f32, f32)]>, tris: &[[usize; 3]], edges: Option<&[[usize; 2]]>) {
+    let (m, view, proj, _) = matrices();
+    let (w, h) = dims();
+    let (fill, stroke, weight) = crate::render::style_pub();
+    let lights = S.with(|s| s.borrow().lights.clone());
+    let Some((fcpu, images)) = crate::shader::active_cpu(w, h) else { return };
+    let mv = mul(&view, &m);
+    let pmv = mul(&proj, &mv);
+    let nm = mat3_of(&transpose(&invert(&mv).unwrap_or(IDENT)));
+    // corner normals: the faces around each corner, averaged
+    let mut normals = vec![[0.0f32; 3]; verts.len()];
+    for t in tris {
+        let n = cross(sub(verts[t[1]], verts[t[0]]), sub(verts[t[2]], verts[t[0]]));
+        for &i in t { for k in 0..3 { normals[i][k] += n[k]; } }
+    }
+    // what reaches the fragment stage: built-ins plus varyings both declare
+    let mut outs: Vec<String> = vec!["vertColor".into(), "vertTexCoord".into()];
+    for n in &vcpu.varyings { if fcpu.global(n).is_some() && !outs.contains(n) { outs.push(n.clone()); } }
+    let slots: Vec<(usize, crate::glsl::Ty)> = outs.iter().map(|n| fcpu.global(n).unwrap()).collect();
+    let sizes: Vec<usize> = slots.iter().map(|(_, t)| t.size_pub().max(1)).collect();
+    let stride: usize = sizes.iter().sum();
+    let run_stage = |col: Color| -> Vec<Option<(SV, Vec<f32>)>> {
+        let mut vs = vcpu.vertex();
+        for (k, v) in [("transform", &pmv), ("modelviewMatrix", &mv), ("modelview", &mv), ("projectionMatrix", &proj),
+                       ("projection", &proj), ("projmodelviewMatrix", &pmv), ("texMatrix", &IDENT)] {
+            if vcpu.uniforms.contains_key(k) && !vs.was_set(k) { vs.set_uniform(k, v); }
+        }
+        if !vs.was_set("normalMatrix") { vs.set_uniform("normalMatrix", &nm); }
+        if !vs.was_set("viewport") { vs.set_uniform("viewport", &[0.0, 0.0, w as f32, h as f32]); }
+        light_uniforms(&mut vs, &view, &lights);
+        verts.iter().enumerate().map(|(i, p)| {
+            let c = [col.r, col.g, col.b, col.a];
+            let uv = uvs.and_then(|u| u.get(i)).copied().unwrap_or((0.0, 0.0));
+            let n = norm(normals[i]);
+            vs.set("position", &[p[0], p[1], p[2], 1.0]);
+            vs.set("vertex", &[p[0], p[1], p[2], 1.0]);
+            vs.set("color", &c);
+            vs.set("normal", &n);
+            vs.set("texCoord", &[uv.0, uv.1]);
+            vs.set("vertColor", &c);
+            vs.set("vertTexCoord", &[uv.0, uv.1, 0.0, 1.0]);
+            vs.set("gl_Position", &[0.0, 0.0, 0.0, 1.0]);
+            let (clip, o) = vs.run(&outs)?;
+            Some((to_screen(clip, w as f32, h as f32)?, o))
+        }).collect()
+    };
+    if let Some(fc) = fill {
+        let corners = run_stage(fc);
+        let src: Vec<u32> = crate::pixel_buf().lock().iter().map(|p| 0xFF00_0000 | (p & 0x00FF_FFFF)).collect();
+        let px = fcpu.one_pixel(w, h, src, images);
+        let mut mix = vec![0.0f32; stride];
+        let mix = std::cell::RefCell::new(&mut mix);
+        for t in tris {
+            let (Some((a, oa)), Some((b, ob)), Some((c, oc))) = (&corners[t[0]], &corners[t[1]], &corners[t[2]]) else { continue };
+            raster_tri_with(*a, *b, *c, fc.a < 0.999, &|k0, k1, k2| {
+                let (x, y) = PIXEL.with(|p| p.get());
+                let mut mx = mix.borrow_mut();
+                for j in 0..stride { mx[j] = k0 * oa[j] + k1 * ob[j] + k2 * oc[j]; }
+                let mut vary = Vec::with_capacity(slots.len());
+                let mut at = 0;
+                for (k, (slot, ty)) in slots.iter().enumerate() { vary.push((*slot, *ty, &mx[at..at + sizes[k]])); at += sizes[k]; }
+                let vc = [mx[0], mx[1], mx[2], mx[3]];
+                match px.color_with(x, y, vc, &vary) {
+                    Some(c) => Color::from_rgba(c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0), c[3].clamp(0.0, 1.0)),
+                    None => Color::from_rgba(0.0, 0.0, 0.0, 0.0),
+                }
+            });
+        }
+    }
+    if let Some(sc) = stroke {
+        // lines go where the vertex stage put the corners, in the stroke color
+        let corners = run_stage(sc);
+        let draw = |i: usize, j: usize| {
+            if let (Some((a, _)), Some((b, _))) = (&corners[i], &corners[j]) { raster_line(*a, *b, sc, weight); }
+        };
+        match edges {
+            Some(es) => for e in es { draw(e[0], e[1]); },
+            None => for t in tris { draw(t[0], t[1]); draw(t[1], t[2]); draw(t[2], t[0]); },
+        }
+    }
+}
+
 /// background() and clear() start the depth over.
 pub(crate) fn clear_depth() { S.with(|s| s.borrow_mut().depth_frame = u64::MAX); }
 
@@ -656,7 +775,7 @@ pub(crate) fn in_3d() -> bool {
     S.with(|s| {
         let s = s.borrow();
         let m = s.stack.last().unwrap();
-        s.custom_camera || s.custom_proj || !s.lights.is_empty()
+        s.custom_camera || s.custom_proj || !s.lights.is_empty() || crate::shader::vertex_active()
             || m[2].abs() > 1e-6 || m[6].abs() > 1e-6 || m[8].abs() > 1e-6 || m[9].abs() > 1e-6
             || m[14].abs() > 1e-6
     })
