@@ -578,3 +578,7 @@ match_re	FUNCTION1
 match_all	FUNCTION1
 matchAll	FUNCTION1
 thread	FUNCTION1
+load_shader	FUNCTION1
+loadShader	FUNCTION1
+shader_from_source	FUNCTION1
+PShader	KEYWORD2

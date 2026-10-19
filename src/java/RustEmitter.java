@@ -501,6 +501,13 @@ public class RustEmitter {
     Map.entry("create_shape_ellipse", "PShape"), Map.entry("create_shape_line", "PShape"),
     Map.entry("create_shape_triangle", "PShape"), Map.entry("create_shape_quad", "PShape"),
     Map.entry("wrap_text", "Vec<String>"),
+    Map.entry("load_shader", "PShader"), Map.entry("loadShader", "PShader"), Map.entry("load_shader_vf", "PShader"),
+    Map.entry("shader_from_source", "PShader"),
+    Map.entry("load_xml", "Option<Xml>"), Map.entry("loadXML", "Option<Xml>"),
+    Map.entry("parse_xml", "Result<Xml, String>"), Map.entry("parseXML", "Option<Xml>"),
+    Map.entry("create_writer", "PrintWriter"), Map.entry("createWriter", "PrintWriter"),
+    Map.entry("create_reader", "Reader"), Map.entry("createReader", "Reader"),
+    Map.entry("request_image", "u64"), Map.entry("requestImage", "u64"),
     Map.entry("random", "f32"), Map.entry("noise", "f32"), Map.entry("millis", "u64"));
 
   /** Index of c outside brackets and parentheses, or -1. */

@@ -1,0 +1,145 @@
+//! loadShader / shader.set / filter(shader): Processing's filter shaders.
+//!
+//!   let blur = load_shader("blur.glsl");
+//!   blur.set("radius", 3.0);
+//!   filter(&blur);
+//!
+//! The GLSL runs on the CPU with the software renderer and as a WGSL filter
+//! on the GPU with libprocessing (see glsl.rs).
+
+use crate::glsl;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+
+pub(crate) struct Entry {
+    pub cpu: glsl::Cpu,
+    #[cfg_attr(not(feature = "libprocessing"), allow(dead_code))]
+    pub wgsl: Result<String, String>,
+    pub values: HashMap<String, Vec<f32>>,
+    pub version: u64,
+    pub name: String,
+}
+
+pub(crate) fn shaders() -> &'static Mutex<Vec<Entry>> {
+    static S: std::sync::OnceLock<Mutex<Vec<Entry>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// A shader from load_shader. Cheap to copy; set() changes it everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PShader { pub(crate) id: usize }
+
+/// Values set() takes: numbers, booleans, 2 to 4 numbers, a color.
+pub trait UniformValue { fn floats(&self) -> Vec<f32>; }
+impl UniformValue for f32 { fn floats(&self) -> Vec<f32> { vec![*self] } }
+impl UniformValue for f64 { fn floats(&self) -> Vec<f32> { vec![*self as f32] } }
+impl UniformValue for i32 { fn floats(&self) -> Vec<f32> { vec![*self as f32] } }
+impl UniformValue for bool { fn floats(&self) -> Vec<f32> { vec![if *self { 1.0 } else { 0.0 }] } }
+impl<const N: usize> UniformValue for [f32; N] { fn floats(&self) -> Vec<f32> { self.to_vec() } }
+impl UniformValue for (f32, f32) { fn floats(&self) -> Vec<f32> { vec![self.0, self.1] } }
+impl UniformValue for (f32, f32, f32) { fn floats(&self) -> Vec<f32> { vec![self.0, self.1, self.2] } }
+impl UniformValue for (f32, f32, f32, f32) { fn floats(&self) -> Vec<f32> { vec![self.0, self.1, self.2, self.3] } }
+impl UniformValue for &[f32] { fn floats(&self) -> Vec<f32> { self.to_vec() } }
+impl UniformValue for Vec<f32> { fn floats(&self) -> Vec<f32> { self.clone() } }
+impl UniformValue for crate::Color { fn floats(&self) -> Vec<f32> { vec![self.r, self.g, self.b, self.a] } }
+
+impl PShader {
+    /// set("name", value): a uniform. Numbers, bools, [f32; 2..4], tuples, colors.
+    pub fn set(&self, name: &str, v: impl UniformValue) {
+        let mut all = shaders().lock();
+        let Some(e) = all.get_mut(self.id.wrapping_sub(1)) else { return };
+        let vals = v.floats();
+        if !e.cpu.has_uniform(name) {
+            eprintln!("{}: set(\"{name}\"): the shader has no uniform called that", e.name);
+            return;
+        }
+        e.cpu.set_uniform(name, &vals);
+        e.values.insert(name.to_string(), vals);
+        e.version += 1;
+    }
+    /// set2 / set3 / set4: Processing's set(name, x, y[, z[, w]]).
+    pub fn set2(&self, name: &str, x: impl crate::Num, y: impl crate::Num) { self.set(name, [x.f(), y.f()]) }
+    pub fn set3(&self, name: &str, x: impl crate::Num, y: impl crate::Num, z: impl crate::Num) { self.set(name, [x.f(), y.f(), z.f()]) }
+    pub fn set4(&self, name: &str, x: impl crate::Num, y: impl crate::Num, z: impl crate::Num, w: impl crate::Num) { self.set(name, [x.f(), y.f(), z.f(), w.f()]) }
+    /// Whether it loaded; a shader that didn't does nothing when used.
+    pub fn is_ok(&self) -> bool { self.id != 0 }
+}
+
+/// load_shader("frag.glsl"): a filter shader (looked for as given, then in
+/// data/). On a mistake it says where and gives back a shader that does nothing.
+pub fn load_shader(path: &str) -> PShader {
+    let file = if std::path::Path::new(path).is_file() { path.to_string() } else { format!("data/{path}") };
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("loadShader(\"{path}\"): {e}"); return PShader::default(); }
+    };
+    shader_from_source_named(&text, path)
+}
+/// load_shader_vf(frag, vert): the vertex shader isn't used (filters don't need one).
+pub fn load_shader_vf(frag: &str, _vert: &str) -> PShader { load_shader(frag) }
+/// A shader from GLSL text in the sketch.
+pub fn shader_from_source(src: &str) -> PShader { shader_from_source_named(src, "shader") }
+
+fn shader_from_source_named(src: &str, name: &str) -> PShader {
+    let prog = match glsl::parse(src) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("loadShader(\"{name}\"): {e}"); return PShader::default(); }
+    };
+    let cpu = match glsl::compile(&prog) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("loadShader(\"{name}\"): {e}"); return PShader::default(); }
+    };
+    let wgsl = glsl::to_wgsl(&prog);
+    let mut all = shaders().lock();
+    all.push(Entry { cpu, wgsl, values: HashMap::new(), version: 0, name: name.to_string() });
+    PShader { id: all.len() }
+}
+#[inline] pub fn loadShader(path: &str) -> PShader { load_shader(path) }
+
+/// What filter() takes: a kind (BLUR, INVERT...) or a shader.
+pub trait FilterKind { fn apply(&self); }
+impl FilterKind for u32 { fn apply(&self) { crate::render::filter(*self, f32::NAN); } }
+impl FilterKind for i32 { fn apply(&self) { crate::render::filter(*self as u32, f32::NAN); } }
+impl FilterKind for PShader { fn apply(&self) { apply(*self) } }
+impl FilterKind for &PShader { fn apply(&self) { apply(**self) } }
+impl FilterKind for &mut PShader { fn apply(&self) { apply(**self) } }
+
+/// Runs the shader over the canvas.
+pub(crate) fn apply(s: PShader) {
+    if s.id == 0 { return; }
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() {
+        let (src, values, version, name) = {
+            let all = shaders().lock();
+            let Some(e) = all.get(s.id - 1) else { return };
+            let vals: Vec<(String, glsl::Ty, Vec<f32>)> = e.values.iter()
+                .filter_map(|(k, v)| e.cpu.uniforms.get(k).map(|(_, t)| (k.clone(), *t, v.clone())))
+                .collect();
+            (e.wgsl.clone(), vals, e.version, e.name.clone())
+        };
+        match src {
+            Ok(src) => crate::lp::filter_shader(s.id, &src, &values, version),
+            Err(why) => {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("{name}: can't run on libprocessing: {why}");
+                }
+            }
+        }
+        return;
+    }
+    let (w, h) = (crate::CANVAS_W.load(std::sync::atomic::Ordering::Relaxed) as usize, crate::CANVAS_H.load(std::sync::atomic::Ordering::Relaxed) as usize);
+    let mut cpu = {
+        let all = shaders().lock();
+        let Some(e) = all.get(s.id - 1) else { return };
+        e.cpu.clone()
+    };
+    // Processing fills these in for filter shaders
+    if !shaders().lock()[s.id - 1].values.contains_key("texOffset") { cpu.set_uniform("texOffset", &[1.0 / w as f32, 1.0 / h as f32]); }
+    if !shaders().lock()[s.id - 1].values.contains_key("resolution") { cpu.set_uniform("resolution", &[w as f32, h as f32]); }
+    let src = crate::render::copy_pixels();
+    if src.len() < w * h { return; }
+    let mut dst = vec![0u32; w * h];
+    cpu.run(w, h, &src, &mut dst);
+    crate::render::write_pixels(&dst);
+}

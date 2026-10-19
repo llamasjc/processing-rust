@@ -221,6 +221,23 @@ Sketches are valid Rust files.  The Processing conventions:
 | Both naming styles | `mouseX()` ≡ `mouse_x()`, `noFill()` ≡ `no_fill()`, … |
 | File extension | `.pde` (default) or `.prs` |
 
+### Shaders
+
+`load_shader("blur.glsl")` (or `shader_from_source(text)`) reads a
+Processing filter shader: GLSL with `uniform sampler2D texture`, `varying vec4
+vertTexCoord`, `gl_FragColor`, `gl_FragCoord`, `texOffset` and `resolution`.
+`shader.set("name", value)` sets a uniform (`set("v", x, y)` with up to four
+numbers), and `filter(shader)` runs it over the canvas. On the default
+renderer the shader runs on the CPU (an interpreter in `src/glsl.rs`, on every
+core); on libprocessing it is translated to WGSL and runs on the GPU. Both give
+the same picture.
+
+Supported: float, int, bool, vec2-4, mat2-4, functions (with `out` and `inout`
+parameters), if / for / while / do, `discard`, `const` and `#define`, and the
+usual built-in functions. Not yet: arrays, other textures than the canvas, and
+`shader()` for shapes (a vertex and fragment pair); a mistake in a shader is
+reported with its line when it's loaded.
+
 ### Lights, materials and the rest of the API
 
 - `spot_light`, `light_falloff`, `light_specular`, and the material calls

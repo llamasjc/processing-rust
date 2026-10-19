@@ -27,6 +27,8 @@ final class OverloadRewriter {
     Map.entry("tint",        Map.of(2, "tint_ga",       3, "tint_rgb",       4, "tint_rgba")),
     Map.entry("rect",        Map.of(5, "rect_rounded", 8, "rect_radii")),
     Map.entry("filter",      Map.of(2, "filter_param")),
+    Map.entry("load_shader", Map.of(2, "load_shader_vf")),
+    Map.entry("loadShader",  Map.of(2, "load_shader_vf")),
     Map.entry("arc",         Map.of(7, "arc_mode")),
     Map.entry("image",       Map.of(5, "image_sized")),
     Map.entry("graphics_image", Map.of(5, "graphics_image_sized")),
@@ -57,8 +59,13 @@ final class OverloadRewriter {
     Map.entry("textAlign",   Map.of(1, "text_align_h"))
   );
 
+  /** Overloads only for methods: shader.set(name, x, y) is set2, but set(x, y, c) stays set. */
+  private static final Map<String, Map<Integer, String>> METHOD_ONLY = Map.of(
+    "set", Map.of(3, "set2", 4, "set3", 5, "set4")
+  );
+
   /** Method names rewritten like the free functions, for PShape. */
-  private static final Set<String> METHOD_OVERLOADS = Set.of("fill", "stroke", "begin_shape", "end_shape", "scale", "vertex", "translate");
+  private static final Set<String> METHOD_OVERLOADS = Set.of("fill", "stroke", "begin_shape", "end_shape", "scale", "vertex", "translate", "set");
 
   /** Float functions whose last argument is a constant (PIE, CHORD...), not a number to convert. */
   private static final Set<String> LAST_ARG_AS_IS = Set.of("arc_mode");
@@ -118,7 +125,12 @@ final class OverloadRewriter {
             List<String> args = splitArgs(src.substring(k + 1, close));
             boolean empty = args.size() == 1 && args.get(0).isBlank();
             int count = empty ? 0 : args.size();
-            String target = OVERLOADS.getOrDefault(name, Map.of()).getOrDefault(count, name);
+            // shader.set("name", x, y) -> set2; a Table's set(row, col, v) has no
+            // string first, so it stays set
+            boolean named = count > 0 && args.get(0).strip().startsWith("\"");
+            String target = METHOD_ONLY.containsKey(name)
+              ? (named ? METHOD_ONLY.get(name).getOrDefault(count, name) : name)
+              : OVERLOADS.getOrDefault(name, Map.of()).getOrDefault(count, name);
             List<String> fixed = new ArrayList<>();
             for (String a : args) fixed.add(rewrite(a));
             out.append(target).append(src, j, k + 1).append(String.join(",", fixed)).append(')');

@@ -4514,7 +4514,8 @@ pub const ERODE:     u32 = 17;
 pub const DILATE:    u32 = 18;
 /// filter(GRAY), filter(INVERT), filter(BLUR)...: changes the whole canvas
 /// (or the layer being drawn on).
-pub fn filter(kind: u32) { render::filter(kind, f32::NAN); }
+/// filter(INVERT), filter(GRAY)... or filter(&shader) to run a shader over the canvas.
+pub fn filter(kind: impl FilterKind) { kind.apply(); }
 /// filter(BLUR, radius), filter(THRESHOLD, 0..1), filter(POSTERIZE, levels)
 pub fn filter_param(kind: u32, param: f32) { render::filter(kind, param); }
 /// rect with a radius per corner: top-left, top-right, bottom-right, bottom-left.
@@ -4871,6 +4872,9 @@ pub fn random_gaussian() -> f32 {
 }
 
 // Files, JSON and tables (see data.rs).
+mod glsl;
+mod shader;
+pub use shader::{PShader, load_shader, loadShader, load_shader_vf, shader_from_source, UniformValue, FilterKind};
 mod extra;
 pub use extra::*;
 mod data;

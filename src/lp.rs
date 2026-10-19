@@ -298,6 +298,47 @@ fn open(w: u32, h: u32) {
     for c in early { cmd(c); }
 }
 
+// ── filter shaders ───────────────────────────────────────────────────────
+thread_local! {
+    /// engine shader id -> (libprocessing filter, values version sent)
+    static SHADERS: RefCell<HashMap<usize, (Entity, u64)>> = RefCell::new(HashMap::new());
+}
+/// filter(shader): the shader's WGSL (from glsl.rs) as a libprocessing filter.
+pub(crate) fn filter_shader(id: usize, src: &str, values: &[(String, crate::glsl::Ty, Vec<f32>)], version: u64) {
+    use crate::glsl::Ty;
+    use pr::shader_value::ShaderValue as V;
+    ensure_open();
+    let made = SHADERS.with(|m| m.borrow().get(&id).copied());
+    let (filter, sent) = match made {
+        Some(x) => x,
+        None => {
+            let shader = match pr::shader_create(src) { Ok(s) => s, Err(e) => { fail("making a shader", e); return; } };
+            let f = match pr::filter_create(shader) { Ok(f) => f, Err(e) => { fail("making a shader filter", e); return; } };
+            SHADERS.with(|m| m.borrow_mut().insert(id, (f, u64::MAX)));
+            (f, u64::MAX)
+        }
+    };
+    if sent != version {
+        for (name, t, v) in values {
+            let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
+            let val = match t {
+                Ty::Int | Ty::Bool => V::Int(g(0) as i32),
+                Ty::Vec(2) => V::Float2([g(0), g(1)]),
+                Ty::Vec(3) => V::Float3([g(0), g(1), g(2)]),
+                Ty::Vec(4) => V::Float4([g(0), g(1), g(2), g(3)]),
+                Ty::Mat(4) => { let mut m = [0.0; 16]; for (i, x) in v.iter().take(16).enumerate() { m[i] = *x; } V::Mat4(m) }
+                _ => V::Float(g(0)),
+            };
+            if let Err(e) = pr::filter_set(filter, name.as_str(), val) { fail("setting a shader uniform", e); }
+        }
+        SHADERS.with(|m| { if let Some(x) = m.borrow_mut().get_mut(&id) { x.1 = version; } });
+    }
+    let Some(t) = target() else { return };
+    let _ = pr::graphics_flush(t);
+    if let Err(e) = pr::graphics_apply_filter(t, filter) { fail("running a shader", e); }
+    DIRTY.store(true, Ordering::Relaxed);
+}
+
 pub(crate) fn window_move(x: i32, y: i32) {
     LP.with(|l| if let Some(l) = l.borrow().as_ref() { let _ = pr::surface_set_position(l.surface, x, y); });
 }
