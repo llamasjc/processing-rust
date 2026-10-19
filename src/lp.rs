@@ -408,9 +408,56 @@ fn shaded_3d(draw: DrawCommand) -> bool {
     if let Some(t) = target() { let _ = pr::graphics_flush(t); }
     true
 }
-/// A 2D shape with shader() on: drawn plainly, and said once.
-fn shaded_2d_note() {
-    if SHADING.with(|s| s.get()).is_some() { missing("shader() on 2D shapes (it colors 3D shapes like box() and sphere() on libprocessing)"); }
+/// A filled 2D shape with shader() on: its fill as a whole mesh (normals,
+/// texture coordinates and colors, built in one go like libprocessing's own
+/// box), so the custom material can draw it. The outline is drawn as usual.
+fn shaded_2d(pts: &[(f32, f32)], outline: DrawCommand) -> bool {
+    let Some(mat) = SHADING.with(|s| s.get()) else { return false };
+    let Some(fill) = crate::render::style_pub().0 else { return false };
+    if pts.len() < 3 { return false; }
+    let verts: Vec<[f32; 3]> = pts.iter().map(|p| [p.0, p.1, 0.0]).collect();
+    let (tris, _) = crate::render::shape_triangles(0, &verts, true);
+    let Some(g) = whole_mesh(&verts, &tris, fill) else { return false };
+    let _ = pr::material_set(mat, "glsl_fill", pr::shader_value::ShaderValue::Float4([fill.r, fill.g, fill.b, fill.a]));
+    cmd(DrawCommand::Geometry(g));
+    if let Some(t) = target() { let _ = pr::graphics_flush(t); }
+    if crate::render::style_pub().1.is_some() {
+        cmd(DrawCommand::PushStyle);
+        cmd(DrawCommand::NoFill);
+        cmd(DrawCommand::Unlit);
+        cmd(outline);
+        cmd(DrawCommand::PopStyle);
+    }
+    true
+}
+/// A Geometry whose mesh is complete when it's made: positions, normals,
+/// colors, texture coordinates (across the shape's box) and indices.
+fn whole_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], fill: Color) -> Option<Entity> {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for v in verts { x0 = x0.min(v[0]); y0 = y0.min(v[1]); x1 = x1.max(v[0]); y1 = y1.max(v[1]); }
+    let (bw, bh) = ((x1 - x0).max(1e-6), (y1 - y0).max(1e-6));
+    let uvs: Vec<[f32; 2]> = verts.iter().map(|v| [(v[0] - x0) / bw, (v[1] - y0) / bh]).collect();
+    let normals = vec![[0.0f32, 0.0, 1.0]; verts.len()];
+    let colors = vec![[fill.r, fill.g, fill.b, fill.a]; verts.len()];
+    // both ways round, so it shows whichever way it faces
+    let idx: Vec<u32> = tris.iter().flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32, t[0] as u32, t[2] as u32, t[1] as u32]).collect();
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts.to_vec());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(idx));
+    let attrs = vec![pr::geometry_attribute_position(), pr::geometry_attribute_normal(), pr::geometry_attribute_color(), pr::geometry_attribute_uv()];
+    let g = processing_core::app_mut(|app| {
+        let world = app.world_mut();
+        let handle = world.resource_mut::<bevy::asset::Assets<Mesh>>().add(mesh);
+        let layout = world.spawn(pr::geometry::layout::VertexLayout::with_attributes(attrs)).id();
+        Ok(world.spawn(pr::geometry::Geometry::new(handle, layout)).id())
+    }).ok()?;
+    FRAME_GEOMETRY.with(|f| f.borrow_mut().push(g));
+    Some(g)
 }
 
 pub(crate) fn window_move(x: i32, y: i32) {
@@ -688,8 +735,21 @@ fn corner_modes() {
 }
 
 // ── shapes ───────────────────────────────────────────────────────────────
-pub(crate) fn rect(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) { shaded_2d_note(); cmd(DrawCommand::Rect { x, y, w, h, radii }); }
-pub(crate) fn ellipse(cx: f32, cy: f32, w: f32, h: f32) { shaded_2d_note(); cmd(DrawCommand::Ellipse { cx, cy, w, h }); }
+pub(crate) fn rect(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) {
+    let c = DrawCommand::Rect { x, y, w, h, radii };
+    if !shaded_2d(&[(x, y), (x + w, y), (x + w, y + h), (x, y + h)], c.clone()) { cmd(c); }
+}
+pub(crate) fn ellipse(cx: f32, cy: f32, w: f32, h: f32) {
+    let c = DrawCommand::Ellipse { cx, cy, w, h };
+    if !shaded_2d(&arc_outline(cx, cy, w, h, 0.0, std::f32::consts::TAU, false), c.clone()) { cmd(c); }
+}
+/// Points around an ellipse (or part of it, with the center for a pie).
+fn arc_outline(cx: f32, cy: f32, w: f32, h: f32, a0: f32, a1: f32, center: bool) -> Vec<(f32, f32)> {
+    let n = ((w.abs() + h.abs()) * 0.25).clamp(24.0, 128.0) as usize;
+    let mut v: Vec<(f32, f32)> = (0..=n).map(|i| { let t = a0 + (a1 - a0) * i as f32 / n as f32; (cx + t.cos() * w / 2.0, cy + t.sin() * h / 2.0) }).collect();
+    if center { v.push((cx, cy)); }
+    v
+}
 /// Lines and points of an odd width sit in the middle of a pixel row, like
 /// the other renderer, so a 1-pixel line on whole coordinates is one crisp row.
 fn pixel_center() -> f32 {
@@ -702,18 +762,27 @@ pub(crate) fn line(x1: f32, y1: f32, x2: f32, y2: f32) {
 }
 pub(crate) fn point(x: f32, y: f32) { let o = pixel_center(); cmd(DrawCommand::Point { x: x + o, y: y + o }); }
 pub(crate) fn triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
-    cmd(DrawCommand::Triangle { x1, y1, x2, y2, x3, y3 });
+    let c = DrawCommand::Triangle { x1, y1, x2, y2, x3, y3 };
+    if !shaded_2d(&[(x1, y1), (x2, y2), (x3, y3)], c.clone()) { cmd(c); }
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn quad(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, x4: f32, y4: f32) {
-    cmd(DrawCommand::Quad { x1, y1, x2, y2, x3, y3, x4, y4 });
+    let c = DrawCommand::Quad { x1, y1, x2, y2, x3, y3, x4, y4 };
+    if !shaded_2d(&[(x1, y1), (x2, y2), (x3, y3), (x4, y4)], c.clone()) { cmd(c); }
 }
 /// engine arc modes: 0 default (Processing draws a pie fill and an open stroke), 1 OPEN, 2 CHORD, 3 PIE
 pub(crate) fn arc(cx: f32, cy: f32, w: f32, h: f32, start: f32, stop: f32, mode: u8) {
+    let pie = mode != 1 && mode != 2;
     let mode = match mode { 2 => ArcMode::Chord, 3 => ArcMode::Pie, 1 => ArcMode::Open, _ => ArcMode::Open };
-    cmd(DrawCommand::Arc { cx, cy, w, h, start, stop, mode });
+    let c = DrawCommand::Arc { cx, cy, w, h, start, stop, mode };
+    if !shaded_2d(&arc_outline(cx, cy, w, h, start, stop, pie), c.clone()) { cmd(c); }
+}
+thread_local! {
+    /// A shape being built while shader() is on: its kind and vertices.
+    static SHADED_SHAPE: RefCell<Option<(u8, Vec<[f32; 3]>)>> = const { RefCell::new(None) };
 }
 pub(crate) fn begin_shape(kind: u8) {
+    if SHADING.with(|s| s.get()).is_some() { SHADED_SHAPE.with(|s| *s.borrow_mut() = Some((kind, Vec::new()))); }
     // engine kinds: 0 polygon, 1 POINTS, 2 LINES, 3 TRIANGLES, 4 TRIANGLE_FAN, 5 TRIANGLE_STRIP, 6 QUADS, 7 QUAD_STRIP
     let kind = match kind {
         1 => ShapeKind::Points, 2 => ShapeKind::Lines, 3 => ShapeKind::Triangles, 4 => ShapeKind::TriangleFan,
@@ -721,13 +790,37 @@ pub(crate) fn begin_shape(kind: u8) {
     };
     cmd(DrawCommand::BeginShape { kind });
 }
-pub(crate) fn vertex(x: f32, y: f32) { cmd(DrawCommand::ShapeVertex { x, y }); }
+pub(crate) fn vertex(x: f32, y: f32) {
+    SHADED_SHAPE.with(|s| if let Some((_, v)) = s.borrow_mut().as_mut() { v.push([x, y, 0.0]); });
+    cmd(DrawCommand::ShapeVertex { x, y });
+}
 pub(crate) fn bezier_vertex(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) {
     cmd(DrawCommand::ShapeBezierVertex { cx1, cy1, cx2, cy2, x, y });
 }
 pub(crate) fn quadratic_vertex(cx: f32, cy: f32, x: f32, y: f32) { cmd(DrawCommand::ShapeQuadraticVertex { cx, cy, x, y }); }
 pub(crate) fn curve_vertex(x: f32, y: f32) { cmd(DrawCommand::ShapeCurveVertex { x, y }); }
-pub(crate) fn end_shape(close: bool) { cmd(DrawCommand::EndShape { close }); }
+pub(crate) fn end_shape(close: bool) {
+    let shaded = SHADED_SHAPE.with(|s| s.borrow_mut().take());
+    if let (Some((kind, verts)), Some(mat), Some(fill)) = (shaded, SHADING.with(|s| s.get()), crate::render::style_pub().0) {
+        // points and lines have no fill to shade
+        if verts.len() >= 3 && kind != 1 && kind != 2 {
+            let (tris, _) = crate::render::shape_triangles(kind, &verts, close);
+            if let Some(g) = whole_mesh(&verts, &tris, fill) {
+                let _ = pr::material_set(mat, "glsl_fill", pr::shader_value::ShaderValue::Float4([fill.r, fill.g, fill.b, fill.a]));
+                cmd(DrawCommand::Geometry(g));
+                if let Some(t) = target() { let _ = pr::graphics_flush(t); }
+                // the recorded vertices still make the outline, with no fill
+                cmd(DrawCommand::PushStyle);
+                cmd(DrawCommand::NoFill);
+                cmd(DrawCommand::Unlit);
+                cmd(DrawCommand::EndShape { close });
+                cmd(DrawCommand::PopStyle);
+                return;
+            }
+        }
+    }
+    cmd(DrawCommand::EndShape { close });
+}
 pub(crate) fn begin_contour() { cmd(DrawCommand::BeginContour); }
 pub(crate) fn end_contour() { cmd(DrawCommand::EndContour); }
 

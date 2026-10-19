@@ -234,8 +234,9 @@ the same picture.
 
 `shader(s)` colors the shapes drawn after it with the shader (its fragment
 part; `vertColor` is the shape's fill), until `reset_shader()`. On the default
-renderer that is every filled shape; on libprocessing 3D shapes (`box`,
-`sphere`) for now, since its 2D shapes can't take a custom material yet.
+renderer and on libprocessing that is every filled shape, 2D and 3D. (On
+libprocessing a shape drawn with a shader is rendered as soon as it's drawn,
+so each keeps its own fill.)
 
 Supported: float, int, bool, vec2-4, mat2-4, functions (with `out` and `inout`
 parameters), if / for / while / do, `discard`, `const` and `#define`, the
