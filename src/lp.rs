@@ -739,7 +739,12 @@ thread_local! { static LIT: std::cell::Cell<bool> = const { std::cell::Cell::new
 pub(crate) fn add_light(spec: LightSpec) {
     WANT.with(|w| w.borrow_mut().push(spec));
     if !LIT.with(|l| l.replace(true)) { cmd(DrawCommand::Roughness(0.9)); cmd(DrawCommand::Metallic(0.0)); send_material(); }
-    if matches!(spec, LightSpec::Spot(..)) { sync_lights(); }
+    // a spot light only lights what is drawn after the canvas has rendered
+    // once with it in the frame, so make it now and render what came before
+    if matches!(spec, LightSpec::Spot(..)) {
+        sync_lights();
+        if let Some(t) = target() { let _ = pr::graphics_flush(t); }
+    }
 }
 // The material calls, as libprocessing's PBR material: emissive is its glow,
 // shininess its smoothness. A specular color has no match there (the shine
@@ -825,7 +830,11 @@ fn sync_lights() {
                 let range = (w.max(h) as f32) * 4.0;
                 let outer = angle.clamp(0.01, std::f32::consts::FRAC_PI_2 - 0.01);
                 let lumens = point_lumens(p, w, h);
-                match pr::light_create_spot(main, BColor::linear_rgb(c[0], c[1], c[2]), lumens, range * 4.0, 0.0, outer * 0.8, outer) {
+                // reach just past the canvas: Bevy culls a spot light by a sphere
+                // along its cone, and a far reach puts that sphere out of view
+                let reach = Vec3::new(p[0] - hw, p[1] - hh, p[2]).length() + w.max(h) as f32 * 2.0;
+                let _ = range;
+                match pr::light_create_spot(main, BColor::linear_rgb(c[0], c[1], c[2]), lumens, reach, 0.0, outer * 0.8, outer) {
                     Ok(e) => {
                         let pos = Vec3::new(p[0] - hw, -(p[1] - hh), p[2]);
                         let _ = pr::transform_set_position(e, pos);
