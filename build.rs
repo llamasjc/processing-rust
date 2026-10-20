@@ -1,10 +1,13 @@
 // Older libprocessing checkouts have no Texture draw command. When the
-// checkout the build uses (LIBPROCESSING_DIR, or sketchbook/libprocessing
-// next to the modes folder) lacks it, textured shapes draw untextured.
+// checkout the build uses lacks it, textured shapes draw untextured. That is
+// the same checkout build-libprocessing.sh picks: LIBPROCESSING_DIR, then
+// ~/lp-fork, then sketchbook/libprocessing next to the modes folder.
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(lp_no_texture)");
     println!("cargo:rerun-if-env-changed=LIBPROCESSING_DIR");
-    let dir = std::env::var("LIBPROCESSING_DIR").ok().map(std::path::PathBuf::from).or_else(|| {
+    let fork = std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join("lp-fork"))
+        .filter(|d| d.join("crates/processing_render/Cargo.toml").is_file());
+    let dir = std::env::var("LIBPROCESSING_DIR").ok().map(std::path::PathBuf::from).or(fork).or_else(|| {
         let here = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?);
         Some(here.parent()?.parent()?.join("libprocessing"))
     });
