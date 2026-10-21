@@ -266,8 +266,19 @@ address (with curl). `load_json_object`, `load_json_array`,
 `parse_json_object`, `parse_json_array` and the save ones are Processing's
 names for the JSON functions.
 
-Not there yet: `begin_record` / `begin_raw` (PDF and SVG output), custom
-vertex attributes (`attrib`), and `window_ratio`.
+`begin_record("drawing.svg")` (or `.pdf`, or `begin_record(PDF, path)`)
+... `end_record()` also writes what's drawn as vector shapes: outlines after
+the transform with their fill, stroke and weight, curves as short lines, text
+at its size (not its font). Images and 3D solids are left out. `begin_raw`
+is the same.
+
+`window_ratio(w, h)`: draw in w by h units, scaled to fit the canvas and
+centered; `rwidth`, `rheight`, `rmouse_x`, `rmouse_y` are in those units.
+
+`attrib("name", value)` (and `attrib_position`, `attrib_normal`,
+`attrib_color`) gives the vertices that follow a value of your own, read in
+a vertex shader as `attribute float name;` (up to vec4). Both renderers; on
+libprocessing it needs the lp-fork.
 
 Supported: float, int, bool, vec2-4, mat2-4, functions (with `out` and `inout`
 parameters), if / for / while / do, `discard`, `const` and `#define`, the

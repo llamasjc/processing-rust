@@ -402,8 +402,6 @@ pub(crate) fn reset_shape_shader() {
     cmd(DrawCommand::Unlit);
     if LIT.with(|l| l.get()) { cmd(DrawCommand::Roughness(0.9)); cmd(DrawCommand::Metallic(0.0)); send_material(); }
 }
-/// Before a 3D shape with shader() on: its fill, as vertColor. The shape is
-/// rendered right after, so each keeps its own fill.
 thread_local! {
     /// The fill each shader material has now, and whether shapes drawn with
     /// a shader are waiting to be rendered.
@@ -428,6 +426,7 @@ fn shaded_fill(mat: Entity, c: Color) {
     }
     SHADED_PENDING.with(|p| p.set(true));
 }
+/// Before a 3D shape with shader() on: its fill, as vertColor.
 fn shaded_3d(draw: DrawCommand) -> bool {
     let Some(mat) = SHADING.with(|s| s.get()) else { return false };
     let c = crate::render::style_pub().0.unwrap_or(Color::from_rgb(1.0, 1.0, 1.0));
@@ -458,7 +457,10 @@ fn shaded_2d(pts: &[(f32, f32)], outline: DrawCommand) -> bool {
 }
 /// A Geometry whose mesh is complete when it's made: positions, normals,
 /// colors, texture coordinates (across the shape's box) and indices.
-fn whole_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], fill: Color) -> Option<Entity> {
+fn whole_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], fill: Color) -> Option<Entity> { whole_mesh_with(verts, tris, fill, &[]) }
+/// whole_mesh, with the attrib() values each vertex had: every attribute the
+/// active shader reads is in the mesh (zeros where none was given).
+fn whole_mesh_with(verts: &[[f32; 3]], tris: &[[usize; 3]], fill: Color, attrs: &[Vec<(String, Vec<f32>)>]) -> Option<Entity> {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -474,6 +476,24 @@ fn whole_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], fill: Color) -> Option<En
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    #[cfg(lp_attribs)]
+    for (name, n) in crate::shader::lp_attributes() {
+        let value = |i: usize| -> Vec<f32> {
+            let mut v = attrs.get(i).and_then(|l| l.iter().find(|(k, _)| *k == name)).map(|(_, v)| v.clone()).unwrap_or_default();
+            v.resize(n, 0.0);
+            v
+        };
+        let attr = pr::material::custom::custom_attribute(&format!("a_{name}"), n as u32);
+        let count = verts.len();
+        match n {
+            1 => mesh.insert_attribute(attr, (0..count).map(|i| value(i)[0]).collect::<Vec<f32>>()),
+            2 => mesh.insert_attribute(attr, (0..count).map(|i| { let v = value(i); [v[0], v[1]] }).collect::<Vec<[f32; 2]>>()),
+            3 => mesh.insert_attribute(attr, (0..count).map(|i| { let v = value(i); [v[0], v[1], v[2]] }).collect::<Vec<[f32; 3]>>()),
+            _ => mesh.insert_attribute(attr, (0..count).map(|i| { let v = value(i); [v[0], v[1], v[2], v[3]] }).collect::<Vec<[f32; 4]>>()),
+        }
+    }
+    #[cfg(not(lp_attribs))]
+    let _ = attrs;
     mesh.insert_indices(Indices::U32(idx));
     let attrs = vec![pr::geometry_attribute_position(), pr::geometry_attribute_normal(), pr::geometry_attribute_color(), pr::geometry_attribute_uv()];
     let g = processing_core::app_mut(|app| {
@@ -806,9 +826,14 @@ pub(crate) fn arc(cx: f32, cy: f32, w: f32, h: f32, start: f32, stop: f32, mode:
 thread_local! {
     /// A shape being built while shader() is on: its kind and vertices.
     static SHADED_SHAPE: RefCell<Option<(u8, Vec<[f32; 3]>)>> = const { RefCell::new(None) };
+    /// attrib() values of each of its vertices
+    static SHADED_ATTRS: RefCell<Vec<Vec<(String, Vec<f32>)>>> = const { RefCell::new(Vec::new()) };
 }
 pub(crate) fn begin_shape(kind: u8) {
-    if SHADING.with(|s| s.get()).is_some() { SHADED_SHAPE.with(|s| *s.borrow_mut() = Some((kind, Vec::new()))); }
+    if SHADING.with(|s| s.get()).is_some() {
+        SHADED_SHAPE.with(|s| *s.borrow_mut() = Some((kind, Vec::new())));
+        SHADED_ATTRS.with(|a| a.borrow_mut().clear());
+    }
     // engine kinds: 0 polygon, 1 POINTS, 2 LINES, 3 TRIANGLES, 4 TRIANGLE_FAN, 5 TRIANGLE_STRIP, 6 QUADS, 7 QUAD_STRIP
     let kind = match kind {
         1 => ShapeKind::Points, 2 => ShapeKind::Lines, 3 => ShapeKind::Triangles, 4 => ShapeKind::TriangleFan,
@@ -817,7 +842,11 @@ pub(crate) fn begin_shape(kind: u8) {
     cmd(DrawCommand::BeginShape { kind });
 }
 pub(crate) fn vertex(x: f32, y: f32) {
-    SHADED_SHAPE.with(|s| if let Some((_, v)) = s.borrow_mut().as_mut() { v.push([x, y, 0.0]); });
+    SHADED_SHAPE.with(|s| if let Some((_, v)) = s.borrow_mut().as_mut() {
+        v.push([x, y, 0.0]);
+        let cur = crate::render::ATTRIBS.with(|a| a.borrow().clone());
+        SHADED_ATTRS.with(|a| a.borrow_mut().push(cur));
+    });
     cmd(DrawCommand::ShapeVertex { x, y });
 }
 pub(crate) fn bezier_vertex(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) {
@@ -831,7 +860,8 @@ pub(crate) fn end_shape(close: bool) {
         // points and lines have no fill to shade
         if verts.len() >= 3 && kind != 1 && kind != 2 {
             let (tris, _) = crate::render::shape_triangles(kind, &verts, close);
-            if let Some(g) = whole_mesh(&verts, &tris, fill) {
+            let attrs = SHADED_ATTRS.with(|a| std::mem::take(&mut *a.borrow_mut()));
+            if let Some(g) = whole_mesh_with(&verts, &tris, fill, &attrs) {
                 shaded_fill(mat, fill);
                 cmd(DrawCommand::Geometry(g));
                 // the recorded vertices still make the outline, with no fill

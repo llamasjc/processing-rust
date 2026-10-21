@@ -300,6 +300,16 @@ fn image_px(id: u64) -> (usize, usize, Vec<u32>) {
     }).collect();
     (iw as usize, ih as usize, px)
 }
+/// The attrib() inputs the shader shapes use on libprocessing needs: name and
+/// how many numbers each.
+#[cfg(feature = "libprocessing")]
+pub(crate) fn lp_attributes() -> Vec<(String, usize)> {
+    let Some(s) = *LP_ACTIVE.lock() else { return Vec::new() };
+    let all = shaders().lock();
+    let Some(v) = all.get(s.id - 1).and_then(|e| e.vert_prog.as_ref()) else { return Vec::new() };
+    glsl::custom_attributes(v).into_iter().map(|(t, n)| (n, t.size_pub().max(1))).collect()
+}
+
 /// Is a shader with a vertex stage active? Then every shape goes through 3D.
 pub(crate) fn vertex_active() -> bool {
     let Some(s) = *ACTIVE.lock() else { return false };

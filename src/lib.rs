@@ -208,20 +208,36 @@ mod render {
     struct ShapeState { kind: u8, pts: Vec<(f32, f32)>, curve: Vec<(f32, f32)>, active: bool,
                         holes: Vec<Vec<(f32, f32)>>, outer: Option<Vec<(f32, f32)>>,
                         // per vertex, kept in step with pts: depth and texture coordinates
-                        zs: Vec<f32>, uvs: Vec<(f32, f32)>, three: bool, lp_three: bool }
+                        zs: Vec<f32>, uvs: Vec<(f32, f32)>, three: bool, lp_three: bool,
+                        // attrib() values each vertex had, for a vertex shader
+                        attrs: Vec<Vec<(String, Vec<f32>)>> }
     fn shape_state() -> &'static parking_lot::Mutex<ShapeState> {
         static S: std::sync::OnceLock<parking_lot::Mutex<ShapeState>> = std::sync::OnceLock::new();
         S.get_or_init(|| parking_lot::Mutex::new(ShapeState { kind: 0, pts: Vec::new(), curve: Vec::new(), active: false,
                                                                holes: Vec::new(), outer: None,
-                                                               zs: Vec::new(), uvs: Vec::new(), three: false, lp_three: false }))
+                                                               zs: Vec::new(), uvs: Vec::new(), three: false, lp_three: false,
+                                                               attrs: Vec::new() }))
     }
+    thread_local! {
+        /// attrib("name", ...): the value the next vertices get
+        pub(crate) static ATTRIBS: std::cell::RefCell<Vec<(String, Vec<f32>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    pub(crate) fn set_attrib(name: &str, v: Vec<f32>) {
+        ATTRIBS.with(|a| {
+            let mut a = a.borrow_mut();
+            match a.iter_mut().find(|(n, _)| n == name) { Some(x) => x.1 = v, None => a.push((name.to_string(), v)) }
+        });
+    }
+    struct ClearAttribs;
+    impl Drop for ClearAttribs { fn drop(&mut self) { crate::three::set_shape_attribs(Vec::new()); } }
     pub fn shape_begin(kind: u8) {
+        crate::record::shape_begin(kind);
         TEXTURE.with(|t| t.set(None));
         {
             let mut s = shape_state().lock();
             s.kind = kind; s.pts.clear(); s.curve.clear(); s.active = true;
             s.holes.clear(); s.outer = None;
-            s.zs.clear(); s.uvs.clear(); s.three = false; s.lp_three = false;
+            s.zs.clear(); s.uvs.clear(); s.three = false; s.lp_three = false; s.attrs.clear();
         }
         lp_route! { crate::lp::begin_shape(kind); }
     }
@@ -232,9 +248,11 @@ mod render {
         let uv = s.uvs.last().copied().unwrap_or((0.0, 0.0));
         s.zs.resize(n, z);
         s.uvs.resize(n, uv);
+        if !s.attrs.is_empty() { let a = s.attrs.last().cloned().unwrap_or_default(); s.attrs.resize(n, a); }
     }
     /// vertex(x, y, z), vertex(x, y, u, v) and vertex(x, y, z, u, v).
     pub fn shape_vertex_full(x: f32, y: f32, z: Option<f32>, uv: Option<(f32, f32)>) {
+        crate::record::shape_vertex(x, y);
         #[cfg(feature = "libprocessing")]
         if crate::lp::on() {
             let tex = TEXTURE.with(|t| t.get());
@@ -252,6 +270,8 @@ mod render {
         s.pts.push((x, y));
         s.zs.push(z.unwrap_or(0.0));
         s.uvs.push(uv.unwrap_or((0.0, 0.0)));
+        let cur = ATTRIBS.with(|a| a.borrow().clone());
+        if !cur.is_empty() || !s.attrs.is_empty() { let n = s.pts.len() - 1; s.attrs.resize(n, Vec::new()); s.attrs.push(cur); }
         if z.is_some_and(|z| z != 0.0) || crate::three::in_3d() { s.three = true; }
     }
     /// begin_contour / end_contour: a hole in the shape. Its points should go
@@ -271,7 +291,7 @@ mod render {
         s.curve.clear();
     }
     pub fn shape_vertex(x: f32, y: f32) { shape_vertex_full(x, y, None, None) }
-    pub fn shape_bezier_vertex(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) { lp_route! { crate::lp::bezier_vertex(cx1, cy1, cx2, cy2, x, y); return; }
+    pub fn shape_bezier_vertex(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) { crate::record::shape_bezier(cx1, cy1, cx2, cy2, x, y); lp_route! { crate::lp::bezier_vertex(cx1, cy1, cx2, cy2, x, y); return; }
         let mut s = shape_state().lock();
         let (x0, y0) = match s.pts.last() { Some(p) => *p, None => { s.pts.push((x, y)); return; } };
         let n = crate::BEZIER_DETAIL.load(Ordering::Relaxed).max(1);
@@ -282,7 +302,7 @@ mod render {
             s.pts.push((px, py));
         }
     }
-    pub fn shape_quadratic_vertex(cx: f32, cy: f32, x: f32, y: f32) { lp_route! { crate::lp::quadratic_vertex(cx, cy, x, y); return; }
+    pub fn shape_quadratic_vertex(cx: f32, cy: f32, x: f32, y: f32) { crate::record::shape_quadratic(cx, cy, x, y); lp_route! { crate::lp::quadratic_vertex(cx, cy, x, y); return; }
         let mut s = shape_state().lock();
         let (x0, y0) = match s.pts.last() { Some(p) => *p, None => { s.pts.push((x, y)); return; } };
         for i in 1..=16 {
@@ -291,7 +311,7 @@ mod render {
         }
     }
     /// Catmull-Rom, like Processing: the first and last curve_vertex are control points only.
-    pub fn shape_curve_vertex(x: f32, y: f32) { lp_route! { crate::lp::curve_vertex(x, y); return; }
+    pub fn shape_curve_vertex(x: f32, y: f32) { crate::record::shape_curve(x, y); lp_route! { crate::lp::curve_vertex(x, y); return; }
         let mut s = shape_state().lock();
         s.curve.push((x, y));
         let n = s.curve.len();
@@ -306,6 +326,7 @@ mod render {
         }
     }
     pub fn shape_end(close: bool) {
+        crate::record::shape_end(close);
         #[cfg(feature = "libprocessing")]
         if crate::lp::on() {
             let mesh = {
@@ -342,9 +363,12 @@ mod render {
             if s.active && s.outer.is_none() && s.holes.is_empty() && (s.three || tex.is_some()) {
                 s.active = false;
                 pad(&mut s);
+                let attrs = std::mem::take(&mut s.attrs);
+                crate::three::set_shape_attribs(attrs);
                 Some((s.kind, s.three, std::mem::take(&mut s.pts), std::mem::take(&mut s.zs), std::mem::take(&mut s.uvs), tex))
             } else { None }
         };
+        let _clear = ClearAttribs;
         if let Some((kind, three, pts, zs, uvs, tex)) = mesh {
             let verts: Vec<[f32; 3]> = pts.iter().zip(&zs).map(|(p, z)| [p.0, p.1, *z]).collect();
             if three {
@@ -1321,6 +1345,7 @@ mod render {
             let mut st = s.borrow_mut();
             if st.len() > 1 { let top = st.pop().unwrap(); st.clear(); st.push(top); }
         });
+        crate::apply_window_ratio();
     }
     /// End of setup(), draw() or an event: a layer left open by a missing
     /// endDraw() must not stay the drawing target.
@@ -3992,7 +4017,7 @@ pub fn frame_rate(fps: f32) {
 
 // ──────────────────────────── Background / color ─────────────────────────────
 
-pub fn background(v: impl Paint) { render::background_color(v.paint()); }
+pub fn background(v: impl Paint) { let c = v.paint(); record::background(c); render::background_color(c); }
 pub fn background_rgb(r: impl Num, g: impl Num, b: impl Num)            { let r = r.f(); let g = g.f(); let b = b.f(); render::background_color(cm(r, g, b, None)); }
 pub fn background_rgba(r: impl Num, g: impl Num, b: impl Num, a: impl Num)   { let r = r.f(); let g = g.f(); let b = b.f(); let a = a.f(); render::background_color(cm(r, g, b, Some(a))); }
 pub fn background_color(c: Color)                         { render::background_color(c); }
@@ -4018,27 +4043,32 @@ pub fn stroke_weight(w: f32)                              { render::set_stroke_w
 
 pub fn ellipse(x: f32, y: f32, w: f32, h: f32) {
     let (x, y, w, h) = ellipse_box(x, y, w, h);
+    record::ellipse(x, y, w, h);
     render::draw_ellipse(x, y, w, h);
 }
 pub fn circle(x: f32, y: f32, d: f32)                    { ellipse(x, y, d, d); }
 pub fn rect(x: f32, y: f32, w: f32, h: f32) {
     let (x, y, w, h) = corner_box(RECT_MODE.load(Ordering::Relaxed), x, y, w, h);
+    record::rect(x, y, w, h);
     render::draw_rect(x, y, w, h);
 }
 pub fn rect_rounded(x: f32, y: f32, w: f32, h: f32, r: f32) {
     let (x, y, w, h) = corner_box(RECT_MODE.load(Ordering::Relaxed), x, y, w, h);
+    record::rect(x, y, w, h);
     render::draw_rect_rounded(x, y, w, h, r);
 }
 #[inline] pub fn rectRounded(x: f32, y: f32, w: f32, h: f32, r: f32) { rect_rounded(x, y, w, h, r) }
 pub fn square(x: f32, y: f32, s: f32)                    { rect(x, y, s, s); }
-pub fn triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) { render::draw_triangle(x1, y1, x2, y2, x3, y3); }
-pub fn line(x1: f32, y1: f32, x2: f32, y2: f32)          { render::draw_line(x1, y1, x2, y2); }
-pub fn point(x: f32, y: f32)                              { render::draw_point(x, y); }
+pub fn triangle(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) { record::poly(&[(x1, y1), (x2, y2), (x3, y3)]); render::draw_triangle(x1, y1, x2, y2, x3, y3); }
+pub fn line(x1: f32, y1: f32, x2: f32, y2: f32)          { record::line(x1, y1, x2, y2); render::draw_line(x1, y1, x2, y2); }
+pub fn point(x: f32, y: f32)                              { record::point(x, y); render::draw_point(x, y); }
 pub fn quad(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, x4: f32, y4: f32) {
+    record::poly(&[(x1, y1), (x2, y2), (x3, y3), (x4, y4)]);
     render::draw_quad(x1, y1, x2, y2, x3, y3, x4, y4);
 }
 pub fn arc(x: f32, y: f32, w: f32, h: f32, start: f32, stop: f32) {
     let (x, y, w, h) = ellipse_box(x, y, w, h);
+    record::arc(x, y, w, h, start, stop, 0);
     render::draw_arc(x, y, w, h, start, stop);
 }
 pub const OPEN:  u32 = 1;
@@ -4047,6 +4077,7 @@ pub const PIE:   u32 = 3;
 /// arc() with a closing style: OPEN, CHORD or PIE.
 pub fn arc_mode(x: f32, y: f32, w: f32, h: f32, start: f32, stop: f32, mode: u32) {
     let (x, y, w, h) = ellipse_box(x, y, w, h);
+    record::arc(x, y, w, h, start, stop, if mode <= 3 { mode as u8 } else { 0 });
     render::draw_arc_mode(x, y, w, h, start, stop, if mode <= 3 { mode as u8 } else { 0 });
 }
 /// Centre and size of an ellipse from a call made in the current ellipseMode().
@@ -4082,7 +4113,7 @@ pub fn pop_style()  { render::pop_style(); }
 
 // ─────────────────────────── Text ────────────────────────────────────────────
 
-pub fn text(s: &str, x: f32, y: f32)  { render::draw_text(s, x, y); }
+pub fn text(s: &str, x: f32, y: f32)  { record::text(s, x, y); render::draw_text(s, x, y); }
 pub fn text_size(size: f32)            { render::set_text_size(size); }
 pub fn text_width(s: &str) -> f32      { render::text_width(s) }
 /// createFont("DejaVu Sans", 32) or createFont("data/MyFont.ttf", 32): a
@@ -4538,6 +4569,19 @@ pub fn load_pixels() -> Vec<u32> { render::copy_pixels() }
 /// updatePixels(): puts a (changed) copy from load_pixels() back on the canvas.
 pub fn update_pixels(pixels: &[u32]) { render::write_pixels(pixels); }
 
+/// attrib("name", value): a value of your own for the vertices that follow,
+/// read by a vertex shader as `attribute float name;` (or vec2..vec4).
+/// The software renderer runs it; libprocessing doesn't pass it on yet.
+pub fn attrib(name: &str, v: impl shader::UniformValue) { render::set_attrib(name, v.floats()); }
+/// attrib_position / attrib_normal / attrib_color: Processing's names for
+/// attributes holding a position, a direction or a color.
+pub fn attrib_position(name: &str, x: impl Num, y: impl Num, z: impl Num) { attrib(name, [x.f(), y.f(), z.f()]); }
+pub fn attrib_normal(name: &str, x: impl Num, y: impl Num, z: impl Num) { attrib(name, [x.f(), y.f(), z.f()]); }
+pub fn attrib_color(name: &str, c: impl Paint) { let c = c.paint(); attrib(name, [c.r, c.g, c.b, c.a]); }
+#[inline] pub fn attribPosition(name: &str, x: impl Num, y: impl Num, z: impl Num) { attrib_position(name, x, y, z) }
+#[inline] pub fn attribNormal(name: &str, x: impl Num, y: impl Num, z: impl Num) { attrib_normal(name, x, y, z) }
+#[inline] pub fn attribColor(name: &str, c: impl Paint) { attrib_color(name, c) }
+
 // ── clip(), push() / pop(), hint(), link(), JSON helpers ─────────────────
 
 /// The clip rectangle in canvas pixels, and what the canvas held when clip()
@@ -4574,6 +4618,32 @@ pub(crate) fn clip_end() {
     }
     render::write_pixels(&now);
 }
+
+/// window_ratio(w, h): draw as if the canvas were w by h; it's scaled to fit
+/// the window (keeping its shape, centered). rwidth() / rheight() are w and
+/// h, rmouse_x() / rmouse_y() the mouse in those units.
+static RATIO: parking_lot::Mutex<Option<(f32, f32)>> = parking_lot::Mutex::new(None);
+pub fn window_ratio(w: impl Num, h: impl Num) {
+    let (w, h) = (w.f(), h.f());
+    *RATIO.lock() = if w > 0.0 && h > 0.0 { Some((w, h)) } else { None };
+    apply_window_ratio();
+}
+#[inline] pub fn windowRatio(w: impl Num, h: impl Num) { window_ratio(w, h) }
+/// The scale and offset window_ratio puts in place.
+fn ratio_fit() -> Option<(f32, f32, f32)> {
+    let (rw, rh) = (*RATIO.lock())?;
+    let k = (width() / rw).min(height() / rh);
+    Some((k, (width() - rw * k) / 2.0, (height() - rh * k) / 2.0))
+}
+pub(crate) fn apply_window_ratio() {
+    if let Some((k, ox, oy)) = ratio_fit() { translate(ox, oy); scale(k); }
+}
+pub fn rwidth() -> f32 { RATIO.lock().map(|r| r.0).unwrap_or_else(width) }
+pub fn rheight() -> f32 { RATIO.lock().map(|r| r.1).unwrap_or_else(height) }
+pub fn rmouse_x() -> f32 { match ratio_fit() { Some((k, ox, _)) => (mouse_x() - ox) / k, None => mouse_x() } }
+pub fn rmouse_y() -> f32 { match ratio_fit() { Some((k, _, oy)) => (mouse_y() - oy) / k, None => mouse_y() } }
+#[inline] pub fn rmouseX() -> f32 { rmouse_x() }
+#[inline] pub fn rmouseY() -> f32 { rmouse_y() }
 
 /// push(): saves the transform and the style; pop() brings both back.
 pub fn push() { push_matrix(); push_style(); }
@@ -5024,6 +5094,8 @@ pub fn random_gaussian() -> f32 {
 // Files, JSON and tables (see data.rs).
 mod glsl;
 mod shader;
+mod record;
+pub use record::{begin_record, end_record, begin_raw, end_raw, beginRecord, endRecord, beginRaw, endRaw, PDF, SVG};
 pub use shader::{PShader, load_shader, loadShader, load_shader_vf, shader_from_source, shader_from_source_vf, UniformValue, FilterKind,
                  shader, reset_shader, resetShader};
 mod extra;

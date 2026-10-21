@@ -682,6 +682,12 @@ fn light_uniforms(vs: &mut crate::glsl::VertexRun, view: &M4, lights: &[Light]) 
     }
 }
 
+thread_local! {
+    /// attrib() values for each vertex of the shape being drawn
+    static SHAPE_ATTRIBS: RefCell<Vec<Vec<(String, Vec<f32>)>>> = const { RefCell::new(Vec::new()) };
+}
+pub(crate) fn set_shape_attribs(a: Vec<Vec<(String, Vec<f32>)>>) { SHAPE_ATTRIBS.with(|s| *s.borrow_mut() = a); }
+
 /// Shapes drawn with a shader that has a vertex stage: it places each corner
 /// (gl_Position) and what it passes along is blended across the triangle
 /// for the fragment stage.
@@ -727,6 +733,7 @@ fn draw_mesh_vs(vcpu: &crate::glsl::Cpu, vimages: &[(usize, usize, Vec<u32>)], v
             vs.set("vertColor", &c);
             vs.set("vertTexCoord", &[uv.0, uv.1, 0.0, 1.0]);
             vs.set("gl_Position", &[0.0, 0.0, 0.0, 1.0]);
+            SHAPE_ATTRIBS.with(|a| if let Some(list) = a.borrow().get(i) { for (n, v) in list { vs.set(n, v); } });
             let (clip, o) = vs.run(&outs)?;
             Some((to_screen(clip, w as f32, h as f32)?, o))
         }).collect()

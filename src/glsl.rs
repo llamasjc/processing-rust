@@ -223,9 +223,11 @@ pub struct Program {
     pub funcs: Vec<Func>,
     /// varyings, attributes, ins and outs that aren't built in, in order
     pub varyings: Vec<(Ty, String)>,
+    /// of those, the ones declared `attribute` or `in` (a vertex shader's inputs)
+    pub attributes: Vec<(Ty, String)>,
 }
 
-struct P { t: Vec<(Tok, usize)>, i: usize }
+struct P { t: Vec<(Tok, usize)>, i: usize, input: bool }
 
 impl P {
     fn peek(&self) -> &Tok { &self.t[self.i].0 }
@@ -243,13 +245,16 @@ impl P {
     /// Skips qualifiers like const, highp, in, uniform... and says which were seen.
     fn qualifiers(&mut self) -> (bool, bool, bool, bool) {
         let (mut uniform, mut constant, mut varying, mut out) = (false, false, false, false);
+        self.input = false;
         while let Tok::Id(s) = self.peek() {
             match s.as_str() {
                 "uniform" => uniform = true,
                 "const" => constant = true,
-                "varying" | "attribute" => varying = true,
+                "varying" => varying = true,
+                "attribute" => { varying = true; self.input = true; }
+                "in" => self.input = true,
                 "out" | "inout" => out = true,
-                "in" | "highp" | "mediump" | "lowp" | "flat" | "smooth" | "precise" | "invariant" => {}
+                "highp" | "mediump" | "lowp" | "flat" | "smooth" | "precise" | "invariant" => {}
                 _ => break,
             }
             self.i += 1;
@@ -278,6 +283,8 @@ impl P {
             if self.eat(";") { continue; }
             if self.is_word("precision") { while !self.eat(";") { if *self.peek() == Tok::End { break; } self.i += 1; } continue; }
             let (uniform, constant, varying, out_q) = self.qualifiers();
+            let input = self.input;
+            let varying = varying || input;
             let Some(ty) = self.ty() else { return self.err("expected a type") };
             let name = self.ident()?;
             if self.is("(") {
@@ -297,6 +304,7 @@ impl P {
                     // vertTexCoord, vertColor and the gl_ names are built in;
                     // the rest are plain globals the stages pass along
                     if builtin_var(&n).is_some() { continue; }
+                    if input { p.attributes.push((t, n.clone())); }
                     p.varyings.push((t, n.clone()));
                     p.globals.push((t, n, None, false));
                     continue;
@@ -502,7 +510,7 @@ impl P {
 pub fn parse(src: &str) -> Result<Program, String> {
     let src = preprocess(src)?;
     let toks = lex(&src)?;
-    P { t: toks, i: 0 }.program()
+    P { t: toks, i: 0, input: false }.program()
 }
 
 // ── types of expressions ─────────────────────────────────────────────────
@@ -1852,6 +1860,9 @@ fn emit_wgsl(prog: &Program, target: Target, vert: Option<&Program>) -> Result<S
         vw.out.push_str("struct GlslIn {\n    @builtin(instance_index) instance_index: u32,\n    @location(0) position: vec3<f32>,\n");
         if has("normal") { vw.out.push_str("    @location(1) normal: vec3<f32>,\n"); }
         if has("texCoord") { vw.out.push_str("    @location(2) uv: vec2<f32>,\n"); }
+        // the shader's own attributes (attrib() in the sketch), from location 8
+        let extra: Vec<(Ty, String)> = custom_attributes(v);
+        for (i, (t, n)) in extra.iter().enumerate() { vw.out.push_str(&format!("    @location({}) a_{n}: {},\n", 8 + i, t.wgsl())); }
         vw.out.push_str("}\nstruct GlslVary {\n    @builtin(position) position: vec4<f32>,\n    @location(0) vert_color: vec4<f32>,\n    @location(1) tex_coord: vec4<f32>,\n");
         for (i, (t, n)) in shared.iter().enumerate() { vw.out.push_str(&format!("    @location({}) vy_{n}: {},\n", i + 2, t.wgsl())); }
         vw.out.push_str("}\n\n");
@@ -1870,6 +1881,7 @@ fn emit_wgsl(prog: &Program, target: Target, vert: Option<&Program>) -> Result<S
                        ("texCoord", uv.to_string()), ("color", col.to_string())] {
             if has(n) { vw.line(1, &format!("vs_{n} = {};", fit(&e, ty_of(n)))); }
         }
+        for (_, n) in &extra { vw.line(1, &format!("{} = in.a_{n};", wname(n))); }
         for (n, e) in [("transform", "view.clip_from_world * model"), ("projmodelviewMatrix", "view.clip_from_world * model"),
                        ("modelview", "mv"), ("modelviewMatrix", "mv"), ("projection", "view.clip_from_view"),
                        ("projectionMatrix", "view.clip_from_view"),
@@ -2312,4 +2324,11 @@ impl Cpu {
         let mut e = Env { st, base: 0, g, ctx, fx };
         run_block(&m.body, &mut e)
     }
+}
+
+/// Processing gives these to a vertex shader itself.
+const STANDARD_ATTRIBUTES: [&str; 5] = ["position", "vertex", "color", "normal", "texCoord"];
+/// A vertex shader's attributes besides Processing's own: what attrib() fills.
+pub fn custom_attributes(vert: &Program) -> Vec<(Ty, String)> {
+    vert.attributes.iter().filter(|(t, n)| !STANDARD_ATTRIBUTES.contains(&n.as_str()) && matches!(t, Ty::Float | Ty::Vec(_))).cloned().collect()
 }
