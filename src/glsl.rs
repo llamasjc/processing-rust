@@ -715,6 +715,8 @@ pub struct Cpu {
     pub varyings: Vec<String>,
     /// uniforms the sketch set itself
     pub set_names: Vec<String>,
+    /// the same program as closures, which is what runs per pixel
+    fast: std::sync::Arc<Fast>,
 }
 
 // builtin variables live in the first global slots
@@ -939,8 +941,9 @@ pub fn compile(prog: &Program) -> Result<Cpu, String> {
         funcs.push(CFunc { slots: c.nslots, params: f.params.len(), ret: f.ret, body });
     }
     let main = c.fn_index["main"];
+    let funcs_for_fast = funcs.clone();
     let varyings = prog.varyings.iter().map(|(_, n)| n.clone()).collect();
-    Ok(Cpu { funcs, main, globals: start, global_init, uniforms, names: c.globals, varyings, set_names: Vec::new() })
+    Ok(Cpu { funcs, main, globals: start, global_init, uniforms, names: c.globals, varyings, set_names: Vec::new(), fast: std::sync::Arc::new(make_fast(&funcs_for_fast, main)) })
 }
 
 enum Flow { Go, Brk, Cont, Ret(Val), Discard }
@@ -969,7 +972,7 @@ impl OnePixel<'_> {
         g[G_VERTCOLOR] = Val::vec(&vert);
         for (slot, t, v) in vary { let mut x = Val::zero(*t); let k = t.size().max(1).min(16); x.v[..k.min(v.len())].copy_from_slice(&v[..k.min(v.len())]); g[*slot] = x; }
         g[G_FRAGCOLOR] = g[G_VERTCOLOR];
-        match self.cpu.exec_block(&self.cpu.funcs[self.cpu.main].body, frame, g, &ctx) {
+        match self.cpu.run_main(frame, g, &ctx) {
             Flow::Discard => None,
             _ => { let c = g[G_FRAGCOLOR].v; Some([c[0], c[1], c[2], c[3]]) }
         }
@@ -1015,8 +1018,10 @@ impl Pic<'_> {
 
 fn convert(t: Ty, args: &[Val]) -> Val {
     // vec4(1.0) fills, vec4(v.xy, 0, 1) concatenates, mat2(1.0) is a diagonal
-    let mut flat: Vec<f32> = Vec::with_capacity(16);
-    for a in args { flat.extend_from_slice(&a.v[..a.n()]); }
+    let mut buf = [0.0f32; 64];
+    let mut nf = 0;
+    for a in args { let k = a.n().min(64 - nf); buf[nf..nf + k].copy_from_slice(&a.v[..k]); nf += k; }
+    let flat = &buf[..nf];
     let mut out = Val::zero(t);
     match t {
         Ty::Float => out.v[0] = flat.first().copied().unwrap_or(0.0),
@@ -1086,7 +1091,7 @@ impl Cpu {
                         g[G_TEXCOORD] = Val::vec(&[(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, 0.0, 1.0]);
                         g[G_VERTCOLOR] = Val::vec(&[1.0, 1.0, 1.0, 1.0]);
                         g[G_FRAGCOLOR] = Val::vec(&[0.0, 0.0, 0.0, 1.0]);
-                        match self.exec_block(&self.funcs[self.main].body, &mut frame, &mut g, ctx) {
+                        match self.run_main(&mut frame, &mut g, ctx) {
                             Flow::Discard => *out = src[i],
                             _ => {
                                 let c = g[G_FRAGCOLOR].v;
@@ -1122,7 +1127,7 @@ impl Cpu {
                         g[G_TEXCOORD] = Val::vec(&[(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, 0.0, 1.0]);
                         g[G_VERTCOLOR] = Val::vec(&vert_color);
                         g[G_FRAGCOLOR] = Val::vec(&vert_color);
-                        *o = match self.exec_block(&self.funcs[self.main].body, &mut frame, &mut g, ctx) {
+                        *o = match self.run_main(&mut frame, &mut g, ctx) {
                             Flow::Discard => None,
                             _ => { let c = g[G_FRAGCOLOR].v; Some([c[0], c[1], c[2], c[3]]) }
                         };
@@ -1283,19 +1288,20 @@ impl Cpu {
     }
 }
 
-fn binop(op: &str, a: Val, b: Val, t: Ty) -> Val {
+fn binop(op: &str, a: Val, b: Val, t: Ty) -> Val { binop_op(op_of(op), a, b, t) }
+fn binop_op(op: Op, a: Val, b: Val, t: Ty) -> Val {
     match op {
-        "==" => return Val::b((0..a.n().max(b.n())).all(|i| a.v[i] == b.v[i])),
-        "!=" => return Val::b((0..a.n().max(b.n())).any(|i| a.v[i] != b.v[i])),
-        "<" => return Val::b(a.x() < b.x()),
-        ">" => return Val::b(a.x() > b.x()),
-        "<=" => return Val::b(a.x() <= b.x()),
-        ">=" => return Val::b(a.x() >= b.x()),
-        "^^" => return Val::b(a.truthy() != b.truthy()),
+        Op::Eq => return Val::b((0..a.n().max(b.n())).all(|i| a.v[i] == b.v[i])),
+        Op::Ne => return Val::b((0..a.n().max(b.n())).any(|i| a.v[i] != b.v[i])),
+        Op::Lt => return Val::b(a.x() < b.x()),
+        Op::Gt => return Val::b(a.x() > b.x()),
+        Op::Le => return Val::b(a.x() <= b.x()),
+        Op::Ge => return Val::b(a.x() >= b.x()),
+        Op::Xor => return Val::b(a.truthy() != b.truthy()),
         _ => {}
     }
     // matrix products
-    if op == "*" {
+    if op == Op::Mul {
         match (a.ty, b.ty) {
             (Ty::Mat(n), Ty::Vec(_)) => { let n = n as usize; let mut o = Val::zero(Ty::Vec(n as u8)); for r in 0..n { o.v[r] = (0..n).map(|c| a.v[c * n + r] * b.v[c]).sum(); } return o; }
             (Ty::Vec(_), Ty::Mat(n)) => { let n = n as usize; let mut o = Val::zero(Ty::Vec(n as u8)); for c in 0..n { o.v[c] = (0..n).map(|r| a.v[r] * b.v[c * n + r]).sum(); } return o; }
@@ -1315,9 +1321,9 @@ fn binop(op: &str, a: Val, b: Val, t: Ty) -> Val {
         let x = if a.n() == 1 { a.v[0] } else { a.v[i] };
         let y = if b.n() == 1 { b.v[0] } else { b.v[i] };
         o.v[i] = match op {
-            "+" => x + y, "-" => x - y, "*" => x * y,
-            "/" => if int { if y == 0.0 { 0.0 } else { (x / y).trunc() } } else { x / y },
-            "%" => if y == 0.0 { 0.0 } else { x % y },
+            Op::Add => x + y, Op::Sub => x - y, Op::Mul => x * y,
+            Op::Div => if int { if y == 0.0 { 0.0 } else { (x / y).trunc() } } else { x / y },
+            Op::Rem => if y == 0.0 { 0.0 } else { x % y },
             _ => 0.0,
         };
     }
@@ -1940,7 +1946,8 @@ impl VertexRun<'_> {
     pub fn set_uniform(&mut self, name: &str, vals: &[f32]) {
         if self.was_set(name) || !self.cpu.uniforms.contains_key(name) { return; }
         let mut c = Cpu { funcs: Vec::new(), main: 0, globals: std::mem::take(&mut self.g), global_init: Vec::new(),
-                          uniforms: self.cpu.uniforms.clone(), names: HashMap::new(), varyings: Vec::new(), set_names: Vec::new() };
+                          uniforms: self.cpu.uniforms.clone(), names: HashMap::new(), varyings: Vec::new(), set_names: Vec::new(),
+                          fast: self.cpu.fast.clone() };
         c.set_uniform(name, vals);
         self.g = c.globals;
     }
@@ -1959,7 +1966,7 @@ impl VertexRun<'_> {
         let empty: [u32; 0] = [];
         let ctx = Ctx { w: 1, h: 1, px: &empty, images: &self.images };
         let cpu = self.cpu;
-        if let Flow::Discard = cpu.exec_block(&cpu.funcs[cpu.main].body, &mut self.frame, &mut self.g, &ctx) { return None; }
+        if let Flow::Discard = cpu.run_main(&mut self.frame, &mut self.g, &ctx) { return None; }
         let p = self.g[G_POSITION].v;
         let mut o = Vec::new();
         for n in outs {
@@ -1980,4 +1987,329 @@ impl Cpu {
     }
     /// A global's slot and type by name.
     pub fn global(&self, name: &str) -> Option<(usize, Ty)> { self.names.get(name).copied() }
+}
+
+// ── the shader as closures (what actually runs on the CPU) ───────────────
+//
+// The tree above is turned once into nested closures, so running a pixel is
+// a chain of direct calls: no matching on node kinds or operator names, and
+// no allocating. Function calls share one stack of slots.
+
+type Ex = Box<dyn Fn(&mut Env) -> Val + Send + Sync>;
+type St = Box<dyn Fn(&mut Env) -> Flow + Send + Sync>;
+
+pub(crate) struct Env<'a, 'b> {
+    st: &'a mut Vec<Val>,
+    base: usize,
+    g: &'a mut Vec<Val>,
+    ctx: &'a Ctx<'b>,
+    fx: &'a Fast,
+}
+
+struct FastFn { slots: usize, params: usize, ret: Ty, body: Vec<St> }
+pub(crate) struct Fast { funcs: Vec<FastFn>, main: usize }
+impl std::fmt::Debug for Fast {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Fast({} functions)", self.funcs.len()) }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Op { Add, Sub, Mul, Div, Rem, Eq, Ne, Lt, Gt, Le, Ge, Xor }
+fn op_of(s: &str) -> Op {
+    match s { "+" => Op::Add, "-" => Op::Sub, "*" => Op::Mul, "/" => Op::Div, "%" => Op::Rem, "==" => Op::Eq, "!=" => Op::Ne,
+        "<" => Op::Lt, ">" => Op::Gt, "<=" => Op::Le, ">=" => Op::Ge, _ => Op::Xor }
+}
+fn op_str(o: Op) -> &'static str {
+    match o { Op::Add => "+", Op::Sub => "-", Op::Mul => "*", Op::Div => "/", Op::Rem => "%", Op::Eq => "==", Op::Ne => "!=",
+        Op::Lt => "<", Op::Gt => ">", Op::Le => "<=", Op::Ge => ">=", Op::Xor => "^^" }
+}
+
+fn run_block(b: &[St], e: &mut Env) -> Flow {
+    for s in b { match s(e) { Flow::Go => {} other => return other } }
+    Flow::Go
+}
+
+/// An lvalue made ready: its slot (and array item), then the path below it.
+struct FLv { local: bool, slot: usize, arr: Option<(usize, Ex)>, path: Vec<FAcc> }
+enum FAcc { Swz([u8; 4], u8), Idx(Ex) }
+
+impl FLv {
+    fn slot(&self, e: &mut Env) -> usize {
+        match &self.arr { Some((len, i)) => self.slot + (i(e).x().max(0.0) as usize).min(len - 1), None => self.slot }
+    }
+    fn root(&self, e: &Env, slot: usize) -> Val { if self.local { e.st[e.base + slot] } else { e.g[slot] } }
+    fn get(&self, e: &mut Env) -> Val {
+        let slot = self.slot(e);
+        let mut v = self.root(e, slot);
+        for a in &self.path {
+            v = match a {
+                FAcc::Swz(idx, n) => {
+                    let mut o = Val::zero(if *n == 1 { Ty::Float } else { Ty::Vec(*n) });
+                    for i in 0..*n as usize { o.v[i] = v.v[idx[i] as usize]; }
+                    o
+                }
+                FAcc::Idx(i) => {
+                    let i = i(e).x().max(0.0) as usize;
+                    match v.ty { Ty::Mat(n) => { let n = n as usize; let i = i.min(n - 1); Val::vec(&v.v[i * n..i * n + n]) }
+                                 _ => Val::f(v.v[i.min(v.n().max(1) - 1)]) }
+                }
+            };
+        }
+        v
+    }
+    fn set(&self, val: Val, e: &mut Env) {
+        let slot = self.slot(e);
+        let root = self.root(e, slot);
+        let mut comps = [0usize; 16];
+        let mut nc = root.n().max(1);
+        for (i, c) in comps.iter_mut().enumerate() { *c = i; }
+        let mut ty = root.ty;
+        for a in &self.path {
+            match a {
+                FAcc::Swz(idx, n) => {
+                    let mut next = [0usize; 16];
+                    for i in 0..*n as usize { next[i] = comps[(idx[i] as usize).min(nc - 1)]; }
+                    comps = next; nc = *n as usize;
+                    ty = if *n == 1 { Ty::Float } else { Ty::Vec(*n) };
+                }
+                FAcc::Idx(i) => {
+                    let i = i(e).x().max(0.0) as usize;
+                    if let Ty::Mat(n) = ty {
+                        let n = n as usize; let i = i.min(n - 1);
+                        let mut next = [0usize; 16];
+                        next[..n].copy_from_slice(&comps[i * n..i * n + n]);
+                        comps = next; nc = n; ty = Ty::Vec(n as u8);
+                    } else { comps[0] = comps[i.min(nc - 1)]; nc = 1; ty = Ty::Float; }
+                }
+            }
+        }
+        let val = if val.n() == 1 && nc > 1 { convert(ty, &[val]) } else { val };
+        let target = if self.local { &mut e.st[e.base + slot] } else { &mut e.g[slot] };
+        for k in 0..nc { target.v[comps[k]] = val.v[k.min(15)]; }
+        if self.path.is_empty() && target.ty == Ty::Int { target.v[0] = target.v[0].trunc(); }
+    }
+}
+
+fn fast_lv(lv: &LV) -> FLv {
+    FLv {
+        local: lv.local, slot: lv.slot,
+        arr: lv.arr.as_ref().map(|(n, i)| (*n, fast_ex(i))),
+        path: lv.path.iter().map(|a| match a { Acc::Swz(i, n) => FAcc::Swz(*i, *n), Acc::Idx(i) => FAcc::Idx(fast_ex(i)) }).collect(),
+    }
+}
+
+/// Is it worked out the same every time (no names, no images)?
+fn is_const(c: &C) -> bool {
+    match c {
+        C::K(_) => true,
+        C::Neg(x) | C::Not(x) => is_const(x),
+        C::Bin(_, a, b, _) | C::And(a, b) | C::Or(a, b) => is_const(a) && is_const(b),
+        C::Tern(c, a, b) => is_const(c) && is_const(a) && is_const(b),
+        C::Make(_, args) => args.iter().all(is_const),
+        C::Bi(b, args) => *b != Bi::Texture && args.iter().all(is_const),
+        C::Acc(b, Acc::Swz(..), _) => is_const(b),
+        _ => false,
+    }
+}
+fn fast_ex(c: &C) -> Ex {
+    if is_const(c) && !matches!(c, C::K(_)) {
+        // worked out once, now
+        let ex = fast_ex_raw(c);
+        let mut st = Vec::new();
+        let mut g = Vec::new();
+        let empty: [u32; 0] = [];
+        let ctx = Ctx { w: 1, h: 1, px: &empty, images: &[] };
+        let fx = Fast { funcs: Vec::new(), main: 0 };
+        let v = ex(&mut Env { st: &mut st, base: 0, g: &mut g, ctx: &ctx, fx: &fx });
+        return Box::new(move |_| v);
+    }
+    fast_ex_raw(c)
+}
+fn fast_ex_raw(c: &C) -> Ex {
+    match c {
+        C::K(v) => { let v = *v; Box::new(move |_| v) }
+        C::L(s) => { let s = *s; Box::new(move |e| e.st[e.base + s]) }
+        C::G(s) => { let s = *s; Box::new(move |e| e.g[s]) }
+        C::ArrIdx(local, base, len, i) => {
+            let (local, base, len, i) = (*local, *base, *len, fast_ex(i));
+            Box::new(move |e| { let k = (i(e).x().max(0.0) as usize).min(len - 1); if local { e.st[e.base + base + k] } else { e.g[base + k] } })
+        }
+        C::Acc(b, Acc::Swz(idx, n), t) => {
+            let (b, idx, n, t) = (fast_ex(b), *idx, *n as usize, *t);
+            if n == 1 { let k = idx[0] as usize; return Box::new(move |e| Val::f(b(e).v[k])); }
+            Box::new(move |e| { let v = b(e); let mut o = Val::zero(t); for i in 0..n { o.v[i] = v.v[idx[i] as usize]; } o })
+        }
+        C::Acc(b, Acc::Idx(i), _) => {
+            let (b, i) = (fast_ex(b), fast_ex(i));
+            Box::new(move |e| {
+                let v = b(e); let i = i(e).x().max(0.0) as usize;
+                match v.ty { Ty::Mat(n) => { let n = n as usize; let i = i.min(n - 1); Val::vec(&v.v[i * n..i * n + n]) }
+                             _ => Val::f(v.v[i.min(v.n().max(1) - 1)]) }
+            })
+        }
+        C::Neg(x) => { let x = fast_ex(x); Box::new(move |e| { let mut v = x(e); for i in 0..v.n() { v.v[i] = -v.v[i]; } v }) }
+        C::Not(x) => { let x = fast_ex(x); Box::new(move |e| Val::b(!x(e).truthy())) }
+        C::And(a, b) => { let (a, b) = (fast_ex(a), fast_ex(b)); Box::new(move |e| Val::b(a(e).truthy() && b(e).truthy())) }
+        C::Or(a, b) => { let (a, b) = (fast_ex(a), fast_ex(b)); Box::new(move |e| Val::b(a(e).truthy() || b(e).truthy())) }
+        C::Tern(c, a, b) => { let (c, a, b) = (fast_ex(c), fast_ex(a), fast_ex(b)); Box::new(move |e| if c(e).truthy() { a(e) } else { b(e) }) }
+        C::Bin(op, a, b, t) => {
+            let (o, a, b, t) = (op_of(op), fast_ex(a), fast_ex(b), *t);
+            // plain float arithmetic, the most common case
+            if t == Ty::Float && matches!(o, Op::Add | Op::Sub | Op::Mul | Op::Div) {
+                return match o {
+                    Op::Add => Box::new(move |e| Val::f(a(e).v[0] + b(e).v[0])),
+                    Op::Sub => Box::new(move |e| Val::f(a(e).v[0] - b(e).v[0])),
+                    Op::Mul => Box::new(move |e| Val::f(a(e).v[0] * b(e).v[0])),
+                    _ => Box::new(move |e| Val::f(a(e).v[0] / b(e).v[0])),
+                };
+            }
+            if matches!(o, Op::Lt | Op::Gt | Op::Le | Op::Ge) {
+                return match o {
+                    Op::Lt => Box::new(move |e| Val::b(a(e).v[0] < b(e).v[0])),
+                    Op::Gt => Box::new(move |e| Val::b(a(e).v[0] > b(e).v[0])),
+                    Op::Le => Box::new(move |e| Val::b(a(e).v[0] <= b(e).v[0])),
+                    _ => Box::new(move |e| Val::b(a(e).v[0] >= b(e).v[0])),
+                };
+            }
+            Box::new(move |e| { let (x, y) = (a(e), b(e)); binop_op(o, x, y, t) })
+        }
+        C::Make(t, args) => {
+            let t = *t;
+            let args: Vec<Ex> = args.iter().map(fast_ex).collect();
+            if args.len() == 1 {
+                let a = args.into_iter().next().unwrap();
+                return Box::new(move |e| { let v = a(e); if v.ty == t { v } else { convert(t, &[v]) } });
+            }
+            Box::new(move |e| {
+                let mut vals = [Val::zero(Ty::Float); 16];
+                let n = args.len().min(16);
+                for k in 0..n { vals[k] = args[k](e); }
+                convert(t, &vals[..n])
+            })
+        }
+        C::Bi(bi, args) => {
+            let bi = *bi;
+            let args: Vec<Ex> = args.iter().take(3).map(fast_ex).collect();
+            Box::new(move |e| {
+                let mut v = [Val::zero(Ty::Float); 3];
+                for (k, a) in args.iter().enumerate() { v[k] = a(e); }
+                builtin(bi, &v[..args.len()], e.ctx)
+            })
+        }
+        C::Call(fi, args, outs) => {
+            let fi = *fi;
+            let args: Vec<Ex> = args.iter().map(fast_ex).collect();
+            let outs: Vec<(usize, FLv)> = outs.iter().map(|(i, lv)| (*i, fast_lv(lv))).collect();
+            Box::new(move |e| {
+                let fx = e.fx;
+                let func = &fx.funcs[fi];
+                let new_base = e.st.len();
+                let need = func.slots.max(func.params);
+                // arguments are worked out in the caller's frame, then pushed
+                let mut vals = [Val::zero(Ty::Float); 16];
+                let np = args.len().min(func.params).min(16);
+                for k in 0..np { vals[k] = args[k](e); }
+                e.st.resize(new_base + need, Val::zero(Ty::Float));
+                e.st[new_base..new_base + np].copy_from_slice(&vals[..np]);
+                let old = e.base;
+                e.base = new_base;
+                let r = match run_block(&func.body, e) { Flow::Ret(v) => v, _ => Val::zero(func.ret) };
+                let mut back = [Val::zero(Ty::Float); 16];
+                for (k, (i, _)) in outs.iter().enumerate().take(16) { back[k] = e.st[new_base + *i]; }
+                e.base = old;
+                e.st.truncate(new_base);
+                for (k, (_, lv)) in outs.iter().enumerate().take(16) { lv.set(back[k], e); }
+                r
+            })
+        }
+        C::Set(lv, op, x, t) => {
+            let (lv, x, t) = (fast_lv(lv), fast_ex(x), *t);
+            let op: Option<&'static str> = if *op == "=" { None } else { Some(op_str(op_of(op))) };
+            Box::new(move |e| {
+                let mut v = x(e);
+                if let Some(op) = op { let cur = lv.get(e); v = binop(op, cur, v, t); }
+                if v.ty != t && !(v.n() == 1 && t.size() == 1) { v = convert(t, &[v]); }
+                lv.set(v, e);
+                v
+            })
+        }
+        C::IncDec(lv, inc, pre, t) => {
+            let (lv, inc, pre, t) = (fast_lv(lv), *inc, *pre, *t);
+            Box::new(move |e| {
+                let cur = lv.get(e);
+                let next = binop(if inc { "+" } else { "-" }, cur, Val::f(1.0), t);
+                lv.set(next, e);
+                if pre { next } else { cur }
+            })
+        }
+    }
+}
+
+fn fast_st(s: &S) -> St {
+    match s {
+        S::E(c) => { let c = fast_ex(c); Box::new(move |e| { c(e); Flow::Go }) }
+        S::Init(slot, c) => { let (slot, c) = (*slot, fast_ex(c)); Box::new(move |e| { let v = c(e); let b = e.base; e.st[b + slot] = v; Flow::Go }) }
+        S::InitArr(slot, items) => {
+            let slot = *slot;
+            let items: Vec<Ex> = items.iter().map(fast_ex).collect();
+            Box::new(move |e| { for (k, c) in items.iter().enumerate() { let v = c(e); let b = e.base; e.st[b + slot + k] = v; } Flow::Go })
+        }
+        S::Zero(slot, t) => { let (slot, t) = (*slot, *t); Box::new(move |e| { let b = e.base; e.st[b + slot] = Val::zero(t); Flow::Go }) }
+        S::If(c, a, b) => {
+            let c = fast_ex(c);
+            let a: Vec<St> = a.iter().map(fast_st).collect();
+            let b: Vec<St> = b.iter().map(fast_st).collect();
+            Box::new(move |e| if c(e).truthy() { run_block(&a, e) } else { run_block(&b, e) })
+        }
+        S::Loop(init, cond, step, body, cond_last) => {
+            let init: Vec<St> = init.iter().map(fast_st).collect();
+            let cond = cond.as_ref().map(fast_ex);
+            let step = step.as_ref().map(fast_ex);
+            let body: Vec<St> = body.iter().map(fast_st).collect();
+            let cond_last = *cond_last;
+            Box::new(move |e| {
+                for s in &init { s(e); }
+                let mut guard = 0u32;
+                loop {
+                    if !cond_last { if let Some(c) = &cond { if !c(e).truthy() { break; } } }
+                    match run_block(&body, e) {
+                        Flow::Brk => break,
+                        Flow::Ret(v) => return Flow::Ret(v),
+                        Flow::Discard => return Flow::Discard,
+                        _ => {}
+                    }
+                    if let Some(st) = &step { st(e); }
+                    if cond_last { if let Some(c) = &cond { if !c(e).truthy() { break; } } }
+                    guard += 1;
+                    if guard > 100_000 { break; }
+                }
+                Flow::Go
+            })
+        }
+        S::Ret(c) => match c {
+            Some(c) => { let c = fast_ex(c); Box::new(move |e| Flow::Ret(c(e))) }
+            None => Box::new(|_| Flow::Ret(Val::zero(Ty::Void))),
+        },
+        S::Brk => Box::new(|_| Flow::Brk),
+        S::Cont => Box::new(|_| Flow::Cont),
+        S::Discard => Box::new(|_| Flow::Discard),
+    }
+}
+
+fn make_fast(funcs: &[CFunc], main: usize) -> Fast {
+    Fast {
+        funcs: funcs.iter().map(|f| FastFn { slots: f.slots, params: f.params, ret: f.ret, body: f.body.iter().map(fast_st).collect() }).collect(),
+        main,
+    }
+}
+
+impl Cpu {
+    /// Runs main(): `st` is the stack (its start is main's frame), `g` the globals.
+    fn run_main(&self, st: &mut Vec<Val>, g: &mut Vec<Val>, ctx: &Ctx) -> Flow {
+        let fx = &*self.fast;
+        let m = &fx.funcs[fx.main];
+        st.clear();
+        st.resize(m.slots, Val::zero(Ty::Float));
+        let mut e = Env { st, base: 0, g, ctx, fx };
+        run_block(&m.body, &mut e)
+    }
 }

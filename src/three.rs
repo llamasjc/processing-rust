@@ -743,11 +743,13 @@ fn draw_mesh_vs(vcpu: &crate::glsl::Cpu, vimages: &[(usize, usize, Vec<u32>)], v
                 let (x, y) = PIXEL.with(|p| p.get());
                 let mut mx = mix.borrow_mut();
                 for j in 0..stride { mx[j] = k0 * oa[j] + k1 * ob[j] + k2 * oc[j]; }
-                let mut vary = Vec::with_capacity(slots.len());
+                let mut vary: [(usize, crate::glsl::Ty, &[f32]); 16] = [(0, crate::glsl::Ty::Float, &[]); 16];
                 let mut at = 0;
-                for (k, (slot, ty)) in slots.iter().enumerate() { vary.push((*slot, *ty, &mx[at..at + sizes[k]])); at += sizes[k]; }
+                let nv = slots.len().min(16);
+                for (k, (slot, ty)) in slots.iter().take(16).enumerate() { vary[k] = (*slot, *ty, &mx[at..at + sizes[k]]); at += sizes[k]; }
+                let vary = &vary[..nv];
                 let vc = [mx[0], mx[1], mx[2], mx[3]];
-                match px.color_with(x, y, vc, &vary) {
+                match px.color_with(x, y, vc, vary) {
                     Some(c) => Color::from_rgba(c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0), c[3].clamp(0.0, 1.0)),
                     None => Color::from_rgba(0.0, 0.0, 0.0, 0.0),
                 }
