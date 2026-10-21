@@ -277,13 +277,28 @@ pub fn reset_shader() {
 #[inline] pub fn resetShader() { reset_shader() }
 
 /// The active shader's vertex stage, with its uniforms set (software renderer).
-pub(crate) fn active_vertex() -> Option<glsl::Cpu> {
+pub(crate) fn active_vertex() -> Option<(glsl::Cpu, Vec<(usize, usize, Vec<u32>)>)> {
     let s = (*ACTIVE.lock())?;
     let all = shaders().lock();
     let e = all.get(s.id - 1)?;
     let mut v = e.vert.clone()?;
     for (k, vals) in &e.values { v.set_uniform(k, vals); }
-    Some(v)
+    // images on its sampler2D uniforms: picture 0 is the canvas, so they count from 1
+    let mut images = Vec::new();
+    for (name, id) in &e.textures {
+        if !v.has_uniform(name) { continue; }
+        images.push(image_px(*id));
+        v.set_uniform(name, &[images.len() as f32]);
+    }
+    Some((v, images))
+}
+fn image_px(id: u64) -> (usize, usize, Vec<u32>) {
+    let (iw, ih) = crate::render::image_size(id);
+    let px: Vec<u32> = crate::render::image_pixels(id).iter().map(|c| {
+        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+        (b(c.a) << 24) | (b(c.r) << 16) | (b(c.g) << 8) | b(c.b)
+    }).collect();
+    (iw as usize, ih as usize, px)
 }
 /// Is a shader with a vertex stage active? Then every shape goes through 3D.
 pub(crate) fn vertex_active() -> bool {

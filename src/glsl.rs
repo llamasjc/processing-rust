@@ -1703,7 +1703,6 @@ const VERTEX_MATRICES: [&str; 8] = ["transform", "modelview", "modelviewMatrix",
 /// WGSL module for libprocessing.
 pub fn to_wgsl_material_vf(frag: &Program, vert: &Program) -> Result<String, String> {
     check(vert)?;
-    if vert.uniforms.iter().any(|(t, _)| *t == Ty::Sampler) { return Err("a vertex shader can't read images on libprocessing yet".into()); }
     // the matrices are made in the vertex stage, not set by the sketch
     let mut v = vert.clone();
     let mats: Vec<(Ty, String)> = v.uniforms.iter().filter(|(_, n)| VERTEX_MATRICES.contains(&n.as_str())).cloned().collect();
@@ -1767,7 +1766,7 @@ fn emit_wgsl(prog: &Program, target: Target, vert: Option<&Program>) -> Result<S
     // images set as uniforms: one texture each, named after the uniform (and
     // its own sampler in a material)
     let mut binding = 1;
-    for (t, n) in &prog.uniforms {
+    for (t, n) in &all_uniforms {
         if *t == Ty::Sampler && (n != "texture" || target == Target::Material) {
             w.out.push_str(&format!("@group({group}) @binding({binding}) var tex_{n}: texture_2d<f32>;\n"));
             binding += 1;
@@ -1849,7 +1848,10 @@ fn emit_wgsl(prog: &Program, target: Target, vert: Option<&Program>) -> Result<S
         if has("texCoord") { vw.out.push_str("    @location(2) uv: vec2<f32>,\n"); }
         vw.out.push_str("}\nstruct GlslVary {\n    @builtin(position) position: vec4<f32>,\n    @location(0) vert_color: vec4<f32>,\n    @location(1) tex_coord: vec4<f32>,\n");
         for (i, (t, n)) in shared.iter().enumerate() { vw.out.push_str(&format!("    @location({}) vy_{n}: {},\n", i + 2, t.wgsl())); }
-        vw.out.push_str("}\n\n@vertex\nfn vertex(in: GlslIn) -> GlslVary {\n");
+        vw.out.push_str("}\n\n");
+        // the inverse transpose of the modelview's 3x3, from its cofactors
+        vw.out.push_str("fn glsl_normal_matrix(m: mat4x4<f32>) -> mat3x3<f32> {\n    let a = m[0].xyz; let b = m[1].xyz; let c = m[2].xyz;\n    let det = dot(a, cross(b, c));\n    if abs(det) < 1e-20 { return mat3x3<f32>(a, b, c); }\n    return mat3x3<f32>(cross(b, c), cross(c, a), cross(a, b)) * (1.0 / det);\n}\n\n");
+        vw.out.push_str("@vertex\nfn vertex(in: GlslIn) -> GlslVary {\n");
         vw.out.push_str("    let model = world_from_local(in.instance_index);\n    let mv = view.view_from_world * model;\n");
         let fit = |e: &str, t: Option<Ty>| -> String {
             match t { Some(Ty::Vec(3)) => format!("({e}).xyz"), Some(Ty::Vec(2)) => format!("({e}).xy"), Some(Ty::Float) => format!("({e}).x"), _ => e.to_string() }
@@ -1865,7 +1867,7 @@ fn emit_wgsl(prog: &Program, target: Target, vert: Option<&Program>) -> Result<S
         for (n, e) in [("transform", "view.clip_from_world * model"), ("projmodelviewMatrix", "view.clip_from_world * model"),
                        ("modelview", "mv"), ("modelviewMatrix", "mv"), ("projection", "view.clip_from_view"),
                        ("projectionMatrix", "view.clip_from_view"),
-                       ("normalMatrix", "mat3x3<f32>(normalize(mv[0].xyz), normalize(mv[1].xyz), normalize(mv[2].xyz))"),
+                       ("normalMatrix", "glsl_normal_matrix(mv)"),
                        ("texMatrix", "mat4x4<f32>(vec4<f32>(1.0, 0.0, 0.0, 0.0), vec4<f32>(0.0, 1.0, 0.0, 0.0), vec4<f32>(0.0, 0.0, 1.0, 0.0), vec4<f32>(0.0, 0.0, 0.0, 1.0))")] {
             if has(n) { vw.line(1, &format!("vs_{n} = {e};")); }
         }
@@ -1931,6 +1933,7 @@ pub struct VertexRun<'a> {
     g: Vec<Val>,
     frame: Vec<Val>,
     set_by_sketch: Vec<String>,
+    images: Vec<(usize, usize, Vec<u32>)>,
 }
 impl VertexRun<'_> {
     /// A uniform, unless the sketch set it with shader.set (then it stays).
@@ -1954,7 +1957,7 @@ impl VertexRun<'_> {
     /// another (each as many numbers as its type has).
     pub fn run(&mut self, outs: &[String]) -> Option<([f32; 4], Vec<f32>)> {
         let empty: [u32; 0] = [];
-        let ctx = Ctx { w: 1, h: 1, px: &empty, images: &[] };
+        let ctx = Ctx { w: 1, h: 1, px: &empty, images: &self.images };
         let cpu = self.cpu;
         if let Flow::Discard = cpu.exec_block(&cpu.funcs[cpu.main].body, &mut self.frame, &mut self.g, &ctx) { return None; }
         let p = self.g[G_POSITION].v;
@@ -1966,13 +1969,14 @@ impl VertexRun<'_> {
     }
 }
 impl Cpu {
-    /// Ready to run as a vertex shader.
-    pub fn vertex(&self) -> VertexRun<'_> {
+    /// Ready to run as a vertex shader, with the images its sampler2D
+    /// uniforms point at.
+    pub fn vertex_with(&self, images: Vec<(usize, usize, Vec<u32>)>) -> VertexRun<'_> {
         let mut g = self.globals.clone();
         let empty: [u32; 0] = [];
-        let ctx = Ctx { w: 1, h: 1, px: &empty, images: &[] };
+        let ctx = Ctx { w: 1, h: 1, px: &empty, images: &images };
         for (slot, e) in &self.global_init { let v = self.eval(e, &mut [], &mut g, &ctx); g[*slot] = v; }
-        VertexRun { cpu: self, g, frame: vec![Val::zero(Ty::Float); self.funcs[self.main].slots], set_by_sketch: self.set_names.clone() }
+        VertexRun { cpu: self, g, frame: vec![Val::zero(Ty::Float); self.funcs[self.main].slots], set_by_sketch: self.set_names.clone(), images }
     }
     /// A global's slot and type by name.
     pub fn global(&self, name: &str) -> Option<(usize, Ty)> { self.names.get(name).copied() }

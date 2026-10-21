@@ -573,7 +573,7 @@ fn raster_line(a: SV, b: SV, col: Color, weight: f32) {
 /// Fills and outlines triangles given in model space, with the current style.
 /// `edges` are pairs of vertex indexes to outline (None: every triangle edge).
 fn draw_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], edges: Option<&[[usize; 2]]>) {
-    if let Some(vs) = crate::shader::active_vertex() { return draw_mesh_vs(&vs, verts, None, tris, edges); }
+    if let Some((vs, imgs)) = crate::shader::active_vertex() { return draw_mesh_vs(&vs, &imgs, verts, None, tris, edges); }
     let (m, view, proj, eye) = matrices();
     let (w, h) = dims();
     let (wf, hf) = (w as f32, h as f32);
@@ -621,7 +621,7 @@ fn draw_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], edges: Option<&[[usize; 2]
 /// A begin_shape / vertex / end_shape made in 3D (or textured in 3D):
 /// filled with the texture or the fill, lit, and outlined along `edges`.
 pub(crate) fn draw_mesh_uv(verts: &[[f32; 3]], uvs: &[(f32, f32)], tris: &[[usize; 3]], edges: &[[usize; 2]], tex: Option<u64>) {
-    if let Some(vs) = crate::shader::active_vertex() { return draw_mesh_vs(&vs, verts, Some(uvs), tris, Some(edges)); }
+    if let Some((vs, imgs)) = crate::shader::active_vertex() { return draw_mesh_vs(&vs, &imgs, verts, Some(uvs), tris, Some(edges)); }
     let Some(tex) = tex else { return draw_mesh(verts, tris, Some(edges)) };
     let (m, view, proj, eye) = matrices();
     let (w, h) = dims();
@@ -685,7 +685,7 @@ fn light_uniforms(vs: &mut crate::glsl::VertexRun, view: &M4, lights: &[Light]) 
 /// Shapes drawn with a shader that has a vertex stage: it places each corner
 /// (gl_Position) and what it passes along is blended across the triangle
 /// for the fragment stage.
-fn draw_mesh_vs(vcpu: &crate::glsl::Cpu, verts: &[[f32; 3]], uvs: Option<&[(f32, f32)]>, tris: &[[usize; 3]], edges: Option<&[[usize; 2]]>) {
+fn draw_mesh_vs(vcpu: &crate::glsl::Cpu, vimages: &[(usize, usize, Vec<u32>)], verts: &[[f32; 3]], uvs: Option<&[(f32, f32)]>, tris: &[[usize; 3]], edges: Option<&[[usize; 2]]>) {
     let (m, view, proj, _) = matrices();
     let (w, h) = dims();
     let (fill, stroke, weight) = crate::render::style_pub();
@@ -707,7 +707,7 @@ fn draw_mesh_vs(vcpu: &crate::glsl::Cpu, verts: &[[f32; 3]], uvs: Option<&[(f32,
     let sizes: Vec<usize> = slots.iter().map(|(_, t)| t.size_pub().max(1)).collect();
     let stride: usize = sizes.iter().sum();
     let run_stage = |col: Color| -> Vec<Option<(SV, Vec<f32>)>> {
-        let mut vs = vcpu.vertex();
+        let mut vs = vcpu.vertex_with(vimages.to_vec());
         for (k, v) in [("transform", &pmv), ("modelviewMatrix", &mv), ("modelview", &mv), ("projectionMatrix", &proj),
                        ("projection", &proj), ("projmodelviewMatrix", &pmv), ("texMatrix", &IDENT)] {
             if vcpu.uniforms.contains_key(k) && !vs.was_set(k) { vs.set_uniform(k, v); }

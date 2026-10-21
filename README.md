@@ -246,8 +246,9 @@ varyings reach the fragment shader, blended across each triangle. While one is
 active every shape goes through the 3D path, as in P3D. On the default renderer
 it also gets `lightCount`, `lightPosition[8]` and the other light uniforms. On
 libprocessing it needs the lp-fork (its `processing::vertex` module); there
-`color` is the shape's fill, `normalMatrix` assumes even scaling, varyings are
-floats or vecs, and the vertex shader can't read images yet.
+`color` is the shape's fill and varyings are floats or vecs. Vertex shaders
+can read images (`sampler2D` uniforms, set with `shader.set("height", img)`)
+on both. See `examples/VertexWave`.
 
 Supported: float, int, bool, vec2-4, mat2-4, functions (with `out` and `inout`
 parameters), if / for / while / do, `discard`, `const` and `#define`, the
