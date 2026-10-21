@@ -302,7 +302,7 @@ fn image_px(id: u64) -> (usize, usize, Vec<u32>) {
 }
 /// The attrib() inputs the shader shapes use on libprocessing needs: name and
 /// how many numbers each.
-#[cfg(feature = "libprocessing")]
+#[cfg(all(feature = "libprocessing", lp_attribs))]
 pub(crate) fn lp_attributes() -> Vec<(String, usize)> {
     let Some(s) = *LP_ACTIVE.lock() else { return Vec::new() };
     let all = shaders().lock();
