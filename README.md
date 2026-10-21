@@ -250,6 +250,25 @@ libprocessing it needs the lp-fork (its `processing::vertex` module); there
 can read images (`sampler2D` uniforms, set with `shader.set("height", img)`)
 on both. See `examples/VertexWave`.
 
+On the default renderer shaders are turned into Rust closures once when they
+load (constants worked out ahead), so a pixel costs a chain of direct calls.
+
+### Clipping, push / pop, hints, links
+
+`clip(x, y, w, h)` (placed like an image, following translate and scale)
+keeps drawing inside a rectangle until `no_clip()` or the end of `draw()`, on
+both renderers. `push()` / `pop()` save and restore the transform and style
+together. `hint(DISABLE_DEPTH_TEST)` lets 3D shapes draw over each other in
+order on the default renderer; the other hints are accepted and do nothing.
+`link(url)` opens the browser, `launch(&["file.pdf"])` opens a file or runs
+a program, `save_stream(target, source)` copies a file or downloads an
+address (with curl). `load_json_object`, `load_json_array`,
+`parse_json_object`, `parse_json_array` and the save ones are Processing's
+names for the JSON functions.
+
+Not there yet: `begin_record` / `begin_raw` (PDF and SVG output), custom
+vertex attributes (`attrib`), and `window_ratio`.
+
 Supported: float, int, bool, vec2-4, mat2-4, functions (with `out` and `inout`
 parameters), if / for / while / do, `discard`, `const` and `#define`, the
 usual built-in functions, and images as `sampler2D` uniforms

@@ -1324,7 +1324,7 @@ mod render {
     }
     /// End of setup(), draw() or an event: a layer left open by a missing
     /// endDraw() must not stay the drawing target.
-    pub fn end_draw()   { end_all_graphics(); }
+    pub fn end_draw()   { crate::clip_end(); end_all_graphics(); }
     pub fn present()    {}
 
     #[allow(dead_code)]
@@ -4537,6 +4537,120 @@ pub fn is_looping() -> bool {
 pub fn load_pixels() -> Vec<u32> { render::copy_pixels() }
 /// updatePixels(): puts a (changed) copy from load_pixels() back on the canvas.
 pub fn update_pixels(pixels: &[u32]) { render::write_pixels(pixels); }
+
+// ── clip(), push() / pop(), hint(), link(), JSON helpers ─────────────────
+
+/// The clip rectangle in canvas pixels, and what the canvas held when clip()
+/// was called: whatever is drawn outside the rectangle is put back from it.
+static CLIP: parking_lot::Mutex<Option<((i64, i64, i64, i64), Vec<u32>)>> = parking_lot::Mutex::new(None);
+
+/// clip(x, y, w, h): only this rectangle (placed like an image, see
+/// image_mode) can be drawn on, until no_clip() or the end of draw().
+/// It follows translate and scale; turned shapes are clipped to their box.
+pub fn clip(x: impl Num, y: impl Num, w: impl Num, h: impl Num) {
+    clip_end();
+    let (x, y, w, h) = corner_box(IMAGE_MODE.load(Ordering::Relaxed), x.f(), y.f(), w.f(), h.f());
+    let corners = [(x, y), (x + w, y), (x, y + h), (x + w, y + h)];
+    let pts: Vec<(f32, f32)> = corners.iter().map(|&(a, b)| (crate::three::screen_x(a, b, 0.0), crate::three::screen_y(a, b, 0.0))).collect();
+    let x0 = pts.iter().map(|p| p.0).fold(f32::MAX, f32::min).round() as i64;
+    let y0 = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).round() as i64;
+    let x1 = pts.iter().map(|p| p.0).fold(f32::MIN, f32::max).round() as i64;
+    let y1 = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).round() as i64;
+    *CLIP.lock() = Some(((x0, y0, x1, y1), render::copy_pixels()));
+}
+/// no_clip(): the whole canvas can be drawn on again.
+pub fn no_clip() { clip_end(); }
+#[inline] pub fn noClip() { no_clip() }
+/// Puts back what was drawn outside the clip rectangle and ends the clip.
+pub(crate) fn clip_end() {
+    let Some(((x0, y0, x1, y1), before)) = CLIP.lock().take() else { return };
+    let mut now = render::copy_pixels();
+    if now.len() != before.len() { return; }
+    let w = width() as i64;
+    if w <= 0 { return; }
+    for (i, p) in now.iter_mut().enumerate() {
+        let (x, y) = (i as i64 % w, i as i64 / w);
+        if x < x0 || x >= x1 || y < y0 || y >= y1 { *p = before[i]; }
+    }
+    render::write_pixels(&now);
+}
+
+/// push(): saves the transform and the style; pop() brings both back.
+pub fn push() { push_matrix(); push_style(); }
+/// pop(): undoes push().
+pub fn pop() { pop_style(); pop_matrix(); }
+
+pub const DISABLE_DEPTH_TEST: i32 = 2;
+pub const ENABLE_DEPTH_TEST: i32 = -2;
+pub const ENABLE_DEPTH_SORT: i32 = 3;
+pub const DISABLE_DEPTH_SORT: i32 = -3;
+pub const DISABLE_OPENGL_ERRORS: i32 = 4;
+pub const ENABLE_OPENGL_ERRORS: i32 = -4;
+pub const DISABLE_DEPTH_MASK: i32 = 5;
+pub const ENABLE_DEPTH_MASK: i32 = -5;
+pub const DISABLE_OPTIMIZED_STROKE: i32 = 6;
+pub const ENABLE_OPTIMIZED_STROKE: i32 = -6;
+pub const ENABLE_STROKE_PERSPECTIVE: i32 = 7;
+pub const DISABLE_STROKE_PERSPECTIVE: i32 = -7;
+pub const DISABLE_TEXTURE_MIPMAPS: i32 = 8;
+pub const ENABLE_TEXTURE_MIPMAPS: i32 = -8;
+pub const ENABLE_STROKE_PURE: i32 = 9;
+pub const DISABLE_STROKE_PURE: i32 = -9;
+pub const ENABLE_ASYNC_SAVEFRAME: i32 = 10;
+pub const DISABLE_ASYNC_SAVEFRAME: i32 = -10;
+/// hint(which): Processing's renderer hints. DISABLE_DEPTH_TEST lets 3D
+/// shapes draw over each other in the order they're drawn (the software
+/// renderer); the rest are accepted and change nothing here.
+pub fn hint(which: i32) {
+    match which {
+        DISABLE_DEPTH_TEST => crate::three::set_depth_test(false),
+        ENABLE_DEPTH_TEST => crate::three::set_depth_test(true),
+        _ => {}
+    }
+}
+
+/// link("https://..."): opens the address in the web browser.
+pub fn link(url: &str) { launch(&[url]); }
+/// launch(["program", "args"...]) or launch(["file.pdf"]): opens a file with
+/// the program the system uses for it, or runs a program. False if it can't.
+pub fn launch(args: &[&str]) -> bool {
+    let Some(first) = args.first() else { return false };
+    let opener = if cfg!(target_os = "macos") { "open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
+    let run = |prog: &str, rest: &[&str]| std::process::Command::new(prog).args(rest)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().is_ok();
+    if args.len() == 1 && (first.contains("://") || std::path::Path::new(first).exists()) { return run(opener, args); }
+    run(first, &args[1..])
+}
+
+/// save_stream("copy.zip", "https://.../file.zip" or "data/file.zip"):
+/// copies a file or downloads an address (with curl) into the sketch folder.
+pub fn save_stream(target: &str, source: &str) -> bool {
+    if source.contains("://") {
+        return std::process::Command::new("curl").args(["-fsSL", "-o", target, source])
+            .status().map(|s| s.success()).unwrap_or(false);
+    }
+    let from = if std::path::Path::new(source).is_file() { source.to_string() } else { format!("data/{source}") };
+    std::fs::copy(from, target).is_ok()
+}
+
+/// Processing's JSON functions by their own names: an object or an array
+/// (Json::Null when the file or text isn't one).
+pub fn load_json_object(path: &str) -> Json { only_kind(load_json(path), true) }
+pub fn load_json_array(path: &str) -> Json { only_kind(load_json(path), false) }
+pub fn parse_json_object(text: &str) -> Json { only_kind(parse_json(text).unwrap_or(Json::Null), true) }
+pub fn parse_json_array(text: &str) -> Json { only_kind(parse_json(text).unwrap_or(Json::Null), false) }
+pub fn save_json_object(v: &Json, path: &str) -> bool { save_json(path, v) }
+pub fn save_json_array(v: &Json, path: &str) -> bool { save_json(path, v) }
+fn only_kind(v: Json, object: bool) -> Json {
+    match (&v, object) { (Json::Obj(_), true) | (Json::Arr(_), false) => v, _ => Json::Null }
+}
+#[inline] pub fn loadJSONObject(path: &str) -> Json { load_json_object(path) }
+#[inline] pub fn loadJSONArray(path: &str) -> Json { load_json_array(path) }
+#[inline] pub fn parseJSONObject(text: &str) -> Json { parse_json_object(text) }
+#[inline] pub fn parseJSONArray(text: &str) -> Json { parse_json_array(text) }
+#[inline] pub fn saveJSONObject(v: &Json, path: &str) -> bool { save_json_object(v, path) }
+#[inline] pub fn saveJSONArray(v: &Json, path: &str) -> bool { save_json_array(v, path) }
+#[inline] pub fn saveStream(target: &str, source: &str) -> bool { save_stream(target, source) }
 #[inline] pub fn loadPixels() -> Vec<u32> { load_pixels() }
 #[inline] pub fn updatePixels(pixels: &[u32]) { update_pixels(pixels) }
 
@@ -4923,11 +5037,6 @@ pub use data::{load_strings, load_text, load_bytes, save_strings, save_text, sav
 #[inline] pub fn loadBytes(path: &str) -> Vec<u8> { load_bytes(path) }
 #[inline] pub fn saveBytes(path: &str, b: &[u8]) -> bool { save_bytes(path, b) }
 #[inline] pub fn splitTokens(s: &str, d: &str) -> Vec<String> { split_tokens(s, d) }
-#[inline] pub fn loadJSONObject(path: &str) -> Json { load_json(path) }
-#[inline] pub fn loadJSONArray(path: &str) -> Json { load_json(path) }
-#[inline] pub fn saveJSONObject(v: &Json, path: &str) -> bool { save_json(path, v) }
-#[inline] pub fn saveJSONArray(v: &Json, path: &str) -> bool { save_json(path, v) }
-#[inline] pub fn parseJSONObject(s: &str) -> Json { parse_json(s).unwrap_or_default() }
 #[inline] pub fn loadTable(path: &str, options: &str) -> Table { load_table(path, options) }
 #[inline] pub fn saveTable(t: &Table, path: &str) -> bool { save_table(t, path) }
 

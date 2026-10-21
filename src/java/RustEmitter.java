@@ -483,6 +483,9 @@ public class RustEmitter {
   private static final Map<String, String> KNOWN_RESULT = Map.ofEntries(
     Map.entry("loadJSONObject", "Json"), Map.entry("loadJSONArray", "Json"),
     Map.entry("parseJSONObject", "Json"), Map.entry("load_json", "Json"),
+    Map.entry("load_json_object", "Json"), Map.entry("load_json_array", "Json"),
+    Map.entry("parse_json_object", "Json"), Map.entry("parse_json_array", "Json"),
+    Map.entry("parseJSONArray", "Json"),
     Map.entry("loadTable", "Table"), Map.entry("load_table", "Table"),
     Map.entry("loadStrings", "Vec<String>"), Map.entry("load_strings", "Vec<String>"),
     Map.entry("load_text", "String"), Map.entry("loadBytes", "Vec<u8>"),

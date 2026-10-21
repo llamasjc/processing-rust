@@ -533,7 +533,7 @@ fn raster_tri_with(a: SV, b: SV, c: SV, see_through: bool, color: &dyn Fn(f32, f
                 if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
                 let z = w0 * a.z + w1 * b.z + w2 * c.z;
                 let i = y as usize * w + x as usize;
-                if z < depth[i] {
+                if z < depth[i] || !DEPTH_TEST.load(Ordering::Relaxed) {
                     // weights in space, not on the screen, so textures don't swim
                     let (p0, p1, p2) = (w0 * a.iw, w1 * b.iw, w2 * c.iw);
                     let sum = p0 + p1 + p2;
@@ -563,7 +563,7 @@ fn raster_line(a: SV, b: SV, col: Color, weight: f32) {
                     let (px, py) = (x as i64 + dx, y as i64 + dy);
                     if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 { continue; }
                     let k = py as usize * w + px as usize;
-                    if z <= depth[k] { depth[k] = depth[k].min(z); put(&mut buf, k, col, opaque); }
+                    if z <= depth[k] || !DEPTH_TEST.load(Ordering::Relaxed) { depth[k] = depth[k].min(z); put(&mut buf, k, col, opaque); }
                 }
             }
         }
@@ -768,6 +768,10 @@ fn draw_mesh_vs(vcpu: &crate::glsl::Cpu, vimages: &[(usize, usize, Vec<u32>)], v
         }
     }
 }
+
+static DEPTH_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// hint(DISABLE_DEPTH_TEST / ENABLE_DEPTH_TEST)
+pub(crate) fn set_depth_test(on: bool) { DEPTH_TEST.store(on, Ordering::Relaxed); }
 
 /// background() and clear() start the depth over.
 pub(crate) fn clear_depth() { S.with(|s| s.borrow_mut().depth_frame = u64::MAX); }
