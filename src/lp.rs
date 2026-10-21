@@ -358,6 +358,8 @@ pub(crate) fn shape_shader(id: usize, src: &str, values: &[(String, crate::glsl:
     use crate::glsl::Ty;
     use pr::shader_value::ShaderValue as V;
     ensure_open();
+    // the values below change the material for every shape using it
+    flush_shaded();
     let made = MATERIALS.with(|m| m.borrow().get(&id).copied());
     let (mat, sent) = match made {
         Some(x) => x,
@@ -402,12 +404,35 @@ pub(crate) fn reset_shape_shader() {
 }
 /// Before a 3D shape with shader() on: its fill, as vertColor. The shape is
 /// rendered right after, so each keeps its own fill.
+thread_local! {
+    /// The fill each shader material has now, and whether shapes drawn with
+    /// a shader are waiting to be rendered.
+    static SHADED_FILL: RefCell<HashMap<Entity, [f32; 4]>> = RefCell::new(HashMap::new());
+    static SHADED_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Before a shader material's values change: render the shapes that used
+/// the old ones.
+fn flush_shaded() {
+    if SHADED_PENDING.with(|p| p.replace(false)) {
+        if let Some(t) = target() { let _ = pr::graphics_flush(t); }
+    }
+}
+/// The fill a shape drawn with a shader gets (its vertColor). Shapes with the
+/// same fill render together, so a grid of strips has no seams between them.
+fn shaded_fill(mat: Entity, c: Color) {
+    let v = [c.r, c.g, c.b, c.a];
+    if SHADED_FILL.with(|f| f.borrow().get(&mat) != Some(&v)) {
+        flush_shaded();
+        let _ = pr::material_set(mat, "glsl_fill", pr::shader_value::ShaderValue::Float4(v));
+        SHADED_FILL.with(|f| { f.borrow_mut().insert(mat, v); });
+    }
+    SHADED_PENDING.with(|p| p.set(true));
+}
 fn shaded_3d(draw: DrawCommand) -> bool {
     let Some(mat) = SHADING.with(|s| s.get()) else { return false };
     let c = crate::render::style_pub().0.unwrap_or(Color::from_rgb(1.0, 1.0, 1.0));
-    let _ = pr::material_set(mat, "glsl_fill", pr::shader_value::ShaderValue::Float4([c.r, c.g, c.b, c.a]));
+    shaded_fill(mat, c);
     cmd(draw);
-    if let Some(t) = target() { let _ = pr::graphics_flush(t); }
     true
 }
 /// A filled 2D shape with shader() on: its fill as a whole mesh (normals,
@@ -420,9 +445,8 @@ fn shaded_2d(pts: &[(f32, f32)], outline: DrawCommand) -> bool {
     let verts: Vec<[f32; 3]> = pts.iter().map(|p| [p.0, p.1, 0.0]).collect();
     let (tris, _) = crate::render::shape_triangles(0, &verts, true);
     let Some(g) = whole_mesh(&verts, &tris, fill) else { return false };
-    let _ = pr::material_set(mat, "glsl_fill", pr::shader_value::ShaderValue::Float4([fill.r, fill.g, fill.b, fill.a]));
+    shaded_fill(mat, fill);
     cmd(DrawCommand::Geometry(g));
-    if let Some(t) = target() { let _ = pr::graphics_flush(t); }
     if crate::render::style_pub().1.is_some() {
         cmd(DrawCommand::PushStyle);
         cmd(DrawCommand::NoFill);
@@ -808,9 +832,8 @@ pub(crate) fn end_shape(close: bool) {
         if verts.len() >= 3 && kind != 1 && kind != 2 {
             let (tris, _) = crate::render::shape_triangles(kind, &verts, close);
             if let Some(g) = whole_mesh(&verts, &tris, fill) {
-                let _ = pr::material_set(mat, "glsl_fill", pr::shader_value::ShaderValue::Float4([fill.r, fill.g, fill.b, fill.a]));
+                shaded_fill(mat, fill);
                 cmd(DrawCommand::Geometry(g));
-                if let Some(t) = target() { let _ = pr::graphics_flush(t); }
                 // the recorded vertices still make the outline, with no fill
                 cmd(DrawCommand::PushStyle);
                 cmd(DrawCommand::NoFill);
