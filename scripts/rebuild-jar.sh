@@ -19,16 +19,6 @@ if ! command -v gradle &>/dev/null; then
   exit 1
 fi
 
-# ── Pre-flight: ensure vendored deps are present ─────────────────────────────
-
-TS_JAR="$RUSTMODE_DIR/lib/java-tree-sitter.jar"
-if [ ! -f "$TS_JAR" ]; then
-  echo "ERROR: lib/java-tree-sitter.jar not found."
-  echo "  Clone https://github.com/serenadeai/java-tree-sitter, run gradle jar,"
-  echo "  then cp build/libs/*.jar lib/java-tree-sitter.jar and commit it."
-  exit 1
-fi
-
 # ── Locate core.jar ───────────────────────────────────────────────────────────
 
 CORE_FLAG=""

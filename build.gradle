@@ -82,9 +82,7 @@ dependencies {
     compileOnly processingJars
     compileOnly files(extraJars)
 
-    // java-tree-sitter binding — vendored directly in lib/.
-    // Get it once: clone https://github.com/serenadeai/java-tree-sitter and
-    // run `gradle jar`, then cp build/libs/*.jar lib/java-tree-sitter.jar
+    // java-tree-sitter binding, from Maven Central (its native library is in lib/<platform>/)
     implementation 'ch.usi.si.seart:java-tree-sitter:1.9.1'
 }
 
