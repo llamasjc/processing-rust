@@ -1,16 +1,12 @@
-// Older libprocessing checkouts have no Texture draw command. When the
-// checkout the build uses lacks it, textured shapes draw untextured. That is
-// the same checkout build-libprocessing.sh picks: LIBPROCESSING_DIR, then
-// ~/lp-fork, then sketchbook/libprocessing next to the modes folder.
+// Older libprocessing checkouts have no Texture draw command; with one of
+// those, textured shapes draw untextured. LIBPROCESSING_DIR names the
+// checkout the build swaps in (RustMode's IDE build and LuaMode's
+// build-libprocessing.sh set it); empty or unset means the pinned upstream
+// commit, which has them.
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(lp_no_texture)");
     println!("cargo:rerun-if-env-changed=LIBPROCESSING_DIR");
-    let fork = std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join("lp-fork"))
-        .filter(|d| d.join("crates/processing_render/Cargo.toml").is_file());
-    let dir = std::env::var("LIBPROCESSING_DIR").ok().map(std::path::PathBuf::from).or(fork).or_else(|| {
-        let here = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?);
-        Some(here.parent()?.parent()?.join("libprocessing"))
-    });
+    let dir = std::env::var("LIBPROCESSING_DIR").ok().filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
     let Some(dir) = dir else { return };
     let file = dir.join("crates/processing_render/src/render/command.rs");
     println!("cargo:rerun-if-changed={}", file.display());

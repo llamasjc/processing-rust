@@ -251,8 +251,8 @@ public class RustBuild {
   private static final String FORK_END  = "# local libprocessing (end)\n";
 
   /**
-   * Your own libprocessing checkout, when there is one: LIBPROCESSING_DIR, or
-   * the folder named in the rust.libprocessing preference, or
+   * Your own libprocessing checkout, when there is one: LIBPROCESSING_DIR, the
+   * folder named in the rust.libprocessing preference, ~/lp-fork, or
    * sketchbook/libprocessing. null when none of them has the crates.
    */
   static File localFork() {
@@ -261,6 +261,7 @@ public class RustBuild {
     if (env != null && !env.isBlank()) tries.add(env);
     String pref = java.util.prefs.Preferences.userRoot().node("processing/rustmode").get("rust.libprocessing", "");
     if (!pref.isBlank()) tries.add(pref);
+    tries.add(new File(System.getProperty("user.home"), "lp-fork").getPath());
     tries.add(new File(Compat.sketchbookFolder(null), "libprocessing").getPath());
     for (String t : tries) {
       File d = new File(t);
@@ -408,6 +409,10 @@ public class RustBuild {
     // Point all sketches at a shared target dir so deps are compiled once.
     // (libprocessing builds get their own, so switching back and forth doesn't rebuild everything)
     pb.environment().put("CARGO_TARGET_DIR", targetDir().getAbsolutePath());
+    // the engine's build.rs checks this same checkout for what it supports
+    // (empty: the pinned upstream commit)
+    File fork = localFork();
+    pb.environment().put("LIBPROCESSING_DIR", fork == null ? "" : fork.getAbsolutePath());
 
     if (cancelled) throw new InterruptedException("build cancelled");
     Process proc = pb.start();
