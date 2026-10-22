@@ -133,7 +133,37 @@ impl Xml {
         out.push_str(nl);
     }
 
+    pub fn get_double(&self, name: &str) -> f64 { self.get_double_or(name, 0.0) }
+    pub fn get_double_or(&self, name: &str, default: f64) -> f64 { self.attr(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default) }
+    pub fn get_long(&self, name: &str) -> i64 { self.get_long_or(name, 0) }
+    pub fn get_long_or(&self, name: &str, default: i64) -> i64 { self.attr(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default) }
+    pub fn set_double(&mut self, name: &str, v: f64) -> &mut Self { self.set_string(name, &v.to_string()) }
+    pub fn set_long(&mut self, name: &str, v: i64) -> &mut Self { self.set_string(name, &v.to_string()) }
+    pub fn get_double_content(&self) -> f64 { self.content.trim().parse().unwrap_or(0.0) }
+    pub fn get_long_content(&self) -> i64 { self.content.trim().parse().unwrap_or(0) }
+    pub fn set_double_content(&mut self, v: f64) -> &mut Self { self.set_content(&v.to_string()) }
+    pub fn set_long_content(&mut self, v: i64) -> &mut Self { self.set_content(&v.to_string()) }
+    /// The name without its namespace prefix: "svg:rect" gives "rect".
+    pub fn get_local_name(&self) -> &str { self.name.rsplit(':').next().unwrap_or(&self.name) }
+    /// Drops whitespace-only text here and in every child.
+    pub fn trim(&mut self) -> &mut Self {
+        if self.content.trim().is_empty() { self.content.clear(); }
+        for c in &mut self.children { c.trim(); }
+        self
+    }
+    /// Writes the element to a file with an XML header, like saveXML.
+    pub fn save(&self, path: &str) -> bool { save_xml(self, path) }
+
     // camelCase, as in Processing
+    #[inline] pub fn getDouble(&self, n: &str) -> f64 { self.get_double(n) }
+    #[inline] pub fn getLong(&self, n: &str) -> i64 { self.get_long(n) }
+    #[inline] pub fn setDouble(&mut self, n: &str, v: f64) -> &mut Self { self.set_double(n, v) }
+    #[inline] pub fn setLong(&mut self, n: &str, v: i64) -> &mut Self { self.set_long(n, v) }
+    #[inline] pub fn getDoubleContent(&self) -> f64 { self.get_double_content() }
+    #[inline] pub fn getLongContent(&self) -> i64 { self.get_long_content() }
+    #[inline] pub fn setDoubleContent(&mut self, v: f64) -> &mut Self { self.set_double_content(v) }
+    #[inline] pub fn setLongContent(&mut self, v: i64) -> &mut Self { self.set_long_content(v) }
+    #[inline] pub fn getLocalName(&self) -> &str { self.get_local_name() }
     #[inline] pub fn getName(&self) -> &str { self.get_name() }
     #[inline] pub fn getChild(&self, path: &str) -> Option<&Xml> { self.get_child(path) }
     #[inline] pub fn getChildren(&self, path: &str) -> Vec<&Xml> { self.get_children(path) }
@@ -419,6 +449,12 @@ mod tests {
         assert!(parse_xml("<a><b></a>").is_err());
         let mut n = Xml::new("list");
         n.add_child("x").set_int("v", 7);
+        let mut y = parse_xml("<svg:g big=\"9000000000\"><v>2.5</v></svg:g>").unwrap();
+        assert_eq!(y.get_local_name(), "g");
+        assert_eq!(y.get_long("big"), 9_000_000_000);
+        assert_eq!(y.get_child("v").unwrap().get_double_content(), 2.5);
+        y.set_long_content(4).set_content("  ").trim();
+        assert_eq!(y.get_content(), "");
         assert_eq!(n.get_child("x").unwrap().get_int("v"), 7);
     }
     #[test]

@@ -48,7 +48,19 @@ pub struct PShape {
     visible: bool,
     texture: Option<u64>,
     name: String,
+    /// Processing's stroke cap / join numbers, applied when drawn.
+    cap: Option<u32>,
+    join: Option<u32>,
+    /// Kept for get_tint, materials and normals for their getters; not drawn.
+    tint: Option<Option<Color>>,
+    material: Material,
+    normals: std::collections::BTreeMap<usize, [f32; 3]>,
+    /// set_3d overrides what is worked out from the vertices.
+    three: Option<bool>,
 }
+
+#[derive(Clone, Debug, PartialEq, Default)]
+struct Material { ambient: Option<Color>, emissive: Option<Color>, specular: Option<Color>, shininess: Option<f32> }
 
 /// createShape(): an empty shape; fill it with begin_shape / vertex / end_shape.
 pub fn create_shape() -> PShape { PShape { visible: true, ..Default::default() } }
@@ -236,6 +248,8 @@ impl PShape {
         match self.fill { Some(Some(c)) => crate::fill_color(c), Some(None) => crate::no_fill(), None => {} }
         match self.stroke { Some(Some(c)) => crate::stroke_color(c), Some(None) => crate::no_stroke(), None => {} }
         if let Some(w) = self.weight { crate::stroke_weight(w); }
+        if let Some(c) = self.cap { crate::stroke_cap(c); }
+        if let Some(j) = self.join { crate::stroke_join(j); }
         let mut open = false;
         for s in &self.steps {
             match *s {
@@ -270,6 +284,209 @@ impl PShape {
         crate::pop_style();
         crate::pop_matrix();
     }
+}
+
+impl PShape {
+    // ── more of Processing's PShape ──────────────────────────────────────
+    fn is_vertex(s: &Step) -> bool { matches!(s, Step::Vertex(..) | Step::Curve(..) | Step::Bezier(_) | Step::Quadratic(_) | Step::Full(..)) }
+    /// Every corner the shape reaches, primitives and children included (x, y, z).
+    fn extent_points(&self, out: &mut Vec<[f32; 3]>) {
+        for s in &self.steps {
+            match *s {
+                Step::Vertex(x, y) | Step::Curve(x, y) => out.push([x, y, 0.0]),
+                Step::Bezier(v) => out.push([v[4], v[5], 0.0]),
+                Step::Quadratic(v) => out.push([v[2], v[3], 0.0]),
+                Step::Full(v, f) => out.push([v[0], v[1], if f & 1 != 0 { v[2] } else { 0.0 }]),
+                Step::Rect(v) => { out.push([v[0], v[1], 0.0]); out.push([v[0] + v[2], v[1] + v[3], 0.0]); }
+                Step::Ellipse(v) => { out.push([v[0] - v[2] / 2.0, v[1] - v[3] / 2.0, 0.0]); out.push([v[0] + v[2] / 2.0, v[1] + v[3] / 2.0, 0.0]); }
+                Step::Line(v) => { out.push([v[0], v[1], 0.0]); out.push([v[2], v[3], 0.0]); }
+                Step::Triangle(v) => for p in v.chunks(2) { out.push([p[0], p[1], 0.0]); },
+                Step::Quad(v) => for p in v.chunks(2) { out.push([p[0], p[1], 0.0]); },
+                Step::Box(v) => { out.push([-v[0] / 2.0, -v[1] / 2.0, -v[2] / 2.0]); out.push([v[0] / 2.0, v[1] / 2.0, v[2] / 2.0]); }
+                Step::Sphere(r) => { out.push([-r, -r, -r]); out.push([r, r, r]); }
+                _ => {}
+            }
+        }
+        for c in &self.children { c.extent_points(out); }
+    }
+    fn extent(&self, axis: usize) -> f32 {
+        let mut pts = Vec::new();
+        self.extent_points(&mut pts);
+        let mut it = pts.iter().map(|p| p[axis]);
+        let Some(first) = it.next() else { return 0.0 };
+        let (lo, hi) = it.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        hi - lo
+    }
+    /// The size of the box around everything in the shape (children included).
+    pub fn get_width(&self) -> f32 { self.extent(0) }
+    pub fn get_height(&self) -> f32 { self.extent(1) }
+    pub fn get_depth(&self) -> f32 { self.extent(2) }
+
+    /// The shape's own fill (the same for every vertex here); None when it
+    /// uses the sketch's.
+    pub fn get_fill(&self, _i: usize) -> Option<Color> { self.fill.flatten() }
+    pub fn get_stroke(&self, _i: usize) -> Option<Color> { self.stroke.flatten() }
+    /// Its own stroke weight, or 1.
+    pub fn get_stroke_weight(&self) -> f32 { self.weight.unwrap_or(1.0) }
+    /// ROUND, SQUARE or PROJECT, used when the shape is drawn.
+    pub fn set_stroke_cap(&mut self, cap: u32) -> &mut Self { self.cap = Some(cap); self }
+    /// MITER, BEVEL or ROUND, used when the shape is drawn.
+    pub fn set_stroke_join(&mut self, join: u32) -> &mut Self { self.join = Some(join); self }
+    pub fn stroke_cap(&mut self, cap: u32) -> &mut Self { self.set_stroke_cap(cap) }
+    pub fn stroke_join(&mut self, join: u32) -> &mut Self { self.set_stroke_join(join) }
+
+    /// tint() on a shape: kept so get_tint can read it back.
+    pub fn tint(&mut self, c: impl crate::Paint) -> &mut Self { self.tint = Some(Some(c.paint())); self }
+    pub fn set_tint(&mut self, c: impl crate::Paint) -> &mut Self { self.tint(c) }
+    pub fn no_tint(&mut self) -> &mut Self { self.tint = Some(None); self }
+    pub fn get_tint(&self) -> Option<Color> { self.tint.flatten() }
+
+    pub fn get_children(&self) -> &[PShape] { &self.children }
+    /// Where a child is among the children (compared by contents).
+    pub fn get_child_index(&self, who: &PShape) -> Option<usize> { self.children.iter().position(|c| c == who) }
+    /// A shape with that name, searched through children and their children.
+    pub fn find_child(&self, name: &str) -> Option<&PShape> {
+        for c in &self.children {
+            if c.name == name { return Some(c); }
+            if let Some(f) = c.find_child(name) { return Some(f); }
+        }
+        None
+    }
+    /// add_name(name, shape): adds the shape as a child under that name.
+    pub fn add_name(&mut self, name: &str, mut shape: PShape) -> &mut Self { shape.name = name.to_string(); self.add_child(shape) }
+
+    /// Is the shape 3D: a vertex with z, a box or sphere, or a 3D move. set_3d overrides.
+    pub fn is_3d(&self) -> bool {
+        if let Some(t) = self.three { return t; }
+        self.steps.iter().any(|s| matches!(s, Step::Full(_, 1 | 3) | Step::Box(_) | Step::Sphere(_)))
+            || self.moves.iter().any(|m| matches!(m, Move::T3(_) | Move::RX(_) | Move::RY(_) | Move::S3(_)))
+            || self.children.iter().any(|c| c.is_3d())
+    }
+    pub fn is_2d(&self) -> bool { !self.is_3d() }
+    pub fn set_3d(&mut self, on: bool) -> &mut Self { self.three = Some(on); self }
+    /// Was it ended with end_shape_mode(CLOSE)?
+    pub fn is_closed(&self) -> bool { self.steps.iter().any(|s| matches!(s, Step::End(true))) }
+
+    /// Is the point inside the outline made by the vertices (even-odd rule)?
+    pub fn contains(&self, x: impl Num, y: impl Num) -> bool {
+        let (x, y) = (x.f(), y.f());
+        let pts: Vec<(f32, f32)> = self.points().collect();
+        if pts.len() < 3 { return false; }
+        let mut inside = false;
+        let mut j = pts.len() - 1;
+        for i in 0..pts.len() {
+            let ((xi, yi), (xj, yj)) = (pts[i], pts[j]);
+            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi { inside = !inside; }
+            j = i;
+        }
+        inside
+    }
+
+    /// The kind given to begin_shape_kind, or RECT, ELLIPSE, BOX... for
+    /// primitives (POLYGON for a plain shape, GROUP for an empty group).
+    pub fn get_kind(&self) -> u8 {
+        for s in &self.steps {
+            return match s {
+                Step::Begin(k) => *k,
+                Step::Rect(_) => crate::constants::RECT,
+                Step::Ellipse(_) => crate::constants::ELLIPSE,
+                Step::Line(_) => crate::constants::LINE,
+                Step::Triangle(_) => crate::constants::TRIANGLE,
+                Step::Quad(_) => crate::constants::QUAD,
+                Step::Box(_) => crate::constants::BOX,
+                Step::Sphere(_) => crate::constants::SPHERE,
+                _ => continue,
+            };
+        }
+        if self.steps.is_empty() && !self.children.is_empty() { crate::constants::GROUP } else { crate::POLYGON }
+    }
+    /// GROUP (children only), PRIMITIVE (rect, ellipse, box...) or GEOMETRY (vertices).
+    pub fn get_family(&self) -> u8 {
+        if self.steps.iter().any(|s| matches!(s, Step::Rect(_) | Step::Ellipse(_) | Step::Line(_) | Step::Triangle(_)
+            | Step::Quad(_) | Step::Box(_) | Step::Sphere(_))) { crate::constants::PRIMITIVE }
+        else if self.steps.is_empty() && !self.children.is_empty() { crate::constants::GROUP }
+        else { crate::constants::GEOMETRY }
+    }
+
+    fn nth_vertex_mut(&mut self, i: usize) -> Option<&mut Step> { self.steps.iter_mut().filter(|s| Self::is_vertex(s)).nth(i) }
+    /// set_texture_uv(i, u, v): the spot on the texture for a vertex.
+    pub fn set_texture_uv(&mut self, i: usize, u: impl Num, v: impl Num) -> &mut Self {
+        let (u, v) = (u.f(), v.f());
+        if let Some(s) = self.nth_vertex_mut(i) {
+            match s {
+                Step::Full(p, f) => { p[3] = u; p[4] = v; *f |= 2; }
+                Step::Vertex(x, y) => *s = Step::Full([*x, *y, 0.0, u, v], 2),
+                _ => {}
+            }
+        }
+        self
+    }
+    fn vertex_uv_of(&self, i: usize) -> (f32, f32) {
+        match self.steps.iter().filter(|s| Self::is_vertex(s)).nth(i) {
+            Some(Step::Full(p, f)) if f & 2 != 0 => (p[3], p[4]),
+            _ => (0.0, 0.0),
+        }
+    }
+    pub fn get_texture_u(&self, i: usize) -> f32 { self.vertex_uv_of(i).0 }
+    pub fn get_texture_v(&self, i: usize) -> f32 { self.vertex_uv_of(i).1 }
+    /// set_vertex_3d(i, x, y, z)
+    pub fn set_vertex_3d(&mut self, i: usize, x: impl Num, y: impl Num, z: impl Num) -> &mut Self {
+        let (x, y, z) = (x.f(), y.f(), z.f());
+        self.set_vertex(i, x, y);
+        if let Some(s) = self.nth_vertex_mut(i) {
+            match s {
+                Step::Full(p, f) => { p[2] = z; *f |= 1; }
+                Step::Vertex(x, y) => *s = Step::Full([*x, *y, z, 0.0, 0.0], 1),
+                _ => {}
+            }
+        }
+        self
+    }
+
+    /// set_normal(i, x, y, z): kept for get_normal; lighting uses each face's own.
+    pub fn set_normal(&mut self, i: usize, x: impl Num, y: impl Num, z: impl Num) -> &mut Self {
+        self.normals.insert(i, [x.f(), y.f(), z.f()]); self
+    }
+    pub fn get_normal(&self, i: usize) -> crate::PVector {
+        let n = self.normals.get(&i).copied().unwrap_or([0.0; 3]);
+        crate::PVector::new3(n[0], n[1], n[2])
+    }
+    pub fn get_normal_x(&self, i: usize) -> f32 { self.get_normal(i).x }
+    pub fn get_normal_y(&self, i: usize) -> f32 { self.get_normal(i).y }
+    pub fn get_normal_z(&self, i: usize) -> f32 { self.get_normal(i).z }
+
+    /// Material colors, kept on the shape (read back with the getters).
+    pub fn set_ambient(&mut self, c: impl crate::Paint) -> &mut Self { self.material.ambient = Some(c.paint()); self }
+    pub fn set_emissive(&mut self, c: impl crate::Paint) -> &mut Self { self.material.emissive = Some(c.paint()); self }
+    pub fn set_specular(&mut self, c: impl crate::Paint) -> &mut Self { self.material.specular = Some(c.paint()); self }
+    pub fn set_shininess(&mut self, s: impl Num) -> &mut Self { self.material.shininess = Some(s.f()); self }
+    pub fn ambient(&mut self, c: impl crate::Paint) -> &mut Self { self.set_ambient(c) }
+    pub fn emissive(&mut self, c: impl crate::Paint) -> &mut Self { self.set_emissive(c) }
+    pub fn specular(&mut self, c: impl crate::Paint) -> &mut Self { self.set_specular(c) }
+    pub fn shininess(&mut self, s: impl Num) -> &mut Self { self.set_shininess(s) }
+    pub fn get_ambient(&self, _i: usize) -> Option<Color> { self.material.ambient }
+    pub fn get_emissive(&self, _i: usize) -> Option<Color> { self.material.emissive }
+    pub fn get_specular(&self, _i: usize) -> Option<Color> { self.material.specular }
+    pub fn get_shininess(&self, _i: usize) -> f32 { self.material.shininess.unwrap_or(0.0) }
+
+    #[inline] pub fn getWidth(&self) -> f32 { self.get_width() }
+    #[inline] pub fn getHeight(&self) -> f32 { self.get_height() }
+    #[inline] pub fn getDepth(&self) -> f32 { self.get_depth() }
+    #[inline] pub fn getKind(&self) -> u8 { self.get_kind() }
+    #[inline] pub fn getFamily(&self) -> u8 { self.get_family() }
+    #[inline] pub fn isClosed(&self) -> bool { self.is_closed() }
+    #[inline] pub fn is2D(&self) -> bool { self.is_2d() }
+    #[inline] pub fn is3D(&self) -> bool { self.is_3d() }
+    #[inline] pub fn findChild(&self, name: &str) -> Option<&PShape> { self.find_child(name) }
+    #[inline] pub fn getVertexX(&self, i: usize) -> f32 { self.get_vertex_x(i) }
+    #[inline] pub fn getVertexY(&self, i: usize) -> f32 { self.get_vertex_y(i) }
+    #[inline] pub fn getVertexZ(&self, i: usize) -> f32 { self.get_vertex_z(i) }
+    #[inline] pub fn getVertexCount(&self) -> usize { self.get_vertex_count() }
+    #[inline] pub fn setStrokeCap(&mut self, c: u32) -> &mut Self { self.set_stroke_cap(c) }
+    #[inline] pub fn setStrokeJoin(&mut self, j: u32) -> &mut Self { self.set_stroke_join(j) }
+    #[inline] pub fn setTextureUV(&mut self, i: usize, u: impl Num, v: impl Num) -> &mut Self { self.set_texture_uv(i, u, v) }
+    #[inline] pub fn getTextureU(&self, i: usize) -> f32 { self.get_texture_u(i) }
+    #[inline] pub fn getTextureV(&self, i: usize) -> f32 { self.get_texture_v(i) }
 }
 
 /// What shape() can draw: an SVG from load_shape (its id) or a PShape.
@@ -331,5 +548,48 @@ mod tests {
         assert_eq!(g.children[1].moves.len(), 2);
         g.disable_style();
         assert!(g.fill.is_none());
+    }
+    #[test]
+    fn processing_getters() {
+        let mut s = create_shape();
+        s.begin_shape().vertex(0, 0).vertex(10, 0).vertex(10, 20).vertex(0, 20).end_shape_mode(crate::CLOSE);
+        assert_eq!((s.get_width(), s.get_height(), s.get_depth()), (10.0, 20.0, 0.0));
+        assert!(s.is_closed() && s.is_2d());
+        assert!(s.contains(5, 5));
+        assert!(!s.contains(15, 5));
+        assert_eq!(s.get_kind(), crate::POLYGON);
+        assert_eq!(s.get_family(), crate::constants::GEOMETRY);
+        s.set_texture_uv(1, 0.5, 0.25);
+        assert_eq!((s.get_texture_u(1), s.get_texture_v(1)), (0.5, 0.25));
+        assert_eq!(s.get_vertex(1), (10.0, 0.0));
+        s.set_vertex_3d(2, 10, 20, 5);
+        assert!(s.is_3d());
+        assert_eq!(s.get_vertex_z(2), 5.0);
+        assert_eq!(s.get_depth(), 5.0);
+        s.set_3d(false);
+        assert!(s.is_2d());
+        s.set_stroke_cap(crate::SQUARE).tint(crate::color_rgb(255, 0, 0)).set_shininess(4);
+        assert_eq!(s.get_tint(), Some(crate::color_rgb(255, 0, 0)));
+        assert_eq!(s.get_shininess(0), 4.0);
+        s.set_normal(0, 0, 0, 1);
+        assert_eq!(s.get_normal_z(0), 1.0);
+        assert_eq!(s.get_fill(0), None);
+        s.fill_rgb(0, 255, 0);
+        assert_eq!(s.get_fill(3), Some(crate::color_rgb(0, 255, 0)));
+
+        let r = create_shape_rect(0, 0, 30, 40);
+        assert_eq!(r.get_kind(), crate::constants::RECT);
+        assert_eq!(r.get_family(), crate::constants::PRIMITIVE);
+        assert_eq!(create_shape_box(1, 2, 3).get_depth(), 3.0);
+        let mut g = create_shape_group();
+        let mut inner = create_shape_group();
+        inner.add_name("deep", r.clone());
+        g.add_child(inner.clone());
+        assert_eq!(g.get_kind(), crate::constants::GROUP);
+        assert_eq!(g.get_family(), crate::constants::GROUP);
+        assert_eq!(g.find_child("deep").map(|c| c.get_width()), Some(30.0));
+        assert_eq!(g.get_child_index(&inner), Some(0));
+        assert_eq!(g.get_children().len(), 1);
+        assert_eq!(g.get_height(), 40.0);
     }
 }

@@ -1,0 +1,56 @@
+# Processing API parity
+
+How RustMode and LuaMode compare with Processing 4's Java API. Checked by
+pulling every public method out of Processing's source (PApplet, PGraphics,
+PImage, PShape, PVector, PFont, PMatrix2D/3D, Table, TableRow, XML,
+JSONObject, JSONArray, the list and dict classes, PConstants) and looking
+for it in each mode: RustMode by function and method name (snake_case),
+LuaMode by asking a live sketch for each global and each object's methods.
+
+## Covered
+
+Everything a sketch calls, on both modes and both renderers, with these
+names in RustMode:
+
+- Images and fonts are ids (u64); their methods come from `PImageExt` and
+  `PFontExt` (`img.resize(w, h)`, `img.mask(m)`, `font.ascent()`...).
+- `TableRow` edits the table it came from: `table.get_row_mut(i)` /
+  `table.add_row_handle()`; `table.get_row(i)` is read only.
+- Java overloads that Rust can't have get their own names, like
+  `get_subset_n`, `create_vector3`, `set_matrix_2d`.
+
+In LuaMode images and fonts stay numbers but answer Processing's methods
+(`img:resize(w, h)`, `img.width`, `font:getSize()`).
+
+Window events: `focusGained`, `focusLost`, `mouseEntered`, `mouseExited`,
+`windowMoved`, `windowResized` are called on both renderers (libprocessing
+needs the lp-fork).
+
+## Left out on purpose
+
+- Java internals: iterators (`iterator`, `hasNext`, `keyIterator`...),
+  `hashCode`, `compare`, `write(PrintWriter)`, `getNative`, `init`,
+  `checkAlpha`, the `isModified` family, `typedParse`, `parseInto`,
+  `setTableType`, surface and PGL methods, `registerMethod`, `handleDraw`,
+  `postEvent` and the rest of PApplet's plumbing.
+- `X`, `Y`, `Z`: as constants they'd break sketches that use those names
+  for variables.
+- `mask()` on the canvas and `choice()`: deprecated in Processing.
+- `XML.getParent()` in RustMode: children are owned values with no link up
+  (LuaMode has it).
+- `PShape` tessellation (`getTessellation` and friends), `getVertexCode*`,
+  `setFamily` / `setKind` / `setPath`, and in RustMode `PShape.applyMatrix`,
+  `bezierDetail`, `curveDetail`, `textureMode`, `attrib*` on a shape.
+- `PFont.getGlyph`, `getShape`, `save`: they'd need glyph outlines from the
+  font engine.
+- `JSONArray` value iterators and the `double` / `long` array variants in
+  RustMode (use the float and int ones).
+
+## Partial
+
+- `hint()`: only `DISABLE_DEPTH_TEST` / `ENABLE_DEPTH_TEST` do anything, and
+  only on the software renderer.
+- `begin_record`: images and 3D solids aren't written, text keeps its size
+  but not its font.
+- Vertex shaders on libprocessing: `color` is the fill, varyings are floats
+  or vecs.

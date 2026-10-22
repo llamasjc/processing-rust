@@ -95,6 +95,9 @@ pub(crate) fn on_rotate_z(a: f32) {
     let mut m = IDENT; m[0] = c; m[1] = s; m[4] = -s; m[5] = c; post(m);
 }
 pub(crate) fn on_reset() { top_mut(|t| *t = IDENT); }
+/// The current model matrix (column-major), and multiplying it by another.
+pub(crate) fn model_matrix() -> [f32; 16] { S.with(|s| *s.borrow().stack.last().unwrap()) }
+pub(crate) fn on_apply(m: [f32; 16]) { post(m); }
 /// Start of every frame: matrices back to the start, depth cleared, lights off.
 pub(crate) fn on_begin_frame() {
     S.with(|s| {

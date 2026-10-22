@@ -215,6 +215,9 @@ public class RustEmitter {
     if (analysis.hasKeyPressed())    line(sb, "        .key_pressed(key_pressed)");
     if (analysis.hasKeyReleased())   line(sb, "        .key_released(key_released)");
     if (analysis.hasKeyTyped())      line(sb, "        .key_typed(key_typed)");
+    for (String w : new String[] { "focus_gained", "focus_lost", "mouse_entered", "mouse_exited", "window_moved", "window_resized" }) {
+      if (analysis.lifecycleFns().containsKey(w)) line(sb, "        ." + w + "(" + w + ")");
+    }
     line(sb, "        .run();");
     line(sb, "}");
   }
@@ -489,6 +492,10 @@ public class RustEmitter {
     Map.entry("parseJSONArray", "Json"),
     Map.entry("end_record", "bool"), Map.entry("endRecord", "bool"), Map.entry("save_stream", "bool"),
     Map.entry("launch", "bool"),
+    Map.entry("create_vector", "PVector"), Map.entry("create_vector3", "PVector"), Map.entry("createVector", "PVector"),
+    Map.entry("get_matrix", "PMatrix3D"), Map.entry("getMatrix", "PMatrix3D"), Map.entry("get_matrix_2d", "PMatrix2D"),
+    Map.entry("sketch_path", "String"), Map.entry("data_path", "String"), Map.entry("save_path", "String"),
+    Map.entry("list_files", "Vec<String>"), Map.entry("list_paths", "Vec<String>"),
     Map.entry("loadTable", "Table"), Map.entry("load_table", "Table"),
     Map.entry("loadStrings", "Vec<String>"), Map.entry("load_strings", "Vec<String>"),
     Map.entry("load_text", "String"), Map.entry("loadBytes", "Vec<u8>"),

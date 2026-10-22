@@ -1652,6 +1652,8 @@ pub(crate) fn run<S: 'static>(mut app: crate::App<S>) {
 
     let mut frame: u64 = 0;
     let mut first = true;
+    #[cfg(lp_window_state)]
+    let mut watch = crate::WinWatch::default();
     loop {
         let frame_start = std::time::Instant::now();
         let alive = LP.with(|l| l.borrow_mut().as_mut().and_then(|l| l.glfw.as_mut().map(|g| g.poll_events()))).unwrap_or(false);
@@ -1680,6 +1682,15 @@ pub(crate) fn run<S: 'static>(mut app: crate::App<S>) {
             if let Some(f) = app.key_typed_fn { f(&mut app.state); }
         }
         if input::input_key_any_just_released().unwrap_or(false) { if let Some(f) = app.key_released_fn { f(&mut app.state); } }
+        // focus, the mouse coming and going, the window moving or resizing
+        #[cfg(lp_window_state)]
+        {
+            let st = LP.with(|l| l.borrow().as_ref().and_then(|l| l.glfw.as_ref().and_then(|g| g.window_state())));
+            let size = LP.with(|l| l.borrow().as_ref().map(|l| l.size)).unwrap_or((0, 0));
+            if let Some((focused, inside, pos)) = st {
+                for w in watch.update(focused, inside, size, Some(pos)) { app.win_fns.call(w, &mut app.state); }
+            }
+        }
 
         let draw = first || crate::glfw::is_looping() || crate::glfw::take_redraw();
         if draw {

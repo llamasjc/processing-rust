@@ -42,22 +42,26 @@ public class RustAnalyzer {
     "setup", "draw",
     "mouse_pressed", "mouse_released", "mouse_clicked", "mouse_moved", "mouse_dragged",
     "mouse_wheel",
-    "key_pressed",  "key_released",  "key_typed"
+    "key_pressed",  "key_released",  "key_typed",
+    "focus_gained", "focus_lost", "mouse_entered", "mouse_exited", "window_moved", "window_resized"
   );
 
   // camelCase → snake_case normalisation for lifecycle callbacks.
   // Users may write either convention; the emitter always receives snake_case.
   private static final java.util.Map<String, String> CAMEL_TO_SNAKE =
-    java.util.Map.of(
-      "mousePressed",  "mouse_pressed",
-      "mouseReleased", "mouse_released",
-      "mouseClicked",  "mouse_clicked",
-      "mouseMoved",    "mouse_moved",
-      "mouseDragged",  "mouse_dragged",
-      "mouseWheel",    "mouse_wheel",
-      "keyPressed",    "key_pressed",
-      "keyReleased",   "key_released",
-      "keyTyped",      "key_typed"
+    java.util.Map.ofEntries(
+      java.util.Map.entry("focusGained", "focus_gained"), java.util.Map.entry("focusLost", "focus_lost"),
+      java.util.Map.entry("mouseEntered", "mouse_entered"), java.util.Map.entry("mouseExited", "mouse_exited"),
+      java.util.Map.entry("windowMoved", "window_moved"), java.util.Map.entry("windowResized", "window_resized"),
+      java.util.Map.entry("mousePressed", "mouse_pressed"),
+      java.util.Map.entry("mouseReleased", "mouse_released"),
+      java.util.Map.entry("mouseClicked", "mouse_clicked"),
+      java.util.Map.entry("mouseMoved", "mouse_moved"),
+      java.util.Map.entry("mouseDragged", "mouse_dragged"),
+      java.util.Map.entry("mouseWheel", "mouse_wheel"),
+      java.util.Map.entry("keyPressed", "key_pressed"),
+      java.util.Map.entry("keyReleased", "key_released"),
+      java.util.Map.entry("keyTyped", "key_typed")
     );
 
   // ── Fields ──────────────────────────────────────────────────────────────────

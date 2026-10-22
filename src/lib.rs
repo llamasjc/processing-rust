@@ -1810,6 +1810,10 @@ mod render {
             Err(e) => { eprintln!("createFont(\"{}\"): {} (.ttf and .otf are supported)", name, e); 0 }
         }
     }
+    /// A loaded font and the size it was made with (for PFontExt).
+    pub(crate) fn font_info(id: u64) -> Option<(std::sync::Arc<fontdue::Font>, f32)> {
+        fonts().lock().get((id as usize).wrapping_sub(1)).map(|f| (f.font.clone(), f.size))
+    }
     /// textFont(font): 0 is the built-in pixel font. A font made with a size
     /// brings that size along; `size` (when above 0) overrides it.
     pub fn set_text_font(id: u64, size: f32) { lp_route! { crate::lp::text_font(id, size); }
@@ -3381,6 +3385,7 @@ mod glfw {
         MousePressed, MouseReleased, MouseMoved, MouseDragged,
         MouseWheel(f32),
         KeyPressed, KeyReleased, KeyTyped,
+        Window(crate::WinEvent),
     }
 
     #[derive(Clone)]
@@ -3604,6 +3609,7 @@ mod glfw {
             let mut frame_count: u64 = 0;
             let mut last_frame = Instant::now();
             let mut last_mouse_pressed = false;
+            let mut watch = crate::WinWatch::default();
             let mut last_mouse_x = 0.0f32;
             let mut last_mouse_y = 0.0f32;
 
@@ -3669,6 +3675,13 @@ mod glfw {
                     key: None, key_code: 0, key_pressed: false,
                     millis, focused: window.is_active(),
                 };
+
+                // focus, the mouse coming and going, the window moving or resizing
+                let inside = window.get_mouse_pos(MouseMode::Discard).is_some();
+                let pos = window.get_position();
+                for w in watch.update(window.is_active(), inside, (ctx.width, ctx.height), Some((pos.0 as i32, pos.1 as i32))) {
+                    cb(Event::Window(w), &ctx);
+                }
 
                 // Mouse events
                 if mouse_pressed && !last_mouse_pressed {
@@ -4790,6 +4803,10 @@ fn copy_region(sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh
                                        (p & 255) as f32 / 255.0, ((p >> 24) & 255) as f32 / 255.0));
         }
     }
+    if let Some(m) = mode.filter(|m| image_ext::is_extra_blend(*m)) {
+        image_ext::blend_canvas(&part, sw as usize, sh as usize, dx, dy, dw, dh, m);
+        return;
+    }
     // one picture, reused, so copying every frame doesn't pile up images
     static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut id = SCRATCH.load(Ordering::Relaxed);
@@ -4907,6 +4924,7 @@ pub struct App<S: 'static> {
     key_pressed_fn:    Option<fn(&mut S)>,
     key_released_fn:   Option<fn(&mut S)>,
     key_typed_fn:      Option<fn(&mut S)>,
+    pub(crate) win_fns: WindowFns<S>,
 }
 
 impl<S: 'static> App<S> {
@@ -4918,6 +4936,7 @@ impl<S: 'static> App<S> {
             mouse_moved_fn: None,   mouse_dragged_fn: None,
             mouse_wheel_fn: None,   key_pressed_fn: None,
             key_released_fn: None,  key_typed_fn: None,
+            win_fns: WindowFns::default(),
         }
     }
 
@@ -4933,6 +4952,12 @@ impl<S: 'static> App<S> {
     pub fn key_pressed(mut self, f: fn(&mut S)) -> Self    { self.key_pressed_fn    = Some(f); self }
     pub fn key_released(mut self, f: fn(&mut S)) -> Self   { self.key_released_fn   = Some(f); self }
     pub fn key_typed(mut self, f: fn(&mut S)) -> Self      { self.key_typed_fn      = Some(f); self }
+    pub fn focus_gained(mut self, f: fn(&mut S)) -> Self   { self.win_fns.focus_gained = Some(f); self }
+    pub fn focus_lost(mut self, f: fn(&mut S)) -> Self     { self.win_fns.focus_lost = Some(f); self }
+    pub fn mouse_entered(mut self, f: fn(&mut S)) -> Self  { self.win_fns.mouse_entered = Some(f); self }
+    pub fn mouse_exited(mut self, f: fn(&mut S)) -> Self   { self.win_fns.mouse_exited = Some(f); self }
+    pub fn window_moved(mut self, f: fn(&mut S)) -> Self   { self.win_fns.window_moved = Some(f); self }
+    pub fn window_resized(mut self, f: fn(&mut S)) -> Self { self.win_fns.window_resized = Some(f); self }
 
     pub fn run(mut self) {
         #[cfg(feature = "libprocessing")]
@@ -4966,6 +4991,7 @@ impl<S: 'static> App<S> {
                     Event::KeyPressed    => { sync_globals(ctx); if let Some(f) = self.key_pressed_fn    { f(&mut self.state); } }
                     Event::KeyReleased   => { sync_globals(ctx); if let Some(f) = self.key_released_fn   { f(&mut self.state); } }
                     Event::KeyTyped      => { sync_globals(ctx); if let Some(f) = self.key_typed_fn      { f(&mut self.state); } }
+                    Event::Window(w)     => { sync_globals(ctx); self.win_fns.call(w, &mut self.state); }
                 }
                 // whatever just ran, the canvas is the target again
                 render::end_draw();
@@ -5022,6 +5048,51 @@ impl<S: 'static> App<S> {
                 }
             });
         }
+    }
+}
+
+// ── window events: focusGained, focusLost, mouseEntered, mouseExited,
+// windowMoved, windowResized ───────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WinEvent { FocusGained, FocusLost, MouseEntered, MouseExited, Moved, Resized }
+
+/// What the window was like last time, to tell what changed.
+#[derive(Default)]
+pub(crate) struct WinWatch { focused: Option<bool>, inside: Option<bool>, size: Option<(u32, u32)>, pos: Option<(i32, i32)> }
+impl WinWatch {
+    /// The events since the last call. The first call only takes note.
+    pub(crate) fn update(&mut self, focused: bool, inside: bool, size: (u32, u32), pos: Option<(i32, i32)>) -> Vec<WinEvent> {
+        let mut out = Vec::new();
+        if let Some(f) = self.focused { if f != focused { out.push(if focused { WinEvent::FocusGained } else { WinEvent::FocusLost }); } }
+        if let Some(i) = self.inside { if i != inside { out.push(if inside { WinEvent::MouseEntered } else { WinEvent::MouseExited }); } }
+        if let Some(sz) = self.size { if sz != size { out.push(WinEvent::Resized); } }
+        if let (Some(a), Some(b)) = (self.pos, pos) { if a != b { out.push(WinEvent::Moved); } }
+        self.focused = Some(focused);
+        self.inside = Some(inside);
+        self.size = Some(size);
+        if pos.is_some() { self.pos = pos; }
+        out
+    }
+}
+
+/// The sketch's window event functions.
+pub(crate) struct WindowFns<S> {
+    pub(crate) focus_gained: Option<fn(&mut S)>, pub(crate) focus_lost: Option<fn(&mut S)>,
+    pub(crate) mouse_entered: Option<fn(&mut S)>, pub(crate) mouse_exited: Option<fn(&mut S)>,
+    pub(crate) window_moved: Option<fn(&mut S)>, pub(crate) window_resized: Option<fn(&mut S)>,
+}
+impl<S> Default for WindowFns<S> {
+    fn default() -> Self { Self { focus_gained: None, focus_lost: None, mouse_entered: None, mouse_exited: None, window_moved: None, window_resized: None } }
+}
+impl<S> WindowFns<S> {
+    pub(crate) fn call(&self, w: WinEvent, s: &mut S) {
+        let f = match w {
+            WinEvent::FocusGained => self.focus_gained, WinEvent::FocusLost => self.focus_lost,
+            WinEvent::MouseEntered => self.mouse_entered, WinEvent::MouseExited => self.mouse_exited,
+            WinEvent::Moved => self.window_moved, WinEvent::Resized => self.window_resized,
+        };
+        if let Some(f) = f { f(s); }
     }
 }
 
@@ -5094,6 +5165,17 @@ pub fn random_gaussian() -> f32 {
 // Files, JSON and tables (see data.rs).
 mod glsl;
 mod shader;
+mod vector;
+pub use vector::{create_vector, create_vector3, createVector, createVector3};
+mod image_ext;
+pub use image_ext::{PImageExt, PFontExt};
+mod matrix;
+pub use matrix::{PMatrix2D, PMatrix3D, get_matrix, get_matrix_2d, set_matrix, set_matrix_2d, apply_pmatrix, apply_pmatrix_2d,
+                 getMatrix, setMatrix};
+mod constants;
+pub use constants::*;
+mod paths;
+pub use paths::*;
 mod record;
 pub use record::{begin_record, end_record, begin_raw, end_raw, beginRecord, endRecord, beginRaw, endRaw, PDF, SVG};
 pub use shader::{PShader, load_shader, loadShader, load_shader_vf, shader_from_source, shader_from_source_vf, UniformValue, FilterKind,
@@ -5103,7 +5185,9 @@ pub use extra::*;
 mod data;
 pub use data::{load_strings, load_text, load_bytes, save_strings, save_text, save_bytes,
                split_tokens, split, join, trim, Json, parse_json, load_json, save_json,
-               Table, Col, load_table, save_table};
+               Table, Col, load_table, save_table, TableRow, TableRowRef, JsonKey};
+mod lists;
+pub use lists::{IntList, FloatList, StringList, IntDict, FloatDict, StringDict};
 #[inline] pub fn loadStrings(path: &str) -> Vec<String> { load_strings(path) }
 #[inline] pub fn saveStrings<S: AsRef<str>>(path: &str, lines: &[S]) -> bool { save_strings(path, lines) }
 #[inline] pub fn loadBytes(path: &str) -> Vec<u8> { load_bytes(path) }
