@@ -821,7 +821,8 @@ pub(crate) fn arc(cx: f32, cy: f32, w: f32, h: f32, start: f32, stop: f32, mode:
     let pie = mode != 1 && mode != 2;
     let mode = match mode { 2 => ArcMode::Chord, 3 => ArcMode::Pie, 1 => ArcMode::Open, _ => ArcMode::Open };
     let c = DrawCommand::Arc { cx, cy, w, h, start, stop, mode };
-    if !shaded_2d(&arc_outline(cx, cy, w, h, start, stop, pie), c.clone()) { cmd(c); }
+    // the outline only matters with shader() on
+    if SHADING.with(|s| s.get()).is_none() || !shaded_2d(&arc_outline(cx, cy, w, h, start, stop, pie), c.clone()) { cmd(c); }
 }
 thread_local! {
     /// A shape being built while shader() is on: its kind and vertices.

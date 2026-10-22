@@ -4079,7 +4079,18 @@ pub fn quad(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, x4: f32, y4: f
     record::poly(&[(x1, y1), (x2, y2), (x3, y3), (x4, y4)]);
     render::draw_quad(x1, y1, x2, y2, x3, y3, x4, y4);
 }
+/// Processing's angle rules for arc(): nothing for endless or backwards
+/// angles, the start brought into 0..TWO_PI, and anything past a full turn
+/// drawn as the full turn (so a huge span can't mean a huge outline).
+fn arc_angles(start: f32, stop: f32) -> Option<(f32, f32)> {
+    if !start.is_finite() || !stop.is_finite() || stop < start { return None; }
+    let tau = std::f32::consts::TAU;
+    if stop - start >= tau { return Some((0.0, tau)); }
+    let shift = (start / tau).floor() * tau;
+    Some((start - shift, stop - shift))
+}
 pub fn arc(x: f32, y: f32, w: f32, h: f32, start: f32, stop: f32) {
+    let Some((start, stop)) = arc_angles(start, stop) else { return };
     let (x, y, w, h) = ellipse_box(x, y, w, h);
     record::arc(x, y, w, h, start, stop, 0);
     render::draw_arc(x, y, w, h, start, stop);
@@ -4089,6 +4100,7 @@ pub const CHORD: u32 = 2;
 pub const PIE:   u32 = 3;
 /// arc() with a closing style: OPEN, CHORD or PIE.
 pub fn arc_mode(x: f32, y: f32, w: f32, h: f32, start: f32, stop: f32, mode: u32) {
+    let Some((start, stop)) = arc_angles(start, stop) else { return };
     let (x, y, w, h) = ellipse_box(x, y, w, h);
     record::arc(x, y, w, h, start, stop, if mode <= 3 { mode as u8 } else { 0 });
     render::draw_arc_mode(x, y, w, h, start, stop, if mode <= 3 { mode as u8 } else { 0 });
