@@ -290,6 +290,28 @@ passed around whole yet (only its items). Not yet: vertex shaders. A mistake
 in a shader is reported with its line when it's loaded;
 `PROCESSING_SHADER_DEBUG=1` prints the WGSL libprocessing gets.
 
+### Processing's classes and events
+
+`PVector` has Processing's methods (`add`, `mult`, `heading`, `limit`,
+`set_mag`...) and works with `+ - * /`. `IntList`, `FloatList`,
+`StringList`, `IntDict`, `FloatDict` and `StringDict` are there, and
+`Table`, `Json` and `Xml` have their Processing methods (`table.get_row_mut(i)`
+gives a `TableRow` that edits the table). Images and fonts are ids that
+answer Processing's methods through `PImageExt` / `PFontExt`
+(`img.resize(w, h)`, `img.mask(m)`, `font.ascent()`). `PMatrix2D` /
+`PMatrix3D` come from `get_matrix()`, and `sketch_path`, `data_path`,
+`save_path`, `list_files` find files.
+
+`focus_gained`, `focus_lost`, `mouse_entered`, `mouse_exited`,
+`window_moved` and `window_resized` (or the camelCase names) are called like
+the mouse and key events, on both renderers.
+
+`arc()` follows Processing's angle rules: nothing for endless or backwards
+angles, and a span past a full turn is drawn as one turn.
+
+`PARITY.md` lists what was checked against Processing's Java API and what is
+left out on purpose.
+
 ### Lights, materials and the rest of the API
 
 - `spot_light`, `light_falloff`, `light_specular`, and the material calls
