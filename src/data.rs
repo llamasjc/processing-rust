@@ -185,6 +185,8 @@ impl Json {
     pub fn get_int_array(&self) -> Vec<i32> { self.items().iter().map(|j| j.as_i32()).collect() }
     pub fn get_long_array(&self) -> Vec<i64> { (0..self.len()).map(|i| self.get_long(i)).collect() }
     pub fn get_float_array(&self) -> Vec<f32> { self.items().iter().map(|j| j.as_f32()).collect() }
+    #[inline] pub fn toDoubleArray(&self) -> Vec<f64> { self.get_double_array() }
+    #[inline] pub fn toLongArray(&self) -> Vec<i64> { self.get_long_array() }
     pub fn get_double_array(&self) -> Vec<f64> { self.items().iter().map(|j| j.as_f64()).collect() }
     pub fn get_string_array(&self) -> Vec<String> { self.items().iter().map(|j| j.as_string()).collect() }
     pub fn get_boolean_array(&self) -> Vec<bool> { self.items().iter().map(|j| j.as_bool()).collect() }

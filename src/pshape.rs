@@ -32,10 +32,12 @@ enum Step {
     EndContour,
     Box([f32; 3]),
     Sphere(f32),
+    /// attrib(name, values) replayed before the next vertex.
+    Attrib(String, Vec<f32>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Move { T(f32, f32), R(f32), S(f32, f32), T3([f32; 3]), RX(f32), RY(f32), S3([f32; 3]) }
+enum Move { T(f32, f32), R(f32), S(f32, f32), T3([f32; 3]), RX(f32), RY(f32), S3([f32; 3]), M2([f32; 6]), M3([f32; 16]) }
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct PShape {
@@ -57,6 +59,19 @@ pub struct PShape {
     normals: std::collections::BTreeMap<usize, [f32; 3]>,
     /// set_3d overrides what is worked out from the vertices.
     three: Option<bool>,
+    /// disable_style(): use the sketch's style instead of the shape's own.
+    style_off: bool,
+    /// bezier_detail, curve_detail and curve_tightness used while drawing.
+    bezier_detail: Option<u32>,
+    curve_detail: Option<u32>,
+    curve_tightness: Option<f32>,
+    /// texture_mode used while drawing (IMAGE 0, NORMAL 1).
+    texture_mode: Option<u8>,
+    /// color_mode for the shape's number color setters: mode and maxes.
+    color_mode: Option<(u32, [f32; 4])>,
+    /// set_kind / set_family override what is worked out from the steps.
+    kind: Option<u8>,
+    family: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -145,17 +160,17 @@ impl PShape {
 
     // ── style ────────────────────────────────────────────────────────────
     pub fn fill(&mut self, c: impl Paint) -> &mut Self { self.fill = Some(Some(c.paint())); self }
-    pub fn fill_ga(&mut self, g: impl Num, a: impl Num) -> &mut Self { self.fill = Some(Some(crate::color_ga(g, a))); self }
-    pub fn fill_rgb(&mut self, r: impl Num, g: impl Num, b: impl Num) -> &mut Self { self.fill = Some(Some(crate::color_rgb(r, g, b))); self }
+    pub fn fill_ga(&mut self, g: impl Num, a: impl Num) -> &mut Self { self.fill = Some(Some(self.in_color_mode(|| crate::color_ga(g, a)))); self }
+    pub fn fill_rgb(&mut self, r: impl Num, g: impl Num, b: impl Num) -> &mut Self { self.fill = Some(Some(self.in_color_mode(|| crate::color_rgb(r, g, b)))); self }
     pub fn fill_rgba(&mut self, r: impl Num, g: impl Num, b: impl Num, a: impl Num) -> &mut Self {
-        self.fill = Some(Some(crate::color_rgba(r, g, b, a))); self
+        self.fill = Some(Some(self.in_color_mode(|| crate::color_rgba(r, g, b, a)))); self
     }
     pub fn no_fill(&mut self) -> &mut Self { self.fill = Some(None); self }
     pub fn stroke(&mut self, c: impl Paint) -> &mut Self { self.stroke = Some(Some(c.paint())); self }
-    pub fn stroke_ga(&mut self, g: impl Num, a: impl Num) -> &mut Self { self.stroke = Some(Some(crate::color_ga(g, a))); self }
-    pub fn stroke_rgb(&mut self, r: impl Num, g: impl Num, b: impl Num) -> &mut Self { self.stroke = Some(Some(crate::color_rgb(r, g, b))); self }
+    pub fn stroke_ga(&mut self, g: impl Num, a: impl Num) -> &mut Self { self.stroke = Some(Some(self.in_color_mode(|| crate::color_ga(g, a)))); self }
+    pub fn stroke_rgb(&mut self, r: impl Num, g: impl Num, b: impl Num) -> &mut Self { self.stroke = Some(Some(self.in_color_mode(|| crate::color_rgb(r, g, b)))); self }
     pub fn stroke_rgba(&mut self, r: impl Num, g: impl Num, b: impl Num, a: impl Num) -> &mut Self {
-        self.stroke = Some(Some(crate::color_rgba(r, g, b, a))); self
+        self.stroke = Some(Some(self.in_color_mode(|| crate::color_rgba(r, g, b, a)))); self
     }
     pub fn no_stroke(&mut self) -> &mut Self { self.stroke = Some(None); self }
     pub fn stroke_weight(&mut self, w: impl Num) -> &mut Self { self.weight = Some(w.f()); self }
@@ -164,7 +179,13 @@ impl PShape {
     pub fn set_stroke(&mut self, c: impl Paint) -> &mut Self { self.stroke(c) }
     pub fn set_stroke_weight(&mut self, w: impl Num) -> &mut Self { self.stroke_weight(w) }
     /// disable_style(): draw with the sketch's fill and stroke instead.
-    pub fn disable_style(&mut self) -> &mut Self { self.fill = None; self.stroke = None; self.weight = None; self }
+    /// Its own style is kept and comes back with enable_style. Children too.
+    pub fn disable_style(&mut self) -> &mut Self { self.set_style(false); self }
+    /// enable_style(): draw with the shape's own style again.
+    pub fn enable_style(&mut self) -> &mut Self { self.set_style(true); self }
+    fn set_style(&mut self, on: bool) { self.style_off = !on; for c in &mut self.children { c.set_style(on); } }
+    /// Is the shape drawn with its own style?
+    pub fn is_style_enabled(&self) -> bool { !self.style_off }
     pub fn set_visible(&mut self, v: bool) -> &mut Self { self.visible = v; self }
     pub fn is_visible(&self) -> bool { self.visible }
 
@@ -180,6 +201,12 @@ impl PShape {
     pub fn rotate_z(&mut self, a: impl Num) -> &mut Self { self.rotate(a) }
     /// reset_matrix(): forget translate / rotate / scale.
     pub fn reset_matrix(&mut self) -> &mut Self { self.moves.clear(); self }
+    /// apply_matrix(a, b, c, d, e, f): the 2D matrix [a b c; d e f], added to the shape's moves.
+    pub fn apply_matrix(&mut self, a: impl Num, b: impl Num, c: impl Num, d: impl Num, e: impl Num, f: impl Num) -> &mut Self {
+        self.moves.push(Move::M2([a.f(), b.f(), c.f(), d.f(), e.f(), f.f()])); self
+    }
+    /// apply_matrix_3d: 16 numbers, row by row as in Processing.
+    pub fn apply_matrix_3d(&mut self, m: [f32; 16]) -> &mut Self { self.moves.push(Move::M3(m)); self }
 
     // ── vertices ─────────────────────────────────────────────────────────
     fn points(&self) -> impl Iterator<Item = (f32, f32)> + '_ {
@@ -243,13 +270,35 @@ impl PShape {
                 Move::RX(a) => crate::rotate_x(a),
                 Move::RY(a) => crate::rotate_y(a),
                 Move::S3(v) => crate::scale_3d(v[0], v[1], v[2]),
+                Move::M2(m) => crate::apply_matrix(m[0], m[1], m[2], m[3], m[4], m[5]),
+                Move::M3(m) => crate::apply_matrix_3d(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                                                      m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]),
             }
         }
+        // settings the shape carries, put back after it is drawn
+        use std::sync::atomic::Ordering::Relaxed;
+        let old_bd = self.bezier_detail.map(|n| crate::BEZIER_DETAIL.swap(n, Relaxed));
+        let old_cd = self.curve_detail.map(|n| crate::CURVE_DETAIL.swap(n, Relaxed));
+        let old_ct = self.curve_tightness.map(|t| crate::CURVE_TIGHTNESS.swap(t.to_bits(), Relaxed));
+        let old_tm = self.texture_mode.map(|m| { let o = crate::render::texture_mode(); crate::render::set_texture_mode(m); o });
+        if !self.style_off { self.apply_style(); }
+        self.draw_steps();
+        for c in &self.children { c.draw(); }
+        if let Some(n) = old_bd { crate::BEZIER_DETAIL.store(n, Relaxed); }
+        if let Some(n) = old_cd { crate::CURVE_DETAIL.store(n, Relaxed); }
+        if let Some(t) = old_ct { crate::CURVE_TIGHTNESS.store(t, Relaxed); }
+        if let Some(m) = old_tm { crate::render::set_texture_mode(m); }
+        crate::pop_style();
+        crate::pop_matrix();
+    }
+    fn apply_style(&self) {
         match self.fill { Some(Some(c)) => crate::fill_color(c), Some(None) => crate::no_fill(), None => {} }
         match self.stroke { Some(Some(c)) => crate::stroke_color(c), Some(None) => crate::no_stroke(), None => {} }
         if let Some(w) = self.weight { crate::stroke_weight(w); }
         if let Some(c) = self.cap { crate::stroke_cap(c); }
         if let Some(j) = self.join { crate::stroke_join(j); }
+    }
+    fn draw_steps(&self) {
         let mut open = false;
         for s in &self.steps {
             match *s {
@@ -276,13 +325,11 @@ impl PShape {
                 Step::Line(v) => crate::line(v[0], v[1], v[2], v[3]),
                 Step::Triangle(v) => crate::triangle(v[0], v[1], v[2], v[3], v[4], v[5]),
                 Step::Quad(v) => crate::quad(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]),
+                Step::Attrib(ref name, ref v) => crate::render::set_attrib(name, v.clone()),
             }
         }
         // a shape left open (no end_shape) is still drawn, as an open outline
         if open { crate::end_shape(); }
-        for c in &self.children { c.draw(); }
-        crate::pop_style();
-        crate::pop_matrix();
     }
 }
 
@@ -359,7 +406,7 @@ impl PShape {
     pub fn is_3d(&self) -> bool {
         if let Some(t) = self.three { return t; }
         self.steps.iter().any(|s| matches!(s, Step::Full(_, 1 | 3) | Step::Box(_) | Step::Sphere(_)))
-            || self.moves.iter().any(|m| matches!(m, Move::T3(_) | Move::RX(_) | Move::RY(_) | Move::S3(_)))
+            || self.moves.iter().any(|m| matches!(m, Move::T3(_) | Move::RX(_) | Move::RY(_) | Move::S3(_) | Move::M3(_)))
             || self.children.iter().any(|c| c.is_3d())
     }
     pub fn is_2d(&self) -> bool { !self.is_3d() }
@@ -385,6 +432,7 @@ impl PShape {
     /// The kind given to begin_shape_kind, or RECT, ELLIPSE, BOX... for
     /// primitives (POLYGON for a plain shape, GROUP for an empty group).
     pub fn get_kind(&self) -> u8 {
+        if let Some(k) = self.kind { return k; }
         for s in &self.steps {
             return match s {
                 Step::Begin(k) => *k,
@@ -402,10 +450,63 @@ impl PShape {
     }
     /// GROUP (children only), PRIMITIVE (rect, ellipse, box...) or GEOMETRY (vertices).
     pub fn get_family(&self) -> u8 {
+        if let Some(f) = self.family { return f; }
         if self.steps.iter().any(|s| matches!(s, Step::Rect(_) | Step::Ellipse(_) | Step::Line(_) | Step::Triangle(_)
             | Step::Quad(_) | Step::Box(_) | Step::Sphere(_))) { crate::constants::PRIMITIVE }
         else if self.steps.is_empty() && !self.children.is_empty() { crate::constants::GROUP }
         else { crate::constants::GEOMETRY }
+    }
+
+    /// set_kind / set_family: stored and returned by get_kind / get_family; drawing is unchanged.
+    pub fn set_kind(&mut self, k: u8) -> &mut Self { self.kind = Some(k); self }
+    pub fn set_family(&mut self, f: u8) -> &mut Self { self.family = Some(f); self }
+
+    /// Processing's code for each point of the path: VERTEX, BEZIER_VERTEX,
+    /// QUADRATIC_VERTEX, CURVE_VERTEX, or BREAK for begin_contour.
+    pub fn get_vertex_codes(&self) -> Vec<i32> {
+        self.steps.iter().filter_map(|s| match s {
+            Step::Vertex(..) | Step::Full(..) => Some(crate::constants::VERTEX),
+            Step::Bezier(_) => Some(crate::constants::BEZIER_VERTEX),
+            Step::Quadratic(_) => Some(crate::constants::QUADRATIC_VERTEX),
+            Step::Curve(..) => Some(crate::constants::CURVE_VERTEX),
+            Step::BeginContour => Some(crate::constants::BREAK),
+            _ => None,
+        }.map(|c| c as i32)).collect()
+    }
+    pub fn get_vertex_code_count(&self) -> usize { self.get_vertex_codes().len() }
+    /// get_vertex_code(i), or VERTEX past the end.
+    pub fn get_vertex_code(&self, i: usize) -> i32 { self.get_vertex_codes().get(i).copied().unwrap_or(0) }
+
+    /// attrib(name, values) on the shape: replayed before the next vertex when drawn.
+    pub fn attrib(&mut self, name: &str, v: impl crate::shader::UniformValue) -> &mut Self {
+        self.steps.push(Step::Attrib(name.to_string(), v.floats())); self
+    }
+    pub fn attrib_position(&mut self, name: &str, x: impl Num, y: impl Num, z: impl Num) -> &mut Self { self.attrib(name, [x.f(), y.f(), z.f()]) }
+    pub fn attrib_normal(&mut self, name: &str, x: impl Num, y: impl Num, z: impl Num) -> &mut Self { self.attrib(name, [x.f(), y.f(), z.f()]) }
+    pub fn attrib_color(&mut self, name: &str, c: impl Paint) -> &mut Self { let c = c.paint(); self.attrib(name, [c.r, c.g, c.b, c.a]) }
+
+    /// bezier_detail / curve_detail / curve_tightness used while this shape is drawn.
+    pub fn bezier_detail(&mut self, n: impl Num) -> &mut Self { self.bezier_detail = Some(n.f().clamp(1.0, 1000.0) as u32); self }
+    pub fn curve_detail(&mut self, n: impl Num) -> &mut Self { self.curve_detail = Some(n.f().clamp(1.0, 1000.0) as u32); self }
+    pub fn curve_tightness(&mut self, t: impl Num) -> &mut Self { let t = t.f(); if t.is_finite() { self.curve_tightness = Some(t); } self }
+    /// texture_mode(IMAGE or NORMAL) used for this shape's u, v.
+    pub fn texture_mode(&mut self, m: u8) -> &mut Self { self.texture_mode = Some(m.min(1)); self }
+    pub fn set_texture_mode(&mut self, m: u8) -> &mut Self { self.texture_mode(m) }
+
+    /// color_mode for the number setters (fill_rgb, stroke_rgba...) on this shape.
+    pub fn color_mode(&mut self, mode: u32) -> &mut Self { let m = self.color_mode.map_or(255.0, |c| c.1[0]); self.color_mode_max(mode, m, m, m, m) }
+    pub fn color_mode_range(&mut self, mode: u32, max: impl Num) -> &mut Self { let m = max.f(); self.color_mode_max(mode, m, m, m, m) }
+    pub fn color_mode_max(&mut self, mode: u32, m1: impl Num, m2: impl Num, m3: impl Num, ma: impl Num) -> &mut Self {
+        self.color_mode = Some((mode, [m1.f(), m2.f(), m3.f(), ma.f()])); self
+    }
+    /// Runs f with the shape's color_mode in place, if it has one.
+    fn in_color_mode(&self, f: impl FnOnce() -> Color) -> Color {
+        let Some((mode, m)) = self.color_mode else { return f() };
+        let old = *crate::COLOR_MODE.read();
+        crate::color_mode_max(mode, m[0], m[1], m[2], m[3]);
+        let c = f();
+        *crate::COLOR_MODE.write() = old;
+        c
     }
 
     fn nth_vertex_mut(&mut self, i: usize) -> Option<&mut Step> { self.steps.iter_mut().filter(|s| Self::is_vertex(s)).nth(i) }
@@ -487,6 +588,26 @@ impl PShape {
     #[inline] pub fn setTextureUV(&mut self, i: usize, u: impl Num, v: impl Num) -> &mut Self { self.set_texture_uv(i, u, v) }
     #[inline] pub fn getTextureU(&self, i: usize) -> f32 { self.get_texture_u(i) }
     #[inline] pub fn getTextureV(&self, i: usize) -> f32 { self.get_texture_v(i) }
+    #[inline] pub fn applyMatrix(&mut self, a: impl Num, b: impl Num, c: impl Num, d: impl Num, e: impl Num, f: impl Num) -> &mut Self { self.apply_matrix(a, b, c, d, e, f) }
+    #[inline] pub fn applyMatrix3D(&mut self, m: [f32; 16]) -> &mut Self { self.apply_matrix_3d(m) }
+    #[inline] pub fn resetMatrix(&mut self) -> &mut Self { self.reset_matrix() }
+    #[inline] pub fn bezierDetail(&mut self, n: impl Num) -> &mut Self { self.bezier_detail(n) }
+    #[inline] pub fn curveDetail(&mut self, n: impl Num) -> &mut Self { self.curve_detail(n) }
+    #[inline] pub fn curveTightness(&mut self, t: impl Num) -> &mut Self { self.curve_tightness(t) }
+    #[inline] pub fn textureMode(&mut self, m: u8) -> &mut Self { self.texture_mode(m) }
+    #[inline] pub fn setTextureMode(&mut self, m: u8) -> &mut Self { self.texture_mode(m) }
+    #[inline] pub fn colorMode(&mut self, mode: u32) -> &mut Self { self.color_mode(mode) }
+    #[inline] pub fn attribPosition(&mut self, name: &str, x: impl Num, y: impl Num, z: impl Num) -> &mut Self { self.attrib_position(name, x, y, z) }
+    #[inline] pub fn attribNormal(&mut self, name: &str, x: impl Num, y: impl Num, z: impl Num) -> &mut Self { self.attrib_normal(name, x, y, z) }
+    #[inline] pub fn attribColor(&mut self, name: &str, c: impl Paint) -> &mut Self { self.attrib_color(name, c) }
+    #[inline] pub fn getVertexCode(&self, i: usize) -> i32 { self.get_vertex_code(i) }
+    #[inline] pub fn getVertexCodeCount(&self) -> usize { self.get_vertex_code_count() }
+    #[inline] pub fn getVertexCodes(&self) -> Vec<i32> { self.get_vertex_codes() }
+    #[inline] pub fn set3D(&mut self, on: bool) -> &mut Self { self.set_3d(on) }
+    #[inline] pub fn enableStyle(&mut self) -> &mut Self { self.enable_style() }
+    #[inline] pub fn disableStyle(&mut self) -> &mut Self { self.disable_style() }
+    #[inline] pub fn setKind(&mut self, k: u8) -> &mut Self { self.set_kind(k) }
+    #[inline] pub fn setFamily(&mut self, f: u8) -> &mut Self { self.set_family(f) }
 }
 
 /// What shape() can draw: an SVG from load_shape (its id) or a PShape.
@@ -547,7 +668,9 @@ mod tests {
         g.get_child(1).unwrap().translate(3, 3).rotate(0.5);
         assert_eq!(g.children[1].moves.len(), 2);
         g.disable_style();
-        assert!(g.fill.is_none());
+        assert!(g.style_off && g.children[0].style_off && g.children[0].fill.is_some());
+        g.enable_style();
+        assert!(g.is_style_enabled() && !g.children[0].style_off);
     }
     #[test]
     fn processing_getters() {
@@ -591,5 +714,42 @@ mod tests {
         assert_eq!(g.get_child_index(&inner), Some(0));
         assert_eq!(g.get_children().len(), 1);
         assert_eq!(g.get_height(), 40.0);
+        g.set_kind(crate::constants::RECT).set_family(crate::constants::PATH);
+        assert_eq!((g.get_kind(), g.get_family()), (crate::constants::RECT, crate::constants::PATH));
+    }
+    #[test]
+    fn vertex_codes() {
+        let mut s = create_shape();
+        s.begin_shape().vertex(0, 0).bezier_vertex(1, 2, 3, 4, 5, 6).quadratic_vertex(1, 1, 2, 2)
+            .curve_vertex(3, 3).begin_contour().vertex_uv(1, 1, 0, 0).end_contour().end_shape();
+        assert_eq!(s.get_vertex_codes(), vec![0, 1, 2, 3, 4, 0]);
+        assert_eq!(s.get_vertex_code_count(), 6);
+        assert_eq!(s.get_vertex_code(1), crate::constants::BEZIER_VERTEX as i32);
+        assert_eq!(create_shape_rect(0, 0, 1, 1).get_vertex_code_count(), 0);
+    }
+    #[test]
+    fn matrix_moves() {
+        let mut s = create_shape();
+        s.translate(1, 2).apply_matrix(1, 0, 5, 0, 1, 6);
+        assert_eq!(s.moves[1], Move::M2([1.0, 0.0, 5.0, 0.0, 1.0, 6.0]));
+        assert!(s.is_2d());
+        let mut m = [0.0; 16]; m[0] = 1.0; m[5] = 1.0; m[10] = 1.0; m[15] = 1.0;
+        s.apply_matrix_3d(m);
+        assert_eq!(s.moves[2], Move::M3(m));
+        assert!(s.is_3d());
+        s.reset_matrix();
+        assert!(s.moves.is_empty());
+    }
+    #[test]
+    fn attribs_recorded() {
+        let mut s = create_shape();
+        s.begin_shape().attrib_position("p", 1, 2, 3).vertex(0, 0).attrib("w", 0.5f32).vertex(1, 1).end_shape();
+        assert_eq!(s.steps[1], Step::Attrib("p".into(), vec![1.0, 2.0, 3.0]));
+        assert_eq!(s.steps[2], Step::Vertex(0.0, 0.0));
+        assert_eq!(s.steps[3], Step::Attrib("w".into(), vec![0.5]));
+        assert_eq!(s.vertex_count(), 2);
+        assert_eq!(s.get_vertex_codes(), vec![0, 0]);
+        s.bezier_detail(5).curve_tightness(0.5).texture_mode(crate::NORMAL);
+        assert_eq!((s.bezier_detail, s.curve_tightness, s.texture_mode), (Some(5), Some(0.5), Some(1)));
     }
 }

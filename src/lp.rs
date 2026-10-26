@@ -1550,12 +1550,24 @@ pub(crate) fn draw_layer(id: u64, x: f32, y: f32, w: f32, h: f32) {
 // ── the window: resizable, cursor, full screen ──────────────────────────
 thread_local! {
     static APPLIED: std::cell::Cell<Option<(bool, bool, Option<(usize, usize, isize, isize)>)>> = const { std::cell::Cell::new(None) };
+    static CURSOR_APPLIED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 /// Brings the window in line with windowResizable(), cursor() / noCursor()
 /// and fullScreen(); only touches what changed.
 fn sync_window() {
     let want = crate::glfw::window_wants();
     let had = APPLIED.with(|a| a.get());
+    // the cursor's look
+    let kind = crate::glfw::cursor_kind();
+    if CURSOR_APPLIED.with(|c| c.get()) != Some(kind) {
+        if let Some(s) = LP.with(|l| l.borrow().as_ref().map(|l| l.surface)) {
+            CURSOR_APPLIED.with(|c| c.set(Some(kind)));
+            use bevy::window::SystemCursorIcon as I;
+            let icon = match kind { crate::CROSS => I::Crosshair, crate::TEXT => I::Text, crate::WAIT => I::Wait,
+                                    crate::HAND => I::Pointer, crate::MOVE => I::Move, _ => I::Default };
+            if let Err(e) = input::input_set_cursor_icon(s, icon) { fail("cursor", e); }
+        }
+    }
     if had == Some(want) { return; }
     let Some(s) = LP.with(|l| l.borrow().as_ref().map(|l| l.surface)) else { return };
     let (resizable, cursor, present) = want;

@@ -359,6 +359,9 @@ public class RustBuild {
   static java.util.List<String> engineFiles(File modeRoot) {
     java.util.List<String> out = new java.util.ArrayList<>();
     out.add("Cargo.toml");
+    // build.rs checks what the libprocessing checkout supports (textures,
+    // attrib(), window events); without it those are off in IDE builds
+    if (new File(modeRoot, "build.rs").isFile()) out.add("build.rs");
     out.add("src/lib.rs");
     File[] rs = new File(modeRoot, "src").listFiles((d, n) -> n.endsWith(".rs") && !n.equals("lib.rs"));
     if (rs != null) {
@@ -580,6 +583,7 @@ public class RustBuild {
     try {
       java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
       List<String> names = new ArrayList<>(List.of("Cargo.toml", "Cargo.lock"));
+      if (new File(root, "build.rs").isFile()) names.add("build.rs");
       List<String> rs = new ArrayList<>();
       File[] fs = new File(root, "src").listFiles((d, n) -> n.endsWith(".rs"));
       if (fs != null) for (File f : fs) rs.add("src/" + f.getName());

@@ -452,6 +452,7 @@ mod render {
     static TEXTURE_WRAP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     pub fn set_texture(id: Option<u64>) { TEXTURE.with(|t| t.set(id.filter(|&i| i > 0))); }
     pub fn set_texture_mode(m: u8) { TEXTURE_MODE.store(m.min(1), Ordering::Relaxed); }
+    pub(crate) fn texture_mode() -> u8 { TEXTURE_MODE.load(Ordering::Relaxed) }
     pub fn set_texture_wrap(m: u8) { TEXTURE_WRAP.store(m.min(1), Ordering::Relaxed); }
     #[allow(dead_code)] // unused when libprocessing has no textures
     pub(crate) fn texture_wrap_mode() -> u8 { TEXTURE_WRAP.load(Ordering::Relaxed) }
@@ -3503,6 +3504,11 @@ mod glfw {
     pub static MOUSE_BUTTON:   std::sync::atomic::AtomicU32  = std::sync::atomic::AtomicU32::new(0);
     static CURSOR_VISIBLE:     std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     pub fn set_cursor_visible(v: bool) { CURSOR_VISIBLE.store(v, Ordering::Relaxed); }
+    /// The cursor's look: ARROW, CROSS, HAND, MOVE, TEXT or WAIT.
+    static CURSOR_KIND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    pub fn set_cursor_kind(k: u32) { CURSOR_KIND.store(k, Ordering::Relaxed); }
+    #[allow(dead_code)]
+    pub(crate) fn cursor_kind() -> u32 { CURSOR_KIND.load(Ordering::Relaxed) }
     pub fn current_frame_rate() -> f32 { measured_frame_rate() }
     pub fn is_looping() -> bool { looping() }
     /// For the libprocessing renderer's own frame loop.
@@ -3665,6 +3671,13 @@ mod glfw {
                     MOUSE_BUTTON.store(if bl { 37 } else if br { 39 } else { 3 }, Ordering::Relaxed);
                 }
                 window.set_cursor_visibility(CURSOR_VISIBLE.load(Ordering::Relaxed));
+                window.set_cursor_style(match CURSOR_KIND.load(Ordering::Relaxed) {
+                    crate::CROSS => minifb::CursorStyle::Crosshair,
+                    crate::TEXT => minifb::CursorStyle::Ibeam,
+                    crate::HAND => minifb::CursorStyle::OpenHand,
+                    crate::MOVE => minifb::CursorStyle::ResizeAll,
+                    _ => minifb::CursorStyle::Arrow,   // WAIT too: minifb has no busy cursor
+                });
 
                 let millis = start.elapsed().as_millis() as u64;
                 let mut ctx = FrameContext {
@@ -4313,6 +4326,13 @@ pub fn cursor() {
     #[cfg(not(feature = "wasm"))] glfw::set_cursor_visible(true);
     #[cfg(feature = "wasm")]      wasm::set_cursor_visible(true);
 }
+/// cursor(HAND): shows the cursor with that look (ARROW, CROSS, HAND, MOVE,
+/// TEXT, WAIT). Processing's cursor(img) with a picture isn't supported.
+pub fn cursor_kind(kind: u32) {
+    #[cfg(not(feature = "wasm"))] glfw::set_cursor_kind(kind);
+    cursor();
+}
+#[inline] pub fn cursorKind(kind: u32) { cursor_kind(kind) }
 
 // ─────────────────────────── Shapes: bezier / curve ──────────────────────────
 // (begin_shape / vertex / end_shape and the kind constants are further down.)

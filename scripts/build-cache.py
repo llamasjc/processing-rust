@@ -47,7 +47,8 @@ def engine_hash(root: Path) -> str:
     """Same as RustBuild.engineHash(): the engine's sources and lockfile,
     line endings ignored so a Windows checkout gives the same answer."""
     h = hashlib.sha256()
-    files = ["Cargo.toml", "Cargo.lock"] + sorted("src/" + p.name for p in (root / "src").glob("*.rs"))
+    files = ["Cargo.toml", "Cargo.lock"] + (["build.rs"] if (root / "build.rs").is_file() else []) \
+        + sorted("src/" + p.name for p in (root / "src").glob("*.rs"))
     for name in files:
         data = (root / name).read_bytes().replace(b"\r\n", b"\n")
         h.update(name.encode() + b"\0" + data + b"\0")
@@ -64,7 +65,7 @@ def toolchain():
 
 def local_fork():
     env = os.environ.get("LIBPROCESSING_DIR")
-    for d in ([env] if env else []) + [str(ROOT.parent.parent / "libprocessing")]:
+    for d in ([env] if env else []) + [str(Path.home() / "lp-fork"), str(ROOT.parent.parent / "libprocessing")]:
         if d and (Path(d) / "crates/processing_render/Cargo.toml").is_file():
             return Path(d)
     return None
@@ -105,6 +106,8 @@ incremental = false
 
     tc = os.environ.get("RUSTUP_TOOLCHAIN") or toolchain()
     env = dict(os.environ, RUSTUP_TOOLCHAIN=tc, CARGO_TARGET_DIR=str(work / "target"))
+    # the engine's build.rs checks the same checkout for what it supports
+    env["LIBPROCESSING_DIR"] = str(fork) if fork else ""
     print(f"Platform: {plat}  renderer: {renderer}  Rust: {tc}" + (f"  libprocessing: {fork}" if fork else ""))
     p = subprocess.run(["cargo", "build", "--message-format=json-render-diagnostics"],
                        cwd=work, env=env, stdout=subprocess.PIPE, text=True)

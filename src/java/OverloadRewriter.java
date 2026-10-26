@@ -43,6 +43,7 @@ final class OverloadRewriter {
     Map.entry("random",      Map.of(2, "random_range")),
     Map.entry("noise",       Map.of(2, "noise2", 3, "noise3")),
     Map.entry("begin_shape", Map.of(1, "begin_shape_kind")),
+    Map.entry("cursor", Map.of(1, "cursor_kind")),
     Map.entry("end_shape",   Map.of(1, "end_shape_mode")),
     Map.entry("color",       Map.of(2, "color_ga", 3, "color_rgb", 4, "color_rgba")),
     Map.entry("color_mode",  Map.of(2, "color_mode_range", 4, "color_mode3", 5, "color_mode_max")),

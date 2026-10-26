@@ -38,13 +38,13 @@ needs the lp-fork).
 - `mask()` on the canvas and `choice()`: deprecated in Processing.
 - `XML.getParent()` in RustMode: children are owned values with no link up
   (LuaMode has it).
-- `PShape` tessellation (`getTessellation` and friends), `getVertexCode*`,
-  `setFamily` / `setKind` / `setPath`, and in RustMode `PShape.applyMatrix`,
-  `bezierDetail`, `curveDetail`, `textureMode`, `attrib*` on a shape.
+- `PShape` tessellation (`getTessellation` and friends) and `setPath`.
+- `cursor(img, x, y)` with a picture: it shows the normal cursor. The named
+  kinds (`HAND`, `CROSS`, `MOVE`, `TEXT`, `WAIT`, `ARROW`) work; `WAIT` is the
+  arrow on the default renderer.
 - `PFont.getGlyph`, `getShape`, `save`: they'd need glyph outlines from the
   font engine.
-- `JSONArray` value iterators and the `double` / `long` array variants in
-  RustMode (use the float and int ones).
+- `JSONArray` value iterators (use the `get_*_array` ones).
 
 ## Partial
 
