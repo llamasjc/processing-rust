@@ -7,6 +7,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(lp_no_texture)");
     println!("cargo::rustc-check-cfg=cfg(lp_attribs)");
     println!("cargo::rustc-check-cfg=cfg(lp_window_state)");
+    println!("cargo::rustc-check-cfg=cfg(lp_depth_test)");
     println!("cargo:rerun-if-env-changed=LIBPROCESSING_DIR");
     let dir = std::env::var("LIBPROCESSING_DIR").ok().filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
     let Some(dir) = dir else { return };
@@ -25,6 +26,8 @@ fn main() {
     let file = dir.join("crates/processing_render/src/render/command.rs");
     println!("cargo:rerun-if-changed={}", file.display());
     if let Ok(src) = std::fs::read_to_string(&file) {
+        // the lp-fork can turn the depth test off (hint(DISABLE_DEPTH_TEST))
+        if src.contains("DepthTest(bool)") { println!("cargo:rustc-cfg=lp_depth_test"); }
         if !src.contains("NoTexture") {
             println!("cargo:rustc-cfg=lp_no_texture");
             println!("cargo:warning=your libprocessing checkout has no texture commands; textured shapes draw untextured. Update it to get textures.");

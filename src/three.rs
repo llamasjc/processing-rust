@@ -715,6 +715,12 @@ fn draw_mesh_vs(vcpu: &crate::glsl::Cpu, vimages: &[(usize, usize, Vec<u32>)], v
     let slots: Vec<(usize, crate::glsl::Ty)> = outs.iter().map(|n| fcpu.global(n).unwrap()).collect();
     let sizes: Vec<usize> = slots.iter().map(|(_, t)| t.size_pub().max(1)).collect();
     let stride: usize = sizes.iter().sum();
+    let flat: Vec<usize> = {
+        let mut at = 0;
+        let mut f = Vec::new();
+        for (k, (_, t)) in slots.iter().enumerate() { if *t == crate::glsl::Ty::Int { f.push(at); } at += sizes[k]; }
+        f
+    };
     let run_stage = |col: Color| -> Vec<Option<(SV, Vec<f32>)>> {
         let mut vs = vcpu.vertex_with(vimages.to_vec());
         for (k, v) in [("transform", &pmv), ("modelviewMatrix", &mv), ("modelview", &mv), ("projectionMatrix", &proj),
@@ -753,6 +759,8 @@ fn draw_mesh_vs(vcpu: &crate::glsl::Cpu, vimages: &[(usize, usize, Vec<u32>)], v
                 let (x, y) = PIXEL.with(|p| p.get());
                 let mut mx = mix.borrow_mut();
                 for j in 0..stride { mx[j] = k0 * oa[j] + k1 * ob[j] + k2 * oc[j]; }
+                // ints aren't blended: they come from the first corner (flat)
+                for &j in &flat { mx[j] = oa[j]; }
                 let mut vary: [(usize, crate::glsl::Ty, &[f32]); 16] = [(0, crate::glsl::Ty::Float, &[]); 16];
                 let mut at = 0;
                 let nv = slots.len().min(16);
@@ -799,14 +807,84 @@ pub(crate) fn in_3d() -> bool {
 
 /// box(size) or box_3d(w, h, d): centered on the current origin.
 pub fn box_3d(w: impl Num, h: impl Num, d: impl Num) {
-    lp_route! { crate::lp::box_3d(w.f(), h.f(), d.f()); return; }
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() {
+        if crate::record::on() { record_box(w.f(), h.f(), d.f()); }
+        crate::lp::box_3d(w.f(), h.f(), d.f());
+        return;
+    }
     let (x, y, z) = (w.f() / 2.0, h.f() / 2.0, d.f() / 2.0);
     let v = [[-x, -y, -z], [x, -y, -z], [x, y, -z], [-x, y, -z], [-x, -y, z], [x, -y, z], [x, y, z], [-x, y, z]];
     let t = [[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6], [0, 4, 5], [0, 5, 1],
              [3, 2, 6], [3, 6, 7], [0, 3, 7], [0, 7, 4], [1, 5, 6], [1, 6, 2]];
     let e = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
+    if crate::record::on() { record_mesh(&v, &t, &e); }
     draw_mesh(&v, &t, Some(&e));
 }
+#[cfg(feature = "libprocessing")]
+fn record_box(w: f32, h: f32, d: f32) {
+    let (x, y, z) = (w / 2.0, h / 2.0, d / 2.0);
+    let v = [[-x, -y, -z], [x, -y, -z], [x, y, -z], [-x, y, -z], [-x, -y, z], [x, -y, z], [x, y, z], [-x, y, z]];
+    let t = [[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6], [0, 4, 5], [0, 5, 1],
+             [3, 2, 6], [3, 6, 7], [0, 3, 7], [0, 7, 4], [1, 5, 6], [1, 6, 2]];
+    let e = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
+    record_mesh(&v, &t, &e);
+}
+
+/// A box with its own corners for each face, so each face has its normal:
+/// corners, normals, triangles.
+#[cfg(feature = "libprocessing")]
+pub(crate) fn box_mesh_flat(w: f32, h: f32, d: f32) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[usize; 3]>) {
+    let (x, y, z) = (w / 2.0, h / 2.0, d / 2.0);
+    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+        ([0.0, 0.0, -1.0], [[-x, -y, -z], [x, -y, -z], [x, y, -z], [-x, y, -z]]),
+        ([0.0, 0.0, 1.0], [[-x, -y, z], [-x, y, z], [x, y, z], [x, -y, z]]),
+        ([0.0, -1.0, 0.0], [[-x, -y, -z], [-x, -y, z], [x, -y, z], [x, -y, -z]]),
+        ([0.0, 1.0, 0.0], [[-x, y, -z], [x, y, -z], [x, y, z], [-x, y, z]]),
+        ([-1.0, 0.0, 0.0], [[-x, -y, -z], [-x, y, -z], [-x, y, z], [-x, -y, z]]),
+        ([1.0, 0.0, 0.0], [[x, -y, -z], [x, -y, z], [x, y, z], [x, y, -z]]),
+    ];
+    let (mut v, mut n, mut t) = (Vec::new(), Vec::new(), Vec::new());
+    for (normal, quad) in faces {
+        let b = v.len();
+        for p in quad { v.push(p); n.push(normal); }
+        t.push([b, b + 1, b + 2]);
+        t.push([b, b + 2, b + 3]);
+    }
+    (v, n, t)
+}
+
+/// begin_record(): a box or sphere as its triangles in canvas pixels, lit,
+/// farthest first so nearer ones cover them, then its outline.
+fn record_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], edges: &[[usize; 2]]) {
+    let (m, view, proj, eye) = matrices();
+    let (w, h) = dims();
+    let vp = mul(&proj, &view);
+    let world: Vec<[f32; 3]> = verts.iter().map(|p| { let q = apply(&m, *p); [q[0], q[1], q[2]] }).collect();
+    let screen: Vec<Option<SV>> = world.iter().map(|p| to_screen(apply(&vp, *p), w as f32, h as f32)).collect();
+    let (fill, stroke, weight) = crate::render::style_pub();
+    let (lights, mat) = S.with(|s| { let s = s.borrow(); (s.lights.clone(), s.material) });
+    if let Some(fc) = fill {
+        let mut faces: Vec<(f32, [(f32, f32); 3], Color)> = Vec::new();
+        for t in tris {
+            let (Some(a), Some(b), Some(c)) = (screen[t[0]], screen[t[1]], screen[t[2]]) else { continue };
+            let (pa, pb, pc) = (world[t[0]], world[t[1]], world[t[2]]);
+            let n = norm(cross(sub(pb, pa), sub(pc, pa)));
+            let center = [(pa[0] + pb[0] + pc[0]) / 3.0, (pa[1] + pb[1] + pc[1]) / 3.0, (pa[2] + pb[2] + pc[2]) / 3.0];
+            faces.push(((a.z + b.z + c.z) / 3.0, [(a.x, a.y), (b.x, b.y), (c.x, c.y)], shade_with(fc, n, center, eye, &lights, &mat)));
+        }
+        faces.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (_, p, c) in faces { crate::record::screen_path(&p, true, Some(c), None, 0.0); }
+    }
+    if let Some(sc) = stroke {
+        for e in edges {
+            if let (Some(a), Some(b)) = (screen[e[0]], screen[e[1]]) {
+                crate::record::screen_path(&[(a.x, a.y), (b.x, b.y)], false, None, Some(sc), weight);
+            }
+        }
+    }
+}
+
 pub fn box_cube(size: impl Num) { let s = size.f(); box_3d(s, s, s); }
 
 /// sphere_detail(n) or sphere_detail_uv(around, down): how many pieces a sphere is made of.
@@ -815,10 +893,8 @@ pub fn sphere_detail_uv(u: impl Num, v: impl Num) {
     let (u, v) = ((u.f() as usize).clamp(3, 200), (v.f() as usize).clamp(2, 200));
     S.with(|s| s.borrow_mut().sphere_detail = (u, v));
 }
-pub fn sphere(r: impl Num) {
-    let r = r.f();
-    let (us, vs) = S.with(|s| s.borrow().sphere_detail);
-    lp_route! { crate::lp::sphere(r, us as u32, vs as u32); return; }
+/// A sphere's corners, triangles and outline edges.
+pub(crate) fn sphere_mesh(r: f32, us: usize, vs: usize) -> (Vec<[f32; 3]>, Vec<[usize; 3]>, Vec<[usize; 2]>) {
     let mut v = Vec::with_capacity((us + 1) * (vs + 1));
     for j in 0..=vs {
         let phi = std::f32::consts::PI * j as f32 / vs as f32;
@@ -839,6 +915,20 @@ pub fn sphere(r: impl Num) {
             if j != 0 { e.push([a, b]); }
         }
     }
+    (v, t, e)
+}
+
+pub fn sphere(r: impl Num) {
+    let r = r.f();
+    let (us, vs) = S.with(|s| s.borrow().sphere_detail);
+    #[cfg(feature = "libprocessing")]
+    if crate::lp::on() {
+        if crate::record::on() { let (v, t, e) = sphere_mesh(r, us, vs); record_mesh(&v, &t, &e); }
+        crate::lp::sphere(r, us as u32, vs as u32);
+        return;
+    }
+    let (v, t, e) = sphere_mesh(r, us, vs);
+    if crate::record::on() { record_mesh(&v, &t, &e); }
     draw_mesh(&v, &t, Some(&e));
 }
 pub fn line_3d(x1: impl Num, y1: impl Num, z1: impl Num, x2: impl Num, y2: impl Num, z2: impl Num) {

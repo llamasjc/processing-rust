@@ -430,6 +430,29 @@ fn shaded_fill(mat: Entity, c: Color) {
 fn shaded_3d(draw: DrawCommand) -> bool {
     let Some(mat) = SHADING.with(|s| s.get()) else { return false };
     let c = crate::render::style_pub().0.unwrap_or(Color::from_rgb(1.0, 1.0, 1.0));
+    // with a vertex stage the mesh has to carry what it reads (color,
+    // attrib()), so the box or sphere is built here
+    if crate::shader::lp_has_vertex() {
+        let mesh = match &draw {
+            DrawCommand::Box { width, height, depth } => {
+                let (v, n, t) = crate::three::box_mesh_flat(*width, *height, *depth);
+                Some((v, Some(n), t))
+            }
+            DrawCommand::Sphere { radius, sectors, stacks } => {
+                let (v, t, _) = crate::three::sphere_mesh(*radius, *sectors as usize, *stacks as usize);
+                let n: Vec<[f32; 3]> = v.iter().map(|p| { let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-6); [p[0] / l, p[1] / l, p[2] / l] }).collect();
+                Some((v, Some(n), t))
+            }
+            _ => None,
+        };
+        if let Some((v, n, t)) = mesh {
+            if let Some(g) = whole_mesh_full(&v, &t, c, &[], n.as_deref(), true) {
+                shaded_fill(mat, c);
+                cmd(DrawCommand::Geometry(g));
+                return true;
+            }
+        }
+    }
     shaded_fill(mat, c);
     cmd(draw);
     true
@@ -461,16 +484,26 @@ fn whole_mesh(verts: &[[f32; 3]], tris: &[[usize; 3]], fill: Color) -> Option<En
 /// whole_mesh, with the attrib() values each vertex had: every attribute the
 /// active shader reads is in the mesh (zeros where none was given).
 fn whole_mesh_with(verts: &[[f32; 3]], tris: &[[usize; 3]], fill: Color, attrs: &[Vec<(String, Vec<f32>)>]) -> Option<Entity> {
+    whole_mesh_full(verts, tris, fill, attrs, None, true)
+}
+/// whole_mesh_with, with normals of its own (else facing the screen) and
+/// whether to add each triangle the other way round too (flat 2D shapes).
+fn whole_mesh_full(verts: &[[f32; 3]], tris: &[[usize; 3]], fill: Color, attrs: &[Vec<(String, Vec<f32>)>],
+                   normals: Option<&[[f32; 3]]>, both_sides: bool) -> Option<Entity> {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for v in verts { x0 = x0.min(v[0]); y0 = y0.min(v[1]); x1 = x1.max(v[0]); y1 = y1.max(v[1]); }
     let (bw, bh) = ((x1 - x0).max(1e-6), (y1 - y0).max(1e-6));
     let uvs: Vec<[f32; 2]> = verts.iter().map(|v| [(v[0] - x0) / bw, (v[1] - y0) / bh]).collect();
-    let normals = vec![[0.0f32, 0.0, 1.0]; verts.len()];
+    let normals: Vec<[f32; 3]> = match normals { Some(n) if n.len() == verts.len() => n.to_vec(), _ => vec![[0.0f32, 0.0, 1.0]; verts.len()] };
     let colors = vec![[fill.r, fill.g, fill.b, fill.a]; verts.len()];
     // both ways round, so it shows whichever way it faces
-    let idx: Vec<u32> = tris.iter().flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32, t[0] as u32, t[2] as u32, t[1] as u32]).collect();
+    let idx: Vec<u32> = if both_sides {
+        tris.iter().flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32, t[0] as u32, t[2] as u32, t[1] as u32]).collect()
+    } else {
+        tris.iter().flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32]).collect()
+    };
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts.to_vec());
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
@@ -479,7 +512,9 @@ fn whole_mesh_with(verts: &[[f32; 3]], tris: &[[usize; 3]], fill: Color, attrs: 
     #[cfg(lp_attribs)]
     for (name, n) in crate::shader::lp_attributes() {
         let value = |i: usize| -> Vec<f32> {
-            let mut v = attrs.get(i).and_then(|l| l.iter().find(|(k, _)| *k == name)).map(|(_, v)| v.clone()).unwrap_or_default();
+            // a vertex with no color of its own has the fill
+            let missing = if name == "color" { vec![fill.r, fill.g, fill.b, fill.a] } else { Vec::new() };
+            let mut v = attrs.get(i).and_then(|l| l.iter().find(|(k, _)| *k == name)).map(|(_, v)| v.clone()).unwrap_or(missing);
             v.resize(n, 0.0);
             v
         };
@@ -753,6 +788,9 @@ pub(crate) fn tint(c: Option<Color>) {
     TINT.with(|t| t.set(c));
     cmd(match c { Some(c) => DrawCommand::Tint(col(c)), None => DrawCommand::NoTint });
 }
+/// hint(DISABLE_DEPTH_TEST / ENABLE_DEPTH_TEST)
+#[cfg(lp_depth_test)]
+pub(crate) fn depth_test(on: bool) { cmd(DrawCommand::DepthTest(on)); }
 pub(crate) fn blend_mode(m: u8) {
     let mode = pr::render::command::BlendMode::try_from(m).unwrap_or_default();
     cmd(DrawCommand::BlendMode(mode.to_blend_state()));
@@ -845,7 +883,9 @@ pub(crate) fn begin_shape(kind: u8) {
 pub(crate) fn vertex(x: f32, y: f32) {
     SHADED_SHAPE.with(|s| if let Some((_, v)) = s.borrow_mut().as_mut() {
         v.push([x, y, 0.0]);
-        let cur = crate::render::ATTRIBS.with(|a| a.borrow().clone());
+        let mut cur = crate::render::ATTRIBS.with(|a| a.borrow().clone());
+        // each vertex's own fill, for a vertex shader's `color`
+        if let Some(f) = crate::render::style_pub().0 { cur.push(("color".to_string(), vec![f.r, f.g, f.b, f.a])); }
         SHADED_ATTRS.with(|a| a.borrow_mut().push(cur));
     });
     cmd(DrawCommand::ShapeVertex { x, y });

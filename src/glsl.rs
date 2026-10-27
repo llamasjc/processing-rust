@@ -1723,8 +1723,8 @@ pub fn to_wgsl_material_vf(frag: &Program, vert: &Program) -> Result<String, Str
     v.uniforms.retain(|(_, n)| !VERTEX_MATRICES.contains(&n.as_str()));
     for (t, n) in mats { v.globals.push((t, n, None, false)); }
     for (t, n) in &frag.varyings {
-        if v.varyings.iter().any(|(_, m)| m == n) && !matches!(t, Ty::Float | Ty::Vec(_)) {
-            return Err(format!("varying `{n}`: only float and vec varyings work on libprocessing"));
+        if v.varyings.iter().any(|(_, m)| m == n) && !matches!(t, Ty::Float | Ty::Vec(_) | Ty::Int) {
+            return Err(format!("varying `{n}`: only float, vec and int varyings work on libprocessing"));
         }
     }
     let r = emit_wgsl(frag, Target::Material, Some(&v));
@@ -1864,7 +1864,11 @@ fn emit_wgsl(prog: &Program, target: Target, vert: Option<&Program>) -> Result<S
         let extra: Vec<(Ty, String)> = custom_attributes(v);
         for (i, (t, n)) in extra.iter().enumerate() { vw.out.push_str(&format!("    @location({}) a_{n}: {},\n", 8 + i, t.wgsl())); }
         vw.out.push_str("}\nstruct GlslVary {\n    @builtin(position) position: vec4<f32>,\n    @location(0) vert_color: vec4<f32>,\n    @location(1) tex_coord: vec4<f32>,\n");
-        for (i, (t, n)) in shared.iter().enumerate() { vw.out.push_str(&format!("    @location({}) vy_{n}: {},\n", i + 2, t.wgsl())); }
+        // an int can't be blended across a triangle: it comes from one corner
+        for (i, (t, n)) in shared.iter().enumerate() {
+            let flat = if *t == Ty::Int { "@interpolate(flat) " } else { "" };
+            vw.out.push_str(&format!("    @location({}) {flat}vy_{n}: {},\n", i + 2, t.wgsl()));
+        }
         vw.out.push_str("}\n\n");
         // the inverse transpose of the modelview's 3x3, from its cofactors
         vw.out.push_str("fn glsl_normal_matrix(m: mat4x4<f32>) -> mat3x3<f32> {\n    let a = m[0].xyz; let b = m[1].xyz; let c = m[2].xyz;\n    let det = dot(a, cross(b, c));\n    if abs(det) < 1e-20 { return mat3x3<f32>(a, b, c); }\n    return mat3x3<f32>(cross(b, c), cross(c, a), cross(a, b)) * (1.0 / det);\n}\n\n");
@@ -2329,6 +2333,9 @@ impl Cpu {
 /// Processing gives these to a vertex shader itself.
 const STANDARD_ATTRIBUTES: [&str; 5] = ["position", "vertex", "color", "normal", "texCoord"];
 /// A vertex shader's attributes besides Processing's own: what attrib() fills.
+/// `color` is one too: each vertex's own fill.
 pub fn custom_attributes(vert: &Program) -> Vec<(Ty, String)> {
-    vert.attributes.iter().filter(|(t, n)| !STANDARD_ATTRIBUTES.contains(&n.as_str()) && matches!(t, Ty::Float | Ty::Vec(_))).cloned().collect()
+    let mut v: Vec<(Ty, String)> = vert.attributes.iter().filter(|(t, n)| !STANDARD_ATTRIBUTES.contains(&n.as_str()) && matches!(t, Ty::Float | Ty::Vec(_))).cloned().collect();
+    if let Some(c) = vert.attributes.iter().find(|(t, n)| n == "color" && matches!(t, Ty::Vec(_))) { v.push(c.clone()); }
+    v
 }

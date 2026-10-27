@@ -270,7 +270,11 @@ mod render {
         s.pts.push((x, y));
         s.zs.push(z.unwrap_or(0.0));
         s.uvs.push(uv.unwrap_or((0.0, 0.0)));
-        let cur = ATTRIBS.with(|a| a.borrow().clone());
+        let mut cur = ATTRIBS.with(|a| a.borrow().clone());
+        // a vertex shader's `color` is each vertex's own fill, like Processing
+        if crate::shader::vertex_active() {
+            if let Some(f) = style_pub().0 { cur.push(("color".to_string(), vec![f.r, f.g, f.b, f.a])); }
+        }
         if !cur.is_empty() || !s.attrs.is_empty() { let n = s.pts.len() - 1; s.attrs.resize(n, Vec::new()); s.attrs.push(cur); }
         if z.is_some_and(|z| z != 0.0) || crate::three::in_3d() { s.three = true; }
     }
@@ -1751,7 +1755,7 @@ mod render {
     // Font 0 is the built-in pixel font. createFont() loads a .ttf or .otf
     // (or finds an installed font by name) and textFont() switches to it.
 
-    struct LoadedFont { font: std::sync::Arc<fontdue::Font>, size: f32 }
+    struct LoadedFont { font: std::sync::Arc<fontdue::Font>, size: f32, path: Option<std::path::PathBuf> }
     fn fonts() -> &'static parking_lot::Mutex<Vec<LoadedFont>> {
         static F: std::sync::OnceLock<parking_lot::Mutex<Vec<LoadedFont>>> = std::sync::OnceLock::new();
         F.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
@@ -1794,7 +1798,7 @@ mod render {
             let data = std::fs::read(&path).map_err(|e| e.to_string())?;
             let font = fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
                 .map_err(|e| format!("{} ({})", e, path.display()))?;
-            Ok(LoadedFont { font: std::sync::Arc::new(font), size: if size.is_finite() && size > 0.0 { size } else { 0.0 } })
+            Ok(LoadedFont { font: std::sync::Arc::new(font), size: if size.is_finite() && size > 0.0 { size } else { 0.0 }, path: Some(path) })
         };
         let mut all = fonts().lock();
         if all.len() >= MAX_FONTS {
@@ -1812,6 +1816,16 @@ mod render {
         }
     }
     /// A loaded font and the size it was made with (for PFontExt).
+    /// The font file text is drawn with now (None: the built-in font).
+    pub(crate) fn current_font_file() -> Option<(std::path::PathBuf, std::sync::Arc<fontdue::Font>)> {
+        let id = CUR_FONT.with(|c| c.get());
+        if id == 0 { return None; }
+        fonts().lock().get(id - 1).and_then(|f| f.path.clone().map(|p| (p, f.font.clone())))
+    }
+    /// The file a font was loaded from.
+    pub(crate) fn font_file(id: u64) -> Option<std::path::PathBuf> {
+        fonts().lock().get((id as usize).wrapping_sub(1)).and_then(|f| f.path.clone())
+    }
     pub(crate) fn font_info(id: u64) -> Option<(std::sync::Arc<fontdue::Font>, f32)> {
         fonts().lock().get((id as usize).wrapping_sub(1)).map(|f| (f.font.clone(), f.size))
     }
@@ -2446,6 +2460,7 @@ mod render {
     }
     /// Draw an image scaled into (x, y, w, h), through the current transform.
     pub fn draw_image(id: u64, x: f32, y: f32, w: f32, h: f32) {
+        crate::record::image(id, x, y, w, h);
         let imgs = images().lock();
         let img = match imgs.get((id as usize).wrapping_sub(1)) { Some(i) => i, None => return };
         lp_route! {
@@ -4714,9 +4729,13 @@ pub const DISABLE_STROKE_PURE: i32 = -9;
 pub const ENABLE_ASYNC_SAVEFRAME: i32 = 10;
 pub const DISABLE_ASYNC_SAVEFRAME: i32 = -10;
 /// hint(which): Processing's renderer hints. DISABLE_DEPTH_TEST lets 3D
-/// shapes draw over each other in the order they're drawn (the software
-/// renderer); the rest are accepted and change nothing here.
+/// shapes draw over each other in the order they're drawn (on libprocessing
+/// with the lp-fork); the rest are accepted and change nothing here.
 pub fn hint(which: i32) {
+    #[cfg(all(feature = "libprocessing", lp_depth_test))]
+    if crate::lp::on() && (which == DISABLE_DEPTH_TEST || which == ENABLE_DEPTH_TEST) {
+        crate::lp::depth_test(which == ENABLE_DEPTH_TEST);
+    }
     match which {
         DISABLE_DEPTH_TEST => crate::three::set_depth_test(false),
         ENABLE_DEPTH_TEST => crate::three::set_depth_test(true),

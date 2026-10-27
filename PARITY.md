@@ -37,20 +37,19 @@ needs the lp-fork).
   for variables.
 - `mask()` on the canvas and `choice()`: deprecated in Processing.
 - `XML.getParent()` in RustMode: children are owned values with no link up
-  (LuaMode has it).
+  (LuaMode has it). Keep the parent around where you need it.
 - `PShape` tessellation (`getTessellation` and friends) and `setPath`.
 - `cursor(img, x, y)` with a picture: it shows the normal cursor. The named
   kinds (`HAND`, `CROSS`, `MOVE`, `TEXT`, `WAIT`, `ARROW`) work; `WAIT` is the
   arrow on the default renderer.
-- `PFont.getGlyph`, `getShape`, `save`: they'd need glyph outlines from the
-  font engine.
+- `PFont.getGlyph` and `save`: Processing's own glyph bitmaps and .vlw
+  files. `getShape(c)` works (the outline, holes as contours).
 - `JSONArray` value iterators (use the `get_*_array` ones).
 
 ## Partial
 
-- `hint()`: only `DISABLE_DEPTH_TEST` / `ENABLE_DEPTH_TEST` do anything, and
-  only on the software renderer.
-- `begin_record`: images and 3D solids aren't written, text keeps its size
-  but not its font.
-- Vertex shaders on libprocessing: `color` is the fill, varyings are floats
-  or vecs.
+- `hint()`: `DISABLE_DEPTH_TEST` / `ENABLE_DEPTH_TEST` work on both renderers
+  (libprocessing needs the lp-fork); the other hints do nothing.
+- `begin_record`: shapes, text with its font (embedded), images (embedded)
+  and boxes / spheres (as lit triangles) are written. Shapes made with
+  `vertex(x, y, z)` are flattened, and shader effects aren't written.

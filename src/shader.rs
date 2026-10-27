@@ -310,6 +310,13 @@ pub(crate) fn lp_attributes() -> Vec<(String, usize)> {
     glsl::custom_attributes(v).into_iter().map(|(t, n)| (n, t.size_pub().max(1))).collect()
 }
 
+/// Does the shader shapes use on libprocessing have a vertex stage?
+#[cfg(feature = "libprocessing")]
+pub(crate) fn lp_has_vertex() -> bool {
+    let Some(s) = *LP_ACTIVE.lock() else { return false };
+    shaders().lock().get(s.id - 1).is_some_and(|e| e.vert_prog.is_some())
+}
+
 /// Is a shader with a vertex stage active? Then every shape goes through 3D.
 pub(crate) fn vertex_active() -> bool {
     let Some(s) = *ACTIVE.lock() else { return false };

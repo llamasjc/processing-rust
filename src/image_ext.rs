@@ -290,6 +290,14 @@ pub trait PFontExt {
     fn ascent(&self) -> f32;
     fn descent(&self) -> f32;
     /// How far one character moves the pen.
+    /// get_shape('a'): the character's outline as a PShape, at the font's size
+    /// (12 when it has none), from its baseline; holes are contours.
+    fn get_shape(&self, c: char) -> crate::PShape;
+    /// The outline as contours of (code, numbers): 0 vertex (x, y), 1 bezier
+    /// (cx1, cy1, cx2, cy2, x, y), 2 quadratic (cx, cy, x, y); VERTEX,
+    /// BEZIER_VERTEX and QUADRATIC_VERTEX in Processing's numbering.
+    fn get_outline(&self, c: char) -> Vec<Vec<(u8, [f32; 6])>>;
+    #[inline] fn getShape(&self, c: char) -> crate::PShape { self.get_shape(c) }
     fn char_width(&self, c: char) -> f32;
     #[inline] fn getSize(&self) -> f32 { self.get_size() }
     #[inline] fn getName(&self) -> String { self.get_name() }
@@ -298,6 +306,47 @@ pub trait PFontExt {
 fn font_px(size: f32) -> f32 { if size > 0.0 { size } else { 48.0 } }
 
 impl PFontExt for u64 {
+    fn get_outline(&self, c: char) -> Vec<Vec<(u8, [f32; 6])>> {
+        let Some(path) = crate::render::font_file(*self) else { return Vec::new() };
+        let Ok(data) = std::fs::read(path) else { return Vec::new() };
+        let Ok(face) = ttf_parser::Face::parse(&data, 0) else { return Vec::new() };
+        let size = self.get_size();
+        let k = if size > 0.0 { size } else { 12.0 } / face.units_per_em() as f32;
+        let Some(g) = face.glyph_index(c) else { return Vec::new() };
+        struct Outline { contours: Vec<Vec<(u8, [f32; 6])>>, k: f32 }
+        impl Outline { fn seg(&mut self, op: u8, v: [f32; 6]) { if let Some(c) = self.contours.last_mut() { c.push((op, v)); } } }
+        impl ttf_parser::OutlineBuilder for Outline {
+            fn move_to(&mut self, x: f32, y: f32) { let k = self.k; self.contours.push(vec![(0, [x * k, -y * k, 0.0, 0.0, 0.0, 0.0])]); }
+            fn line_to(&mut self, x: f32, y: f32) { let k = self.k; self.seg(0, [x * k, -y * k, 0.0, 0.0, 0.0, 0.0]); }
+            fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) { let k = self.k; self.seg(2, [x1 * k, -y1 * k, x * k, -y * k, 0.0, 0.0]); }
+            fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+                let k = self.k; self.seg(1, [x1 * k, -y1 * k, x2 * k, -y2 * k, x * k, -y * k]);
+            }
+            fn close(&mut self) {}
+        }
+        let mut o = Outline { contours: Vec::new(), k };
+        if face.outline_glyph(g, &mut o).is_none() { return Vec::new(); }
+        o.contours
+    }
+    fn get_shape(&self, c: char) -> crate::PShape {
+        let mut shape = crate::create_shape();
+        let outline = self.get_outline(c);
+        if outline.is_empty() { return shape; }
+        shape.begin_shape();
+        for (i, contour) in outline.iter().enumerate() {
+            if i > 0 { shape.begin_contour(); }
+            for (op, v) in contour {
+                match op {
+                    0 => { shape.vertex(v[0], v[1]); }
+                    2 => { shape.quadratic_vertex(v[0], v[1], v[2], v[3]); }
+                    _ => { shape.bezier_vertex(v[0], v[1], v[2], v[3], v[4], v[5]); }
+                }
+            }
+            if i > 0 { shape.end_contour(); }
+        }
+        shape.end_shape_mode(crate::CLOSE);
+        shape
+    }
     fn get_size(&self) -> f32 { crate::render::font_info(*self).map(|f| f.1).unwrap_or(0.0) }
     fn get_name(&self) -> String {
         crate::render::font_info(*self).and_then(|f| f.0.name().map(str::to_string)).unwrap_or_default()

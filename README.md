@@ -245,8 +245,9 @@ vert)`) adds a vertex shader. It gets Processing's attributes (`position`,
 varyings reach the fragment shader, blended across each triangle. While one is
 active every shape goes through the 3D path, as in P3D. On the default renderer
 it also gets `lightCount`, `lightPosition[8]` and the other light uniforms. On
-libprocessing it needs the lp-fork (its `processing::vertex` module); there
-`color` is the shape's fill and varyings are floats or vecs. Vertex shaders
+libprocessing it needs the lp-fork (its `processing::vertex` module).
+`color` is each vertex's own fill, and `flat varying int` comes from one
+corner instead of being blended. Vertex shaders
 can read images (`sampler2D` uniforms, set with `shader.set("height", img)`)
 on both. See `examples/VertexWave`.
 
@@ -259,7 +260,8 @@ load (constants worked out ahead), so a pixel costs a chain of direct calls.
 keeps drawing inside a rectangle until `no_clip()` or the end of `draw()`, on
 both renderers. `push()` / `pop()` save and restore the transform and style
 together. `hint(DISABLE_DEPTH_TEST)` lets 3D shapes draw over each other in
-order on the default renderer; the other hints are accepted and do nothing.
+the order they're drawn (libprocessing needs the lp-fork); the other hints
+are accepted and do nothing.
 `link(url)` opens the browser, `launch(&["file.pdf"])` opens a file or runs
 a program, `save_stream(target, source)` copies a file or downloads an
 address (with curl). `load_json_object`, `load_json_array`,
@@ -269,8 +271,10 @@ names for the JSON functions.
 `begin_record("drawing.svg")` (or `.pdf`, or `begin_record(PDF, path)`)
 ... `end_record()` also writes what's drawn as vector shapes: outlines after
 the transform with their fill, stroke and weight, curves as short lines, text
-at its size (not its font). Images and 3D solids are left out. `begin_raw`
-is the same.
+in its font (embedded in the file), images (embedded), and boxes and spheres
+as lit triangles drawn back to front. `begin_raw` is the same.
+
+A font's `get_shape('a')` gives the character's outline as a PShape.
 
 `window_ratio(w, h)`: draw in w by h units, scaled to fit the canvas and
 centered; `rwidth`, `rheight`, `rmouse_x`, `rmouse_y` are in those units.
