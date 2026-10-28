@@ -96,8 +96,14 @@ fn init_app(asset_root: &str) -> processing_core::error::Result<()> {
     app.register_asset_source("assets_directory", AssetSourceBuilder::platform_default(asset_root, None));
     let plugins = DefaultPlugins
         .build()
+        // pipelines are compiled before the frame that needs them: with this
+        // off, filters fail with PipelineNotReady and get() reads an empty
+        // canvas on the first frames
         .set(RenderPlugin { synchronous_pipeline_compilation: true, ..default() })
         .disable::<bevy::winit::WinitPlugin>()
+        // nothing here animates models or reads game pads; both cost every update
+        .disable::<bevy::animation::AnimationPlugin>()
+        .disable::<bevy::gilrs::GilrsPlugin>()
         .disable::<bevy::log::LogPlugin>()
         .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
         // no sound for now: don't open the sound card
@@ -205,6 +211,7 @@ fn make_canvas(w: u32, h: u32) -> Option<(Entity, Entity)> {
         Ok(g) => g, Err(e) => { fail("making the canvas", e); return None; }
     };
     if let Err(e) = pr::graphics_mode_3d(main) { fail("3D mode", e); }
+    default_projection(main, w, h);
     Some((canvas, main))
 }
 fn start_canvas(main: Entity) {
@@ -980,9 +987,21 @@ pub(crate) fn camera_default() {
     camera([w as f32 / 2.0, h as f32 / 2.0, z], [w as f32 / 2.0, h as f32 / 2.0, 0.0], [0.0, 1.0, 0.0]);
 }
 pub(crate) fn perspective(fov: f32, aspect: f32, near: f32, far: f32) {
-    if let Some(g) = target() {
-        if let Err(e) = pr::graphics_perspective(g, fov, aspect, near, far, Vec4::new(0.0, 0.0, -1.0, -near)) { fail("perspective", e); }
-    }
+    set_projection(perspective_matrix(fov, aspect, near), far);
+}
+/// Bevy's own perspective (y up, depth reversed and endless). RustMode sets it
+/// itself rather than through libprocessing, whose projection may be y-down
+/// (the lp-fork's P3D frustum): the camera here already turns y around.
+fn perspective_matrix(fov: f32, aspect: f32, near: f32) -> bevy::math::Mat4 {
+    bevy::math::Mat4::perspective_infinite_reverse_rh(fov, aspect, near)
+}
+/// The projection a new canvas or layer starts with: what libprocessing's
+/// 3D mode used to give (60 degrees, near 1, far ten camera distances).
+fn default_projection(g: Entity, w: u32, h: u32) {
+    let (w, h) = (w.max(1) as f32, h.max(1) as f32);
+    let fov = std::f32::consts::PI / 3.0;
+    let camera_z = (h / 2.0) / (fov / 2.0).tan();
+    set_projection_on(g, perspective_matrix(fov, w / h, 1.0), camera_z * 10.0);
 }
 pub(crate) fn ortho(w: f32, h: f32, near: f32, far: f32) {
     ortho_edges(-w / 2.0, w / 2.0, -h / 2.0, h / 2.0, near, far);
@@ -1007,6 +1026,9 @@ impl bevy::camera::CameraProjection for MatrixProjection {
 }
 fn set_projection(m: bevy::math::Mat4, far: f32) {
     let Some(g) = target() else { return };
+    set_projection_on(g, m, far);
+}
+fn set_projection_on(g: Entity, m: bevy::math::Mat4, far: f32) {
     let _ = pr::graphics_flush(g);
     let _ = processing_core::app_mut(|app| {
         if let Some(mut p) = app.world_mut().get_mut::<bevy::camera::Projection>(g) {
@@ -1515,6 +1537,7 @@ pub(crate) fn create_layer(id: u64, w: u32, h: u32) -> bool {
     };
     LP.with(|l| { if let Some(l) = l.borrow_mut().as_mut() { l.layers.insert(id, (g, w, h)); } });
     if let Err(e) = pr::graphics_mode_3d(g) { fail("3D mode for a layer", e); }
+    default_projection(g, w, h);
     // cleared to transparent on its first beginDraw(), not now: starting and
     // ending another canvas in the middle of a frame upsets this one
     FRESH.with(|f| f.borrow_mut().push(g));
