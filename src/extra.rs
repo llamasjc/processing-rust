@@ -9,94 +9,139 @@ use std::io::{BufRead, Write};
 ///
 ///   let xml = load_xml("data.xml").unwrap();
 ///   for c in xml.get_children("item") { println!("{}", c.get_string("name")); }
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Xml {
+///
+/// Like Processing's XML, an `Xml` is a handle: a child you get from
+/// get_child() is the same element as the one inside its parent, so changing
+/// it changes the document, and get_parent() leads back up. `clone()` gives
+/// another handle to the same element; `copy()` makes a separate one.
+#[derive(Clone, Default)]
+pub struct Xml(std::rc::Rc<std::cell::RefCell<Node>>);
+
+#[derive(Default)]
+struct Node {
     name: String,
     attrs: Vec<(String, String)>,
     children: Vec<Xml>,
     content: String,
+    parent: std::rc::Weak<std::cell::RefCell<Node>>,
+}
+
+impl PartialEq for Xml {
+    /// Same name, attributes, text and children (not the same handle).
+    fn eq(&self, other: &Xml) -> bool {
+        if std::rc::Rc::ptr_eq(&self.0, &other.0) { return true; }
+        let (a, b) = (self.0.borrow(), other.0.borrow());
+        a.name == b.name && a.attrs == b.attrs && a.content == b.content && a.children == b.children
+    }
+}
+impl std::fmt::Debug for Xml {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.format(-1)) }
 }
 
 impl Xml {
     /// A new, empty element.
-    pub fn new(name: &str) -> Xml { Xml { name: name.to_string(), ..Default::default() } }
-    pub fn get_name(&self) -> &str { &self.name }
-    pub fn set_name(&mut self, n: &str) -> &mut Self { self.name = n.to_string(); self }
+    pub fn new(name: &str) -> Xml { let x = Xml::default(); x.0.borrow_mut().name = name.to_string(); x }
+    pub fn get_name(&self) -> String { self.0.borrow().name.clone() }
+    pub fn set_name(&self, n: &str) -> &Self { self.0.borrow_mut().name = n.to_string(); self }
+    /// The element this one is a child of (None for the root).
+    pub fn get_parent(&self) -> Option<Xml> { self.0.borrow().parent.upgrade().map(Xml) }
+    /// A separate copy of this element and everything under it (with no parent).
+    pub fn copy(&self) -> Xml {
+        let n = self.0.borrow();
+        let x = Xml::new(&n.name);
+        { let mut m = x.0.borrow_mut(); m.attrs = n.attrs.clone(); m.content = n.content.clone(); }
+        for c in &n.children { x.add_child_xml(c.copy()); }
+        x
+    }
 
     // children
-    pub fn has_children(&self) -> bool { !self.children.is_empty() }
-    pub fn get_child_count(&self) -> usize { self.children.len() }
-    pub fn list_children(&self) -> Vec<String> { self.children.iter().map(|c| c.name.clone()).collect() }
+    pub fn has_children(&self) -> bool { !self.0.borrow().children.is_empty() }
+    pub fn get_child_count(&self) -> usize { self.0.borrow().children.len() }
+    pub fn list_children(&self) -> Vec<String> { self.0.borrow().children.iter().map(|c| c.get_name()).collect() }
     /// The first child with this name, or a path like "a/b/c".
-    pub fn get_child(&self, path: &str) -> Option<&Xml> {
-        let mut cur = self;
+    pub fn get_child(&self, path: &str) -> Option<Xml> {
+        let mut cur = self.clone();
         for part in path.split('/').filter(|p| !p.is_empty()) {
-            cur = cur.children.iter().find(|c| c.name == part)?;
+            let next = cur.0.borrow().children.iter().find(|c| c.0.borrow().name == part).cloned()?;
+            cur = next;
         }
         Some(cur)
     }
-    pub fn get_child_mut(&mut self, path: &str) -> Option<&mut Xml> {
-        let mut cur = self;
-        for part in path.split('/').filter(|p| !p.is_empty()) {
-            cur = cur.children.iter_mut().find(|c| c.name == part)?;
-        }
-        Some(cur)
-    }
+    /// get_child_mut: the same as get_child (an Xml can always be changed).
+    pub fn get_child_mut(&self, path: &str) -> Option<Xml> { self.get_child(path) }
     /// get_child_at(i): the i-th child (text between elements doesn't count).
-    pub fn get_child_at(&self, i: usize) -> Option<&Xml> { self.children.get(i) }
+    pub fn get_child_at(&self, i: usize) -> Option<Xml> { self.0.borrow().children.get(i).cloned() }
     /// Every child with this name (or at the end of a path like "a/b"), or all of them for "".
-    pub fn get_children(&self, path: &str) -> Vec<&Xml> {
-        if path.is_empty() { return self.children.iter().collect(); }
+    pub fn get_children(&self, path: &str) -> Vec<Xml> {
+        if path.is_empty() { return self.0.borrow().children.clone(); }
         let (parent, last) = match path.rfind('/') { Some(i) => (&path[..i], &path[i + 1..]), None => ("", path) };
         match self.get_child(parent) {
-            Some(p) => p.children.iter().filter(|c| c.name == last).collect(),
+            Some(p) => p.0.borrow().children.iter().filter(|c| c.0.borrow().name == last).cloned().collect(),
             None => Vec::new(),
         }
     }
     /// add_child("name") makes a new child and gives it back to fill in.
-    pub fn add_child(&mut self, name: &str) -> &mut Xml {
-        self.children.push(Xml::new(name));
-        self.children.last_mut().unwrap()
-    }
-    pub fn add_child_xml(&mut self, child: Xml) -> &mut Xml {
-        self.children.push(child);
-        self.children.last_mut().unwrap()
+    pub fn add_child(&self, name: &str) -> Xml { self.add_child_xml(Xml::new(name)) }
+    /// Adds an element as the last child. One that already has a parent is
+    /// copied, so it isn't in two places at once.
+    pub fn add_child_xml(&self, child: Xml) -> Xml {
+        let child = if child.0.borrow().parent.upgrade().is_some() || std::rc::Rc::ptr_eq(&child.0, &self.0) { child.copy() } else { child };
+        child.0.borrow_mut().parent = std::rc::Rc::downgrade(&self.0);
+        self.0.borrow_mut().children.push(child.clone());
+        child
     }
     /// Removes the first child with this name.
-    pub fn remove_child(&mut self, name: &str) -> &mut Self {
-        if let Some(i) = self.children.iter().position(|c| c.name == name) { self.children.remove(i); }
+    pub fn remove_child(&self, name: &str) -> &Self {
+        let mut n = self.0.borrow_mut();
+        if let Some(i) = n.children.iter().position(|c| c.0.borrow().name == name) {
+            let c = n.children.remove(i);
+            c.0.borrow_mut().parent = std::rc::Weak::new();
+        }
+        drop(n);
+        self
+    }
+    /// remove_child_xml(child): takes this very element out.
+    pub fn remove_child_xml(&self, child: &Xml) -> &Self {
+        let mut n = self.0.borrow_mut();
+        if let Some(i) = n.children.iter().position(|c| std::rc::Rc::ptr_eq(&c.0, &child.0)) {
+            let c = n.children.remove(i);
+            c.0.borrow_mut().parent = std::rc::Weak::new();
+        }
+        drop(n);
         self
     }
 
     // attributes
-    pub fn get_attribute_count(&self) -> usize { self.attrs.len() }
-    pub fn list_attributes(&self) -> Vec<String> { self.attrs.iter().map(|a| a.0.clone()).collect() }
-    pub fn has_attribute(&self, name: &str) -> bool { self.attrs.iter().any(|a| a.0 == name) }
-    fn attr(&self, name: &str) -> Option<&str> { self.attrs.iter().find(|a| a.0 == name).map(|a| a.1.as_str()) }
-    pub fn get_string(&self, name: &str) -> String { self.attr(name).unwrap_or("").to_string() }
-    pub fn get_string_or(&self, name: &str, default: &str) -> String { self.attr(name).unwrap_or(default).to_string() }
+    pub fn get_attribute_count(&self) -> usize { self.0.borrow().attrs.len() }
+    pub fn list_attributes(&self) -> Vec<String> { self.0.borrow().attrs.iter().map(|a| a.0.clone()).collect() }
+    pub fn has_attribute(&self, name: &str) -> bool { self.0.borrow().attrs.iter().any(|a| a.0 == name) }
+    fn attr(&self, name: &str) -> Option<String> { self.0.borrow().attrs.iter().find(|a| a.0 == name).map(|a| a.1.clone()) }
+    pub fn get_string(&self, name: &str) -> String { self.attr(name).unwrap_or_default() }
+    pub fn get_string_or(&self, name: &str, default: &str) -> String { self.attr(name).unwrap_or_else(|| default.to_string()) }
     pub fn get_int(&self, name: &str) -> i32 { self.get_int_or(name, 0) }
     pub fn get_int_or(&self, name: &str, default: i32) -> i32 { self.attr(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default) }
     pub fn get_float(&self, name: &str) -> f32 { self.get_float_or(name, 0.0) }
     pub fn get_float_or(&self, name: &str, default: f32) -> f32 { self.attr(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default) }
-    pub fn set_string(&mut self, name: &str, v: &str) -> &mut Self {
-        match self.attrs.iter_mut().find(|a| a.0 == name) {
+    pub fn set_string(&self, name: &str, v: &str) -> &Self {
+        let mut n = self.0.borrow_mut();
+        match n.attrs.iter_mut().find(|a| a.0 == name) {
             Some(a) => a.1 = v.to_string(),
-            None => self.attrs.push((name.to_string(), v.to_string())),
+            None => n.attrs.push((name.to_string(), v.to_string())),
         }
+        drop(n);
         self
     }
-    pub fn set_int(&mut self, name: &str, v: i32) -> &mut Self { self.set_string(name, &v.to_string()) }
-    pub fn set_float(&mut self, name: &str, v: f32) -> &mut Self { self.set_string(name, &v.to_string()) }
-    pub fn remove_attribute(&mut self, name: &str) -> &mut Self { self.attrs.retain(|a| a.0 != name); self }
+    pub fn set_int(&self, name: &str, v: i32) -> &Self { self.set_string(name, &v.to_string()) }
+    pub fn set_float(&self, name: &str, v: f32) -> &Self { self.set_string(name, &v.to_string()) }
+    pub fn remove_attribute(&self, name: &str) -> &Self { self.0.borrow_mut().attrs.retain(|a| a.0 != name); self }
 
     // text
-    pub fn get_content(&self) -> String { self.content.clone() }
-    pub fn get_int_content(&self) -> i32 { self.content.trim().parse().unwrap_or(0) }
-    pub fn get_float_content(&self) -> f32 { self.content.trim().parse().unwrap_or(0.0) }
-    pub fn set_content(&mut self, t: &str) -> &mut Self { self.content = t.to_string(); self }
-    pub fn set_int_content(&mut self, v: i32) -> &mut Self { self.set_content(&v.to_string()) }
-    pub fn set_float_content(&mut self, v: f32) -> &mut Self { self.set_content(&v.to_string()) }
+    pub fn get_content(&self) -> String { self.0.borrow().content.clone() }
+    pub fn get_int_content(&self) -> i32 { self.get_content().trim().parse().unwrap_or(0) }
+    pub fn get_float_content(&self) -> f32 { self.get_content().trim().parse().unwrap_or(0.0) }
+    pub fn set_content(&self, t: &str) -> &Self { self.0.borrow_mut().content = t.to_string(); self }
+    pub fn set_int_content(&self, v: i32) -> &Self { self.set_content(&v.to_string()) }
+    pub fn set_float_content(&self, v: f32) -> &Self { self.set_content(&v.to_string()) }
 
     /// The element as text; indent is the spaces per level (-1: all on one line).
     pub fn format(&self, indent: i32) -> String {
@@ -105,31 +150,32 @@ impl Xml {
         out
     }
     fn write_to(&self, out: &mut String, indent: i32, depth: usize) {
+        let n = self.0.borrow();
         let pad = if indent >= 0 { " ".repeat(indent as usize * depth) } else { String::new() };
         let nl = if indent >= 0 { "\n" } else { "" };
         out.push_str(&pad);
         out.push('<');
-        out.push_str(&self.name);
-        for (k, v) in &self.attrs { out.push_str(&format!(" {}=\"{}\"", k, escape(v))); }
-        if self.children.is_empty() && self.content.is_empty() {
+        out.push_str(&n.name);
+        for (k, v) in &n.attrs { out.push_str(&format!(" {}=\"{}\"", k, escape(v))); }
+        if n.children.is_empty() && n.content.is_empty() {
             out.push_str("/>");
             out.push_str(nl);
             return;
         }
         out.push('>');
-        if self.children.is_empty() {
-            out.push_str(&escape(&self.content));
+        if n.children.is_empty() {
+            out.push_str(&escape(&n.content));
         } else {
             out.push_str(nl);
-            if !self.content.trim().is_empty() {
+            if !n.content.trim().is_empty() {
                 out.push_str(&pad);
-                out.push_str(&escape(self.content.trim()));
+                out.push_str(&escape(n.content.trim()));
                 out.push_str(nl);
             }
-            for c in &self.children { c.write_to(out, indent, depth + 1); }
+            for c in &n.children { c.write_to(out, indent, depth + 1); }
             out.push_str(&pad);
         }
-        out.push_str(&format!("</{}>", self.name));
+        out.push_str(&format!("</{}>", n.name));
         out.push_str(nl);
     }
 
@@ -137,18 +183,22 @@ impl Xml {
     pub fn get_double_or(&self, name: &str, default: f64) -> f64 { self.attr(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default) }
     pub fn get_long(&self, name: &str) -> i64 { self.get_long_or(name, 0) }
     pub fn get_long_or(&self, name: &str, default: i64) -> i64 { self.attr(name).and_then(|v| v.trim().parse().ok()).unwrap_or(default) }
-    pub fn set_double(&mut self, name: &str, v: f64) -> &mut Self { self.set_string(name, &v.to_string()) }
-    pub fn set_long(&mut self, name: &str, v: i64) -> &mut Self { self.set_string(name, &v.to_string()) }
-    pub fn get_double_content(&self) -> f64 { self.content.trim().parse().unwrap_or(0.0) }
-    pub fn get_long_content(&self) -> i64 { self.content.trim().parse().unwrap_or(0) }
-    pub fn set_double_content(&mut self, v: f64) -> &mut Self { self.set_content(&v.to_string()) }
-    pub fn set_long_content(&mut self, v: i64) -> &mut Self { self.set_content(&v.to_string()) }
+    pub fn set_double(&self, name: &str, v: f64) -> &Self { self.set_string(name, &v.to_string()) }
+    pub fn set_long(&self, name: &str, v: i64) -> &Self { self.set_string(name, &v.to_string()) }
+    pub fn get_double_content(&self) -> f64 { self.get_content().trim().parse().unwrap_or(0.0) }
+    pub fn get_long_content(&self) -> i64 { self.get_content().trim().parse().unwrap_or(0) }
+    pub fn set_double_content(&self, v: f64) -> &Self { self.set_content(&v.to_string()) }
+    pub fn set_long_content(&self, v: i64) -> &Self { self.set_content(&v.to_string()) }
     /// The name without its namespace prefix: "svg:rect" gives "rect".
-    pub fn get_local_name(&self) -> &str { self.name.rsplit(':').next().unwrap_or(&self.name) }
+    pub fn get_local_name(&self) -> String { let n = self.get_name(); n.rsplit(':').next().unwrap_or(&n).to_string() }
     /// Drops whitespace-only text here and in every child.
-    pub fn trim(&mut self) -> &mut Self {
-        if self.content.trim().is_empty() { self.content.clear(); }
-        for c in &mut self.children { c.trim(); }
+    pub fn trim(&self) -> &Self {
+        let kids = {
+            let mut n = self.0.borrow_mut();
+            if n.content.trim().is_empty() { n.content.clear(); }
+            n.children.clone()
+        };
+        for c in &kids { c.trim(); }
         self
     }
     /// Writes the element to a file with an XML header, like saveXML.
@@ -157,22 +207,25 @@ impl Xml {
     // camelCase, as in Processing
     #[inline] pub fn getDouble(&self, n: &str) -> f64 { self.get_double(n) }
     #[inline] pub fn getLong(&self, n: &str) -> i64 { self.get_long(n) }
-    #[inline] pub fn setDouble(&mut self, n: &str, v: f64) -> &mut Self { self.set_double(n, v) }
-    #[inline] pub fn setLong(&mut self, n: &str, v: i64) -> &mut Self { self.set_long(n, v) }
+    #[inline] pub fn setDouble(&self, n: &str, v: f64) -> &Self { self.set_double(n, v) }
+    #[inline] pub fn setLong(&self, n: &str, v: i64) -> &Self { self.set_long(n, v) }
     #[inline] pub fn getDoubleContent(&self) -> f64 { self.get_double_content() }
     #[inline] pub fn getLongContent(&self) -> i64 { self.get_long_content() }
-    #[inline] pub fn setDoubleContent(&mut self, v: f64) -> &mut Self { self.set_double_content(v) }
-    #[inline] pub fn setLongContent(&mut self, v: i64) -> &mut Self { self.set_long_content(v) }
-    #[inline] pub fn getLocalName(&self) -> &str { self.get_local_name() }
-    #[inline] pub fn getName(&self) -> &str { self.get_name() }
-    #[inline] pub fn getChild(&self, path: &str) -> Option<&Xml> { self.get_child(path) }
-    #[inline] pub fn getChildren(&self, path: &str) -> Vec<&Xml> { self.get_children(path) }
+    #[inline] pub fn setDoubleContent(&self, v: f64) -> &Self { self.set_double_content(v) }
+    #[inline] pub fn setLongContent(&self, v: i64) -> &Self { self.set_long_content(v) }
+    #[inline] pub fn getLocalName(&self) -> String { self.get_local_name() }
+    #[inline] pub fn getName(&self) -> String { self.get_name() }
+    #[inline] pub fn getParent(&self) -> Option<Xml> { self.get_parent() }
+    #[inline] pub fn getChild(&self, path: &str) -> Option<Xml> { self.get_child(path) }
+    #[inline] pub fn getChildren(&self, path: &str) -> Vec<Xml> { self.get_children(path) }
     #[inline] pub fn getChildCount(&self) -> usize { self.get_child_count() }
     #[inline] pub fn getString(&self, n: &str) -> String { self.get_string(n) }
     #[inline] pub fn getInt(&self, n: &str) -> i32 { self.get_int(n) }
     #[inline] pub fn getFloat(&self, n: &str) -> f32 { self.get_float(n) }
     #[inline] pub fn getContent(&self) -> String { self.get_content() }
     #[inline] pub fn hasAttribute(&self, n: &str) -> bool { self.has_attribute(n) }
+    #[inline] pub fn addChild(&self, name: &str) -> Xml { self.add_child(name) }
+    #[inline] pub fn removeChild(&self, child: &Xml) -> &Self { self.remove_child_xml(child) }
 }
 
 impl std::fmt::Display for Xml {
@@ -217,7 +270,7 @@ pub fn parse_xml(text: &str) -> Result<Xml, String> {
             }
             if text[i..].starts_with("<![CDATA[") {
                 let Some(e) = text[i..].find("]]>") else { return err(i, "CDATA that never ends") };
-                if let Some(top) = stack.last_mut() { top.content.push_str(&text[i + 9..i + e]); }
+                if let Some(top) = stack.last_mut() { top.0.borrow_mut().content.push_str(&text[i + 9..i + e]); }
                 i += e + 3;
                 continue;
             }
@@ -229,14 +282,14 @@ pub fn parse_xml(text: &str) -> Result<Xml, String> {
             i += e + 1;
             if let Some(name) = tag.strip_prefix('/') {
                 let Some(done) = stack.pop() else { return err(i, "a closing tag with nothing open") };
-                if done.name != name.trim() { return err(i, &format!("</{}> closes <{}>", name.trim(), done.name)); }
-                match stack.last_mut() { Some(p) => p.children.push(done), None => root = Some(done) }
+                if done.get_name() != name.trim() { return err(i, &format!("</{}> closes <{}>", name.trim(), done.get_name())); }
+                match stack.last_mut() { Some(p) => { p.add_child_xml(done); } None => root = Some(done) }
                 continue;
             }
             let self_close = tag.ends_with('/');
             let tag = tag.trim_end_matches('/');
             let name_end = tag.find(|c: char| c.is_whitespace()).unwrap_or(tag.len());
-            let mut el = Xml::new(&tag[..name_end]);
+            let el = Xml::new(&tag[..name_end]);
             let mut a = tag[name_end..].trim();
             while !a.is_empty() {
                 let Some(eq) = a.find('=') else { break };
@@ -245,11 +298,11 @@ pub fn parse_xml(text: &str) -> Result<Xml, String> {
                 let q = v.chars().next().unwrap_or('"');
                 if q != '"' && q != '\'' { return err(i, "an attribute without quotes"); }
                 let Some(close) = v[1..].find(q) else { return err(i, "an attribute that never ends") };
-                el.attrs.push((key, unescape(&v[1..1 + close])));
+                el.0.borrow_mut().attrs.push((key, unescape(&v[1..1 + close])));
                 a = v[close + 2..].trim_start();
             }
             if self_close {
-                match stack.last_mut() { Some(p) => p.children.push(el), None => root = Some(el) }
+                match stack.last_mut() { Some(p) => { p.add_child_xml(el); } None => root = Some(el) }
             } else {
                 stack.push(el);
             }
@@ -257,19 +310,24 @@ pub fn parse_xml(text: &str) -> Result<Xml, String> {
             let e = text[i..].find('<').map(|e| i + e).unwrap_or(b.len());
             let t = &text[i..e];
             if let Some(top) = stack.last_mut() {
-                if !t.trim().is_empty() || !top.content.is_empty() { top.content.push_str(&unescape(t)); }
+                let mut n = top.0.borrow_mut();
+                if !t.trim().is_empty() || !n.content.is_empty() { n.content.push_str(&unescape(t)); }
             }
             i = e;
         }
     }
-    if let Some(open) = stack.last() { return Err(format!("<{}> is never closed", open.name)); }
+    if let Some(open) = stack.last() { return Err(format!("<{}> is never closed", open.get_name())); }
     // whitespace around child elements isn't content
-    fn tidy(x: &mut Xml) {
-        if !x.children.is_empty() { x.content = x.content.trim().to_string(); }
-        for c in &mut x.children { tidy(c); }
+    fn tidy(x: &Xml) {
+        let kids = {
+            let mut n = x.0.borrow_mut();
+            if !n.children.is_empty() { n.content = n.content.trim().to_string(); }
+            n.children.clone()
+        };
+        for c in &kids { tidy(c); }
     }
-    let mut root = root.ok_or("no element in the text")?;
-    tidy(&mut root);
+    let root = root.ok_or("no element in the text")?;
+    tidy(&root);
     Ok(root)
 }
 /// load_xml(path): the file's root element (looked for as given, then in data/).
@@ -447,15 +505,26 @@ mod tests {
         let again = parse_xml(&x.format(2)).unwrap();
         assert_eq!(again, x);
         assert!(parse_xml("<a><b></a>").is_err());
-        let mut n = Xml::new("list");
+        let n = Xml::new("list");
         n.add_child("x").set_int("v", 7);
-        let mut y = parse_xml("<svg:g big=\"9000000000\"><v>2.5</v></svg:g>").unwrap();
+        let y = parse_xml("<svg:g big=\"9000000000\"><v>2.5</v></svg:g>").unwrap();
         assert_eq!(y.get_local_name(), "g");
         assert_eq!(y.get_long("big"), 9_000_000_000);
         assert_eq!(y.get_child("v").unwrap().get_double_content(), 2.5);
         y.set_long_content(4).set_content("  ").trim();
         assert_eq!(y.get_content(), "");
         assert_eq!(n.get_child("x").unwrap().get_int("v"), 7);
+        // parents, and children that are the same element as in the document
+        let deep = x.get_child("group/deep").unwrap();
+        assert_eq!(deep.get_parent().unwrap().get_name(), "group");
+        assert_eq!(deep.get_parent().unwrap().get_parent().unwrap().get_name(), "root");
+        assert!(x.get_parent().is_none());
+        deep.set_int("v", 9);
+        assert_eq!(x.get_child("group/deep").unwrap().get_int("v"), 9);
+        let c = x.get_child("group").unwrap().copy();
+        assert!(c.get_parent().is_none());
+        x.remove_child("group");
+        assert!(deep.get_parent().is_none());
     }
     #[test]
     fn numbers() {

@@ -299,7 +299,9 @@ in a shader is reported with its line when it's loaded;
 `PVector` has Processing's methods (`add`, `mult`, `heading`, `limit`,
 `set_mag`...) and works with `+ - * /`. `IntList`, `FloatList`,
 `StringList`, `IntDict`, `FloatDict` and `StringDict` are there, and
-`Table`, `Json` and `Xml` have their Processing methods (`table.get_row_mut(i)`
+`Table`, `Json` and `Xml` have their Processing methods (an `Xml` is a
+handle like Processing's XML: a child is the same element as the one in the
+document, and `get_parent()` leads back up) (`table.get_row_mut(i)`
 gives a `TableRow` that edits the table). Images and fonts are ids that
 answer Processing's methods through `PImageExt` / `PFontExt`
 (`img.resize(w, h)`, `img.mask(m)`, `font.ascent()`). `PMatrix2D` /

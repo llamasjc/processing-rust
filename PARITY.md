@@ -36,8 +36,6 @@ needs the lp-fork).
 - `X`, `Y`, `Z`: as constants they'd break sketches that use those names
   for variables.
 - `mask()` on the canvas and `choice()`: deprecated in Processing.
-- `XML.getParent()` in RustMode: children are owned values with no link up
-  (LuaMode has it). Keep the parent around where you need it.
 - `PShape` tessellation (`getTessellation` and friends) and `setPath`.
 - `cursor(img, x, y)` with a picture: it shows the normal cursor. The named
   kinds (`HAND`, `CROSS`, `MOVE`, `TEXT`, `WAIT`, `ARROW`) work; `WAIT` is the
