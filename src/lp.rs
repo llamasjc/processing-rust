@@ -1781,6 +1781,9 @@ pub(crate) fn run<S: 'static>(mut app: crate::App<S>) {
             crate::render::begin_draw();
             begin_frame_lights();
             cmd(DrawCommand::Unlit);
+            // nothing is drawn yet, only settings: the first background() of
+            // the frame needn't render what came before (a whole engine update)
+            DRAWN.store(false, Ordering::Relaxed);
             (app.draw_fn)(&mut app.state);
             crate::render::end_draw();
             sync_lights();
