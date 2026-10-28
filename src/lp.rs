@@ -239,9 +239,10 @@ fn finish_frame() {
     let (fw, fh) = (w as f32, h as f32);
     let (dw, dh) = (fw * fw / ww.max(1.0), fh * fh / wh.max(1.0));
     rec(DrawCommand::Image { entity: canvas, dx: 0.0, dy: 0.0, d_width: Some(dw), d_height: Some(dh), sx: None, sy: None, s_width: None, s_height: None });
-    // the canvas holds sRGB numbers; the window wants light
+    // the canvas holds sRGB numbers; the window wants light (applying a
+    // filter flushes what was recorded first, so no flush of our own: each
+    // one is a whole engine update)
     if let Some(f) = to_light_filter() {
-        let _ = pr::graphics_flush(win);
         if let Err(e) = pr::graphics_apply_filter(win, f) { fail("showing the frame", e); }
     }
     end_draw_guarded(win);
