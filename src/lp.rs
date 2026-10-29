@@ -223,6 +223,8 @@ fn start_canvas(main: Entity) {
 /// Ends the frame: draws the sketch's canvas, then copies it into the
 /// window at the top left.
 fn finish_frame() {
+    #[cfg(lp_filter_now)]
+    if one_update_frame() { return; }
     let Some((main, win, canvas, (w, h))) = LP.with(|l| l.borrow().as_ref().map(|l| (l.main, l.win, l.canvas, l.size))) else { return };
     // Every engine update renders and waits on the GPU, so the sketch's
     // canvas is not finished on its own: it renders in the same update as the
@@ -259,6 +261,97 @@ fn finish_frame() {
     }
     end_draw_guarded(win);
 }
+
+// With the lp-fork a frame costs one engine update. The update renders the
+// sketch's canvas and, in the same go, shows the window's picture of the frame
+// before; right after it the "show" filter paints this frame's canvas into
+// the window (on the GPU, no update), to be shown by the next update or by
+// present_pending() when no next frame comes. So the window is a frame behind
+// the canvas, as with any double-buffered display.
+#[cfg(lp_filter_now)]
+thread_local! {
+    static SHOW: std::cell::Cell<Option<Option<Entity>>> = const { std::cell::Cell::new(None) };
+    static UNSHOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(lp_filter_now)]
+fn show_filter() -> Option<Entity> {
+    if let Some(f) = SHOW.with(|t| t.get()) { return f; }
+    const SRC: &str = r#"import processing::filter::{sample, sample_texture, FullscreenVertexOutput};
+
+struct ShowParams {
+    scale: vec4<f32>,
+}
+
+@group(1) @binding(0) var src: texture_2d<f32>;
+@group(1) @binding(1) var<uniform> show_params: ShowParams;
+
+fn to_light(v: f32) -> f32 {
+    if v <= 0.04045 { return v / 12.92; }
+    return pow((v + 0.055) / 1.055, 2.4);
+}
+
+@fragment
+fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
+    let uv = in.uv * show_params.scale.xy;
+    if uv.x > 1.0 || uv.y > 1.0 { return vec4<f32>(0.0, 0.0, 0.0, 1.0) + sample(in.uv) * 0.0; }
+    let c = sample_texture(src, uv);
+    return vec4<f32>(to_light(c.r), to_light(c.g), to_light(c.b), c.a);
+}
+"#;
+    let f = pr::shader_create(SRC).and_then(pr::filter_create);
+    if let Err(e) = &f { eprintln!("libprocessing: couldn't make the show filter ({e}); frames take an extra update"); }
+    let f = f.ok();
+    SHOW.with(|t| t.set(Some(f)));
+    f
+}
+
+/// One update for the whole frame; false when it can't (then the frame is
+/// shown the older way, with nothing changed).
+#[cfg(lp_filter_now)]
+fn one_update_frame() -> bool {
+    use pr::shader_value::ShaderValue;
+    let Some((main, win, canvas, (w, h), surface)) = LP.with(|l| l.borrow().as_ref().map(|l| (l.main, l.win, l.canvas, l.size, l.surface))) else { return false };
+    let Some(show) = show_filter() else { return false };
+    if !canvas_first(main, win) { return false; }
+    let (ww, wh) = processing_core::app_mut(|app| {
+        Ok(app.world().get::<bevy::window::Window>(surface).map(|win| (win.resolution.width(), win.resolution.height())))
+    }).ok().flatten().unwrap_or((w as f32, h as f32));
+    let scale = [ww.max(1.0) / w as f32, wh.max(1.0) / h as f32, 0.0, 0.0];
+    let first = !UNSHOWN.with(|p| p.get()) && SHOW_RAN.with(|r| !r.get());
+    // the update: this frame's canvas, and last frame's picture to the window
+    show_with(main, true);
+    let pending = UNSHOWN.with(|p| p.replace(false));
+    if pending { show_with_window(win, true); }
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| processing_core::app_mut(|app| { app.update(); Ok(()) })));
+    show_with(main, false);
+    if pending { show_with_window(win, false); }
+    if r.is_err() { missing("drawing one of the shapes in this frame (libprocessing couldn't tessellate it)"); }
+    // then this frame's picture into the window, on the GPU only
+    let set = pr::filter_set(show, "src", ShaderValue::Texture(canvas))
+        .and_then(|_| pr::filter_set(show, "scale", ShaderValue::Float4(scale)));
+    // the first run needs its update: it brings the shader to the GPU
+    let shown = set.and_then(|_| if first { pr::graphics_apply_filter(win, show) } else { pr::graphics_apply_filter_now(win, show) });
+    if let Err(e) = shown { fail("showing the frame", e); return true; }
+    SHOW_RAN.with(|r| r.set(true));
+    UNSHOWN.with(|p| p.set(true));
+    true
+}
+
+#[cfg(lp_filter_now)]
+thread_local! { static SHOW_RAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// Shows the last frame's picture if no update has shown it yet (the sketch
+/// stopped drawing: noLoop(), or waiting on redraw()).
+pub(crate) fn present_pending() {
+    #[cfg(lp_filter_now)]
+    if UNSHOWN.with(|p| p.replace(false)) {
+        if let Some(win) = LP.with(|l| l.borrow().as_ref().map(|l| l.win)) { end_draw_guarded(win); }
+    }
+}
+
+#[cfg(lp_filter_now)]
+fn show_with_window(win: Entity, on: bool) { show_with(win, on); }
 
 /// Makes the canvas camera render before the window's, once; false if the
 /// cameras can't be found (then the canvas is finished on its own).
@@ -1837,6 +1930,7 @@ pub(crate) fn run<S: 'static>(mut app: crate::App<S>) {
             // images made for this frame (pixels, layers) can go now
             for e in PENDING_FREE.with(|f| std::mem::take(&mut *f.borrow_mut())) { let _ = pr::image_destroy(e); }
         }
+        else { present_pending(); }
         { use std::io::Write; let _ = std::io::stdout().flush(); }
         // frameRate(): sleep off what's left of the frame
         let want = std::time::Duration::from_secs_f32(1.0 / crate::glfw::current_frame_rate_target().max(1.0));

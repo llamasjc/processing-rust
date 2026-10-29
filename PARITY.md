@@ -51,8 +51,7 @@ needs the lp-fork).
 - `JSONArray` value iterators (use the `get_*_array` ones).
 - `surface.setVisible`, `setAlwaysOnTop` and `setUndecorated`: the window is
   always shown, decorated and not pinned.
-- `PShape.getParam` / `getParams` (SVG loader internals) in RustMode, and
-  `PFont.getGlyphCount` in LuaMode.
+- `PShape.getParam` / `getParams` (SVG loader internals) in RustMode.
 
 ## Partial
 

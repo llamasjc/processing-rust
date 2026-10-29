@@ -8,6 +8,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(lp_attribs)");
     println!("cargo::rustc-check-cfg=cfg(lp_window_state)");
     println!("cargo::rustc-check-cfg=cfg(lp_depth_test)");
+    println!("cargo::rustc-check-cfg=cfg(lp_filter_now)");
     println!("cargo:rerun-if-env-changed=LIBPROCESSING_DIR");
     let dir = std::env::var("LIBPROCESSING_DIR").ok().filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
     let Some(dir) = dir else { return };
@@ -22,6 +23,13 @@ fn main() {
     println!("cargo:rerun-if-changed={}", glfw.display());
     if std::fs::read_to_string(&glfw).is_ok_and(|s| s.contains("pub fn window_state")) {
         println!("cargo:rustc-cfg=lp_window_state");
+    }
+    // the lp-fork can run a filter without an engine update first, which
+    // lets a frame be shown in one update
+    let lib = dir.join("crates/processing_render/src/lib.rs");
+    println!("cargo:rerun-if-changed={}", lib.display());
+    if std::fs::read_to_string(&lib).is_ok_and(|s| s.contains("pub fn graphics_apply_filter_now")) {
+        println!("cargo:rustc-cfg=lp_filter_now");
     }
     let file = dir.join("crates/processing_render/src/render/command.rs");
     println!("cargo:rerun-if-changed={}", file.display());
