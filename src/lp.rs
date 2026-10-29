@@ -224,7 +224,11 @@ fn start_canvas(main: Entity) {
 /// window at the top left.
 fn finish_frame() {
     let Some((main, win, canvas, (w, h))) = LP.with(|l| l.borrow().as_ref().map(|l| (l.main, l.win, l.canvas, l.size))) else { return };
-    end_draw_guarded(main);
+    // Every engine update renders and waits on the GPU, so the sketch's
+    // canvas is not finished on its own: it renders in the same update as the
+    // window that shows it (the canvas camera goes first), see show_with().
+    let merged = to_light_filter().is_some() && canvas_first(main, win);
+    if !merged { end_draw_guarded(main); }
     let _ = pr::graphics_begin_draw(win);
     let rec = |c: DrawCommand| { if let Err(e) = pr::graphics_record_command(win, c) { fail("showing the frame", e); } };
     rec(DrawCommand::BackgroundColor(BColor::srgb(0.0, 0.0, 0.0)));
@@ -243,9 +247,49 @@ fn finish_frame() {
     // filter flushes what was recorded first, so no flush of our own: each
     // one is a whole engine update)
     if let Some(f) = to_light_filter() {
-        if let Err(e) = pr::graphics_apply_filter(win, f) { fail("showing the frame", e); }
+        // the filter's own flush renders the canvas too when merged
+        if merged { show_with(main, true); }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pr::graphics_apply_filter(win, f)));
+        if merged { show_with(main, false); }
+        match r {
+            Ok(Err(e)) => fail("showing the frame", e),
+            Err(_) => missing("drawing one of the shapes in this frame (libprocessing couldn't tessellate it)"),
+            _ => {}
+        }
     }
     end_draw_guarded(win);
+}
+
+/// Makes the canvas camera render before the window's, once; false if the
+/// cameras can't be found (then the canvas is finished on its own).
+fn canvas_first(main: Entity, win: Entity) -> bool {
+    thread_local! { static DONE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+    if let Some(d) = DONE.with(|d| d.get()) { return d; }
+    let ok = processing_core::app_mut(|app| {
+        let w = app.world_mut();
+        let Some(win_order) = w.get::<bevy::camera::Camera>(win).map(|c| c.order) else { return Ok(false) };
+        let Some(mut cam) = w.get_mut::<bevy::camera::Camera>(main) else { return Ok(false) };
+        cam.order = win_order - 1;
+        Ok(true)
+    }).unwrap_or(false);
+    DONE.with(|d| d.set(Some(ok)));
+    ok
+}
+
+/// While on, the canvas renders and writes out its picture in whatever
+/// update comes next, the same as its own end_draw would.
+fn show_with(main: Entity, on: bool) {
+    use bevy::camera::{Camera, CameraOutputMode};
+    let _ = processing_core::app_mut(|app| {
+        let mut e = app.world_mut().entity_mut(main);
+        if on { e.insert(pr::Flush); } else { e.remove::<pr::Flush>(); }
+        if let Some(mut cam) = e.get_mut::<Camera>() {
+            cam.output_mode = if on {
+                CameraOutputMode::Write { blend_state: None, clear_color: bevy::camera::ClearColorConfig::None }
+            } else { CameraOutputMode::Skip };
+        }
+        Ok(())
+    });
 }
 
 thread_local! { static TO_LIGHT: std::cell::Cell<Option<Option<Entity>>> = const { std::cell::Cell::new(None) }; }
