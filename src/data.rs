@@ -193,6 +193,16 @@ impl Json {
     pub fn to_int_list(&self) -> crate::IntList { self.get_int_array().into() }
     pub fn to_float_list(&self) -> crate::FloatList { self.get_float_array().into() }
     pub fn to_string_list(&self) -> crate::StringList { self.get_string_array().into() }
+    pub fn to_long_list(&self) -> crate::LongList { self.get_long_array().into() }
+    pub fn to_double_list(&self) -> crate::DoubleList { self.get_double_array().into() }
+    #[inline] pub fn to_boolean_array(&self) -> Vec<bool> { self.get_boolean_array() }
+    #[inline] pub fn toLongList(&self) -> crate::LongList { self.to_long_list() }
+    #[inline] pub fn toDoubleList(&self) -> crate::DoubleList { self.to_double_list() }
+    #[inline] pub fn toBooleanArray(&self) -> Vec<bool> { self.get_boolean_array() }
+    pub fn get_long_list(&self, k: impl JsonKey) -> crate::LongList { k.pick(self).to_long_list() }
+    pub fn get_double_list(&self, k: impl JsonKey) -> crate::DoubleList { k.pick(self).to_double_list() }
+    #[inline] pub fn getLongList(&self, k: impl JsonKey) -> crate::LongList { self.get_long_list(k) }
+    #[inline] pub fn getDoubleList(&self, k: impl JsonKey) -> crate::DoubleList { self.get_double_list(k) }
     /// The array under a key as a list.
     pub fn get_int_list(&self, k: impl JsonKey) -> crate::IntList { k.pick(self).to_int_list() }
     pub fn get_float_list(&self, k: impl JsonKey) -> crate::FloatList { k.pick(self).to_float_list() }
@@ -1019,6 +1029,19 @@ pub fn save_table(t: &Table, path: &str) -> bool { write(path, t.to_text(sep_for
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_double_lists() {
+        let j = super::parse_json(r#"{"a": [1, 2, 3000000000], "b": [0.5, 1.5]}"#).unwrap();
+        assert_eq!(j.get_long_list("a").sum(), 3000000003);
+        assert_eq!(j.get_double_list("b").sum(), 2.0);
+        assert_eq!(j.get_json_array("b").to_boolean_array().len(), 2);
+        let mut d = crate::LongDict::new();
+        d.increment("x"); d.increment("x");
+        assert_eq!(d.get("x"), 2);
+        let m = crate::PMatrix3D::new();
+        let p = m.cmult(&crate::PVector::new3(1.0, 2.0, 3.0));
+        assert_eq!((p.x, p.y, p.z), (1.0, 2.0, 3.0));
+    }
     use super::*;
 
     #[test]

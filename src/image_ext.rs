@@ -301,6 +301,19 @@ pub trait PFontExt {
     fn char_width(&self, c: char) -> f32;
     #[inline] fn getSize(&self) -> f32 { self.get_size() }
     #[inline] fn getName(&self) -> String { self.get_name() }
+    /// The size it was made with, or 12 when none was given.
+    fn get_default_size(&self) -> f32 { let s = self.get_size(); if s > 0.0 { s } else { 12.0 } }
+    fn get_post_script_name(&self) -> String { self.get_name() }
+    /// How many glyphs the font file has.
+    fn get_glyph_count(&self) -> usize;
+    /// Always true: text is drawn smoothed.
+    fn is_smooth(&self) -> bool { true }
+    /// Kerning between two characters, as a fraction of the size (like Processing, 0).
+    fn kern(&self, _a: char, _b: char) -> f32 { 0.0 }
+    #[inline] fn getDefaultSize(&self) -> f32 { self.get_default_size() }
+    #[inline] fn getPostScriptName(&self) -> String { self.get_post_script_name() }
+    #[inline] fn getGlyphCount(&self) -> usize { self.get_glyph_count() }
+    #[inline] fn isSmooth(&self) -> bool { self.is_smooth() }
 }
 
 fn font_px(size: f32) -> f32 { if size > 0.0 { size } else { 48.0 } }
@@ -363,6 +376,7 @@ impl PFontExt for u64 {
             f.horizontal_line_metrics(px).map(|m| -m.descent / px)
         }).unwrap_or(0.0)
     }
+    fn get_glyph_count(&self) -> usize { crate::render::font_info(*self).map(|f| f.0.glyph_count() as usize).unwrap_or(0) }
     fn char_width(&self, c: char) -> f32 {
         crate::render::font_info(*self).map(|(f, s)| { let px = font_px(s); f.metrics(c, px).advance_width / px }).unwrap_or(0.0)
     }

@@ -208,6 +208,40 @@ impl FloatList {
     #[inline] pub fn replaceValues(&mut self, old: f32, new: f32) -> bool { self.replace_values(old, new) }
 }
 
+/// A growable list of 64-bit ints (Processing's LongList).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LongList { pub data: Vec<i64> }
+list_common!(LongList, i64);
+list_numeric!(LongList, i64);
+impl LongList {
+    pub fn range(n: i64) -> LongList { LongList { data: (0..n).collect() } }
+    pub fn increment(&mut self, index: usize) {
+        if index >= self.data.len() { self.data.resize(index + 1, 0); }
+        self.data[index] += 1;
+    }
+    pub fn sum(&self) -> i64 { self.data.iter().fold(0i64, |a, b| a.wrapping_add(*b)) }
+    pub fn get_unique(&self) -> Vec<i64> { let mut o = LongList::new(); for v in &self.data { o.append_unique(*v); } o.data }
+}
+
+/// A growable list of doubles (Processing's DoubleList).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DoubleList { pub data: Vec<f64> }
+list_common!(DoubleList, f64);
+list_numeric!(DoubleList, f64);
+impl DoubleList {
+    pub fn sum(&self) -> f64 { self.data.iter().sum() }
+    pub fn replace_value(&mut self, old: f64, new: f64) -> bool {
+        match self.data.iter().position(|x| *x == old) { Some(i) => { self.data[i] = new; true } None => false }
+    }
+    pub fn replace_values(&mut self, old: f64, new: f64) -> bool {
+        let mut any = false;
+        for x in &mut self.data { if *x == old { *x = new; any = true; } }
+        any
+    }
+    #[inline] pub fn replaceValue(&mut self, old: f64, new: f64) -> bool { self.replace_value(old, new) }
+    #[inline] pub fn replaceValues(&mut self, old: f64, new: f64) -> bool { self.replace_values(old, new) }
+}
+
 /// A growable list of strings.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StringList { pub data: Vec<String> }
@@ -434,6 +468,26 @@ impl FloatDict {
     pub fn sum(&self) -> f32 { self.sum_double() as f32 }
     pub fn sum_double(&self) -> f64 { self.vals.iter().map(|v| *v as f64).sum() }
     #[inline] pub fn sumDouble(&self) -> f64 { self.sum_double() }
+}
+
+/// Text keys to 64-bit ints (Processing's LongDict).
+#[derive(Clone, Debug)]
+pub struct LongDict { keys: Vec<String>, vals: Vec<i64>, idx: HashMap<String, usize> }
+dict_common!(LongDict, i64);
+dict_numeric!(LongDict, i64);
+impl LongDict {
+    pub fn increment(&mut self, key: &str) { self.add(key, 1); }
+    pub fn increment_dict(&mut self, other: &LongDict) { for (k, v) in other.keys.iter().zip(&other.vals) { self.add(k, *v); } }
+    pub fn sum(&self) -> i64 { self.vals.iter().fold(0i64, |a, b| a.wrapping_add(*b)) }
+}
+
+/// Text keys to doubles (Processing's DoubleDict).
+#[derive(Clone, Debug)]
+pub struct DoubleDict { keys: Vec<String>, vals: Vec<f64>, idx: HashMap<String, usize> }
+dict_common!(DoubleDict, f64);
+dict_numeric!(DoubleDict, f64);
+impl DoubleDict {
+    pub fn sum(&self) -> f64 { self.vals.iter().sum() }
 }
 
 /// Text keys to text values, in the order they were added.

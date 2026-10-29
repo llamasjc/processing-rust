@@ -287,6 +287,14 @@ impl PMatrix3D {
     #[inline] pub fn multY(&self, x: f32, y: f32, z: f32) -> f32 { self.mult_y(x, y, z) }
     #[inline] pub fn multZ(&self, x: f32, y: f32, z: f32) -> f32 { self.mult_z(x, y, z) }
     #[inline] pub fn multW(&self, x: f32, y: f32, z: f32) -> f32 { self.mult_w(x, y, z) }
+    /// The point through the transposed matrix (Processing's cmult), divided by w.
+    pub fn cmult(&self, p: &PVector) -> PVector {
+        let x = self.m00 * p.x + self.m10 * p.y + self.m20 * p.z + self.m30;
+        let y = self.m01 * p.x + self.m11 * p.y + self.m21 * p.z + self.m31;
+        let z = self.m02 * p.x + self.m12 * p.y + self.m22 * p.z + self.m32;
+        let w = self.m03 * p.x + self.m13 * p.y + self.m23 * p.z + self.m33;
+        if w != 0.0 && w != 1.0 { PVector::new3(x / w, y / w, z / w) } else { PVector::new3(x, y, z) }
+    }
     #[inline] pub fn shearX(&mut self, a: f32) { self.shear_x(a) }
     #[inline] pub fn shearY(&mut self, a: f32) { self.shear_y(a) }
 }

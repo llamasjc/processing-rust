@@ -18,9 +18,15 @@ names in RustMode:
   `table.add_row_handle()`; `table.get_row(i)` is read only.
 - Java overloads that Rust can't have get their own names, like
   `get_subset_n`, `create_vector3`, `set_matrix_2d`.
+- `surface` is a function, `surface().set_title("x")`, so sketches can still
+  have their own variables called `surface`.
 
 In LuaMode images and fonts stay numbers but answer Processing's methods
-(`img:resize(w, h)`, `img.width`, `font:getSize()`).
+(`img:resize(w, h)`, `img.width`, `font:getSize()`). JSON values are plain
+tables that also answer Processing's methods (`o:getInt("id")`,
+`a:getString(0)`, `a:size()`): the methods count array items from 0, `a[i]`
+from 1. `LongList`, `DoubleList`, `LongDict` and `DoubleDict` are the Int and
+Float ones, since Lua numbers are already 64-bit.
 
 Window events: `focusGained`, `focusLost`, `mouseEntered`, `mouseExited`,
 `windowMoved`, `windowResized` are called on both renderers (libprocessing
@@ -43,6 +49,10 @@ needs the lp-fork).
 - `PFont.getGlyph` and `save`: Processing's own glyph bitmaps and .vlw
   files. `getShape(c)` works (the outline, holes as contours).
 - `JSONArray` value iterators (use the `get_*_array` ones).
+- `surface.setVisible`, `setAlwaysOnTop` and `setUndecorated`: the window is
+  always shown, decorated and not pinned.
+- `PShape.getParam` / `getParams` (SVG loader internals) in RustMode, and
+  `PFont.getGlyphCount` in LuaMode.
 
 ## Partial
 

@@ -4327,6 +4327,29 @@ pub fn window_title(t: &str) {
 }
 #[inline] pub fn windowTitle(t: &str) { window_title(t) }
 
+/// Processing's `surface`, the older names for the window calls:
+/// `surface().set_title("x")`, `surface().setResizable(true)`. A function, not
+/// a static, so sketches can still name their own variables `surface`.
+pub fn surface() -> Surface { Surface }
+pub struct Surface;
+impl Surface {
+    pub fn set_title(&self, t: &str) { window_title(t) }
+    pub fn set_resizable(&self, on: bool) { window_resizable(on) }
+    pub fn set_size(&self, w: impl Num, h: impl Num) { window_resize(w, h) }
+    pub fn set_location(&self, x: impl Num, y: impl Num) { window_move(x, y) }
+    /// The window always stays visible and can't be pinned on top; these do nothing.
+    pub fn set_visible(&self, _on: bool) {}
+    pub fn set_always_on_top(&self, _on: bool) {}
+    pub fn set_frame_rate(&self, fps: impl Num) { frame_rate(fps.f()) }
+    #[inline] pub fn setTitle(&self, t: &str) { self.set_title(t) }
+    #[inline] pub fn setResizable(&self, on: bool) { self.set_resizable(on) }
+    #[inline] pub fn setSize(&self, w: impl Num, h: impl Num) { self.set_size(w, h) }
+    #[inline] pub fn setLocation(&self, x: impl Num, y: impl Num) { self.set_location(x, y) }
+    #[inline] pub fn setVisible(&self, on: bool) { self.set_visible(on) }
+    #[inline] pub fn setAlwaysOnTop(&self, on: bool) { self.set_always_on_top(on) }
+    #[inline] pub fn setFrameRate(&self, fps: impl Num) { self.set_frame_rate(fps) }
+}
+
 pub fn smooth()    { render::set_smooth(true); }
 pub fn no_smooth() { render::set_smooth(false); }
 #[inline] pub fn noSmooth() { no_smooth() }
@@ -5238,7 +5261,7 @@ pub use data::{load_strings, load_text, load_bytes, save_strings, save_text, sav
                split_tokens, split, join, trim, Json, parse_json, load_json, save_json,
                Table, Col, load_table, save_table, TableRow, TableRowRef, JsonKey};
 mod lists;
-pub use lists::{IntList, FloatList, StringList, IntDict, FloatDict, StringDict};
+pub use lists::{IntList, FloatList, StringList, IntDict, FloatDict, StringDict, LongList, DoubleList, LongDict, DoubleDict};
 #[inline] pub fn loadStrings(path: &str) -> Vec<String> { load_strings(path) }
 #[inline] pub fn saveStrings<S: AsRef<str>>(path: &str, lines: &[S]) -> bool { save_strings(path, lines) }
 #[inline] pub fn loadBytes(path: &str) -> Vec<u8> { load_bytes(path) }
