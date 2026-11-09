@@ -363,6 +363,9 @@ fn canvas_first(main: Entity, win: Entity) -> bool {
         let Some(win_order) = w.get::<bevy::camera::Camera>(win).map(|c| c.order) else { return Ok(false) };
         let Some(mut cam) = w.get_mut::<bevy::camera::Camera>(main) else { return Ok(false) };
         cam.order = win_order - 1;
+        // the window only shows the finished canvas: multisampling it would
+        // cost a resolve (and a writeback) every frame for nothing
+        w.entity_mut(win).insert(bevy::render::view::Msaa::Off);
         Ok(true)
     }).unwrap_or(false);
     DONE.with(|d| d.set(Some(ok)));
@@ -422,7 +425,7 @@ fn open(w: u32, h: u32) {
         Ok(s) => s,
         Err(e) => { fail("making the surface", e); std::process::exit(1); }
     };
-    let win = match pr::graphics_create(surface, w, h, TextureFormat::Rgba16Float) {
+    let win = match pr::graphics_create(surface, w, h, TextureFormat::Rgba8UnormSrgb) {
         Ok(g) => g,
         Err(e) => { fail("making the window's canvas", e); std::process::exit(1); }
     };
@@ -970,6 +973,8 @@ pub(crate) fn rect(x: f32, y: f32, w: f32, h: f32, radii: [f32; 4]) {
 }
 pub(crate) fn ellipse(cx: f32, cy: f32, w: f32, h: f32) {
     let c = DrawCommand::Ellipse { cx, cy, w, h };
+    // the outline is only worked out when a shader needs it
+    if SHADING.with(|s| s.get()).is_none() { return cmd(c); }
     if !shaded_2d(&arc_outline(cx, cy, w, h, 0.0, std::f32::consts::TAU, false), c.clone()) { cmd(c); }
 }
 /// Points around an ellipse (or part of it, with the center for a pie).
