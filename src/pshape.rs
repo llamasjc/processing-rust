@@ -111,6 +111,23 @@ pub fn create_shape_sphere(r: impl Num) -> PShape {
 }
 
 impl PShape {
+    /// What a primitive shape was made with: create_shape_rect(0, 0, 80, 40)
+    /// gives [0, 0, 80, 40]; empty for other shapes.
+    pub fn get_params(&self) -> Vec<f32> {
+        match self.steps.first() {
+            Some(Step::Rect(p) | Step::Ellipse(p) | Step::Line(p)) => p.to_vec(),
+            Some(Step::Triangle(p)) => p.to_vec(),
+            Some(Step::Quad(p)) => p.to_vec(),
+            Some(Step::Box(p)) => p.to_vec(),
+            Some(Step::Sphere(r)) => vec![*r],
+            _ => Vec::new(),
+        }
+    }
+    /// One of get_params(), or 0 past the end.
+    pub fn get_param(&self, i: usize) -> f32 { self.get_params().get(i).copied().unwrap_or(0.0) }
+    #[inline] pub fn getParams(&self) -> Vec<f32> { self.get_params() }
+    #[inline] pub fn getParam(&self, i: usize) -> f32 { self.get_param(i) }
+
     // ── building ─────────────────────────────────────────────────────────
     pub fn begin_shape(&mut self) -> &mut Self { self.begin_shape_kind(0) }
     /// begin_shape_kind(TRIANGLES) and friends.
@@ -648,6 +665,12 @@ impl<T: ShapeRef + ?Sized> ShapeRef for &mut T {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn params() {
+        assert_eq!(super::create_shape_rect(0, 0, 80, 40).get_params(), vec![0.0, 0.0, 80.0, 40.0]);
+        assert_eq!(super::create_shape_sphere(5).get_param(0), 5.0);
+        assert!(super::create_shape().get_params().is_empty());
+    }
     use super::*;
     #[test]
     fn build_and_edit() {
