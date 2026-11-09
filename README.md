@@ -194,6 +194,17 @@ small (i3 stops at about 75 pixels) or a window resized by hand shows the
 sketch at its own size, with black around it. `get()` and `saveFrame()` always
 see just the sketch.
 
+Speed on libprocessing: every engine update renders and waits on the GPU, so
+a frame is kept to as few as possible. With the lp-fork a frame is one update:
+it renders the sketch's canvas and shows the previous frame in the window,
+then a small GPU pass copies the new canvas into the window for the next
+update. The window is one frame behind the canvas (`get()`, `save()` and
+pixels read the canvas, so they're never behind). Built against upstream it's
+two updates a frame, with nothing behind. The window has no multisampling of
+its own; the canvas does the smoothing. The lp-fork also draws ellipses and
+lines without the general tessellator, which is several times faster for
+sketches that draw hundreds of them.
+
 Textures need libprocessing at the pinned commit or newer. Built against an
 older checkout of your own, textured shapes draw untextured and the build says
 so; older checkouts also tone-map colors, which makes everything a little dull.
