@@ -1576,7 +1576,8 @@ pub(crate) fn read_pixels() -> Option<(Vec<u32>, usize, usize)> {
     let g = target()?;
     let (w, h) = target_size()?;
     sync_lights();
-    let _ = pr::graphics_flush(g);
+    // the readback renders what's waiting itself: no flush of our own (each
+    // one is a whole engine update)
     let px = match pr::graphics_readback(g) { Ok(p) => p, Err(e) => { fail("reading pixels", e); return None; } };
     let all: Vec<u32> = px.iter().map(|s: &LinearRgba| {
         let s = &unpremultiply(*s);
@@ -1721,7 +1722,6 @@ pub(crate) fn end_layer() {
         if l.target == l.main { return None; }
         l.layers.values().find(|v| v.0 == l.target).copied()
     }) else { return };
-    let _ = pr::graphics_flush(g);
     match pr::graphics_readback(g) {
         Ok(px) => {
             let rgba: Vec<u8> = px.iter().flat_map(|s: &LinearRgba| {
