@@ -1681,6 +1681,7 @@ pub(crate) fn create_layer(id: u64, w: u32, h: u32) -> bool {
     LP.with(|l| { if let Some(l) = l.borrow_mut().as_mut() { l.layers.insert(id, (g, w, h)); } });
     if let Err(e) = pr::graphics_mode_3d(g) { fail("3D mode for a layer", e); }
     default_projection(g, w, h);
+    let _ = pr::graphics_record_command(g, DrawCommand::StrokeJoin(StrokeJoinMode::Miter));
     // cleared to transparent on its first beginDraw(), not now: starting and
     // ending another canvas in the middle of a frame upsets this one
     FRESH.with(|f| f.borrow_mut().push(g));
@@ -1858,6 +1859,8 @@ pub(crate) fn run<S: 'static>(mut app: crate::App<S>) {
     IN_SETUP.store(true, Ordering::Relaxed);
     begin_frame_lights();
     EARLY.with(|e| e.borrow_mut().push(DrawCommand::Unlit));
+    // Processing's default join is MITER; libprocessing's own default is ROUND
+    EARLY.with(|e| e.borrow_mut().push(DrawCommand::StrokeJoin(StrokeJoinMode::Miter)));
     (app.setup_fn)(&mut app.state);
     IN_SETUP.store(false, Ordering::Relaxed);
     { use std::io::Write; let _ = std::io::stdout().flush(); }
