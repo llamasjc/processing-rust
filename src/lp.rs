@@ -223,13 +223,17 @@ fn start_canvas(main: Entity) {
 /// Ends the frame: draws the sketch's canvas, then copies it into the
 /// window at the top left.
 fn finish_frame() {
+    // A frame that drew on a layer (createGraphics) finishes the canvas on its
+    // own: ending a layer in the middle of the frame upsets a canvas that is
+    // only rendered later with the window (it stayed at its first frame).
+    let layered = LAYER_THIS_FRAME.with(|f| f.replace(false));
     #[cfg(lp_filter_now)]
-    if one_update_frame() { return; }
+    if !layered && one_update_frame() { return; }
     let Some((main, win, canvas, (w, h))) = LP.with(|l| l.borrow().as_ref().map(|l| (l.main, l.win, l.canvas, l.size))) else { return };
     // Every engine update renders and waits on the GPU, so the sketch's
     // canvas is not finished on its own: it renders in the same update as the
     // window that shows it (the canvas camera goes first), see show_with().
-    let merged = to_light_filter().is_some() && canvas_first(main, win);
+    let merged = !layered && to_light_filter().is_some() && canvas_first(main, win);
     if !merged { end_draw_guarded(main); }
     let _ = pr::graphics_begin_draw(win);
     let rec = |c: DrawCommand| { if let Err(e) = pr::graphics_record_command(win, c) { fail("showing the frame", e); } };
@@ -321,17 +325,21 @@ fn one_update_frame() -> bool {
     let first = !UNSHOWN.with(|p| p.get()) && SHOW_RAN.with(|r| !r.get());
     // the update: this frame's canvas, and last frame's picture to the window
     show_with(main, true);
-    let pending = UNSHOWN.with(|p| p.replace(false));
-    if pending { show_with_window(win, true); }
+    // The window takes part in every engine update from now on and shows
+    // its picture in each: an update with the window left out (a layer's
+    // endDraw(), a pixel read) would drop the picture painted into it.
+    UNSHOWN.with(|p| p.set(false));
+    show_with_window(win, true);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| processing_core::app_mut(|app| { app.update(); Ok(()) })));
     show_with(main, false);
-    if pending { show_with_window(win, false); }
     if r.is_err() { missing("drawing one of the shapes in this frame (libprocessing couldn't tessellate it)"); }
     // then this frame's picture into the window, on the GPU only
     let set = pr::filter_set(show, "src", ShaderValue::Texture(canvas))
         .and_then(|_| pr::filter_set(show, "scale", ShaderValue::Float4(scale)));
     // the first run needs its update: it brings the shader to the GPU
     let shown = set.and_then(|_| if first { pr::graphics_apply_filter(win, show) } else { pr::graphics_apply_filter_now(win, show) });
+    // the first one's own flush left the window out of later updates
+    if first { show_with_window(win, true); }
     if let Err(e) = shown { fail("showing the frame", e); return true; }
     SHOW_RAN.with(|r| r.set(true));
     UNSHOWN.with(|p| p.set(true));
@@ -346,7 +354,11 @@ thread_local! { static SHOW_RAN: std::cell::Cell<bool> = const { std::cell::Cell
 pub(crate) fn present_pending() {
     #[cfg(lp_filter_now)]
     if UNSHOWN.with(|p| p.replace(false)) {
-        if let Some(win) = LP.with(|l| l.borrow().as_ref().map(|l| l.win)) { end_draw_guarded(win); }
+        if let Some(win) = LP.with(|l| l.borrow().as_ref().map(|l| l.win)) {
+            end_draw_guarded(win);
+            // end_draw takes the window out of updates; put it back
+            show_with_window(win, true);
+        }
     }
 }
 
@@ -1007,6 +1019,22 @@ pub(crate) fn quad(x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, x4: f32
 /// engine arc modes: 0 default (Processing draws a pie fill and an open stroke), 1 OPEN, 2 CHORD, 3 PIE
 pub(crate) fn arc(cx: f32, cy: f32, w: f32, h: f32, start: f32, stop: f32, mode: u8) {
     let pie = mode != 1 && mode != 2;
+    // no mode given: Processing fills a pie and outlines just the curve,
+    // which libprocessing has no single mode for, so it's two arcs
+    if mode == 0 && SHADING.with(|s| s.get()).is_none() {
+        let (fill_on, stroke_on) = { let (f, st, _) = crate::render::style_pub(); (f.is_some(), st.is_some()) };
+        if fill_on {
+            cmd(DrawCommand::PushStyle); cmd(DrawCommand::NoStroke);
+            cmd(DrawCommand::Arc { cx, cy, w, h, start, stop, mode: ArcMode::Pie });
+            cmd(DrawCommand::PopStyle);
+        }
+        if stroke_on {
+            cmd(DrawCommand::PushStyle); cmd(DrawCommand::NoFill);
+            cmd(DrawCommand::Arc { cx, cy, w, h, start, stop, mode: ArcMode::Open });
+            cmd(DrawCommand::PopStyle);
+        }
+        return;
+    }
     let mode = match mode { 2 => ArcMode::Chord, 3 => ArcMode::Pie, 1 => ArcMode::Open, _ => ArcMode::Open };
     let c = DrawCommand::Arc { cx, cy, w, h, start, stop, mode };
     // the outline only matters with shader() on
@@ -1688,7 +1716,9 @@ pub(crate) fn create_layer(id: u64, w: u32, h: u32) -> bool {
     FRESH.with(|f| f.borrow_mut().push(g));
     true
 }
+thread_local! { static LAYER_THIS_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 pub(crate) fn begin_layer(id: u64) -> bool {
+    LAYER_THIS_FRAME.with(|f| f.set(true));
     let ok = LP.with(|l| {
         let mut l = l.borrow_mut();
         let Some(l) = l.as_mut() else { return false };
