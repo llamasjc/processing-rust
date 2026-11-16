@@ -252,7 +252,7 @@ mod render {
     }
     /// vertex(x, y, z), vertex(x, y, u, v) and vertex(x, y, z, u, v).
     pub fn shape_vertex_full(x: f32, y: f32, z: Option<f32>, uv: Option<(f32, f32)>) {
-        crate::record::shape_vertex(x, y);
+        crate::record::shape_vertex_z(x, y, z.unwrap_or(0.0));
         #[cfg(feature = "libprocessing")]
         if crate::lp::on() {
             let tex = TEXTURE.with(|t| t.get());
@@ -346,7 +346,7 @@ mod render {
                 let (fill, stroke, _) = style_pub();
                 let tex_e = tex.and_then(|id| {
                     let imgs = images().lock();
-                    let img = imgs.get((id as usize).wrapping_sub(1))?;
+                    let img = imgs.get(img_index(id))?;
                     crate::lp::image_entity(id, img_version(id), img.w, img.h, || img.px.iter().flat_map(|c| {
                         let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
                         [b(c.r), b(c.g), b(c.b), b(c.a)]
@@ -489,7 +489,7 @@ mod render {
     /// returns None when there is no such image.
     pub(crate) fn with_texture<R>(id: u64, f: impl FnOnce(&dyn Fn(f32, f32) -> Color) -> R) -> Option<R> {
         let imgs = images().lock();
-        let img = imgs.get((id as usize).wrapping_sub(1))?;
+        let img = imgs.get(img_index(id))?;
         if img.w == 0 || img.h == 0 { return None; }
         let sample = |u: f32, v: f32| { let (u, v) = tex_uv(u, v, img.w, img.h); tex_sample(img, u, v) };
         Some(f(&sample))
@@ -2268,6 +2268,11 @@ mod render {
     fn img_version(id: u64) -> u64 { IMG_VER.lock().get(&id).copied().unwrap_or(0) }
     fn img_edited(id: u64) { *IMG_VER.lock().entry(id).or_insert(0) += 1; }
     static IMG_VER: parking_lot::Mutex<std::collections::BTreeMap<u64, u64>> = parking_lot::Mutex::new(std::collections::BTreeMap::new());
+    /// Image ids start here, well away from small numbers: a Lua sketch's
+    /// images are plain numbers, and cursor(img) has to tell one from a
+    /// cursor kind like CROSS (1) or HAND (12).
+    pub(crate) const IMAGE_BASE: u64 = 1 << 16;
+    pub(crate) fn img_index(id: u64) -> usize { (id as usize).wrapping_sub(IMAGE_BASE as usize) }
     fn images() -> &'static parking_lot::Mutex<Vec<Img>> {
         static I: std::sync::OnceLock<parking_lot::Mutex<Vec<Img>>> = std::sync::OnceLock::new();
         I.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
@@ -2287,7 +2292,7 @@ mod render {
             else { Err("not a PNG or JPEG file".into()) }
         };
         match decode() {
-            Ok(img) => { let mut v = images().lock(); v.push(img); v.len() as u64 }
+            Ok(img) => { let mut v = images().lock(); v.push(img); v.len() as u64 + IMAGE_BASE - 1 }
             Err(e)  => { eprintln!("loadImage(\"{}\"): {} (PNG and JPEG are supported)", path, e); 0 }
         }
     }
@@ -2336,7 +2341,7 @@ mod render {
     #[cfg(feature = "libprocessing")]
     pub(crate) fn lp_image(id: u64) -> Option<bevy::prelude::Entity> {
         let imgs = images().lock();
-        let img = imgs.get((id as usize).wrapping_sub(1))?;
+        let img = imgs.get(img_index(id))?;
         crate::lp::image_entity(id, img_version(id), img.w, img.h, || img.px.iter().flat_map(|c| {
             let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             [b(c.r), b(c.g), b(c.b), b(c.a)]
@@ -2344,12 +2349,12 @@ mod render {
     }
     pub fn image_size(id: u64) -> (f32, f32) {
         let v = images().lock();
-        v.get((id as usize).wrapping_sub(1)).map(|i| (i.w as f32, i.h as f32)).unwrap_or((0.0, 0.0))
+        v.get(img_index(id)).map(|i| (i.w as f32, i.h as f32)).unwrap_or((0.0, 0.0))
     }
-    fn push_image(img: Img) -> u64 { let mut v = images().lock(); v.push(img); v.len() as u64 }
+    fn push_image(img: Img) -> u64 { let mut v = images().lock(); v.push(img); v.len() as u64 + IMAGE_BASE - 1 }
     fn with_img<R>(id: u64, f: impl FnOnce(&mut Img) -> R) -> Option<R> {
         let mut v = images().lock();
-        v.get_mut((id as usize).wrapping_sub(1)).map(f)
+        v.get_mut(img_index(id)).map(f)
     }
     /// A blank, fully transparent image.
     pub fn create_image(w: usize, h: usize) -> u64 {
@@ -2462,7 +2467,7 @@ mod render {
     pub fn draw_image(id: u64, x: f32, y: f32, w: f32, h: f32) {
         crate::record::image(id, x, y, w, h);
         let imgs = images().lock();
-        let img = match imgs.get((id as usize).wrapping_sub(1)) { Some(i) => i, None => return };
+        let img = match imgs.get(img_index(id)) { Some(i) => i, None => return };
         lp_route! {
             let e = crate::lp::image_entity(id, img_version(id), img.w, img.h, || img.px.iter().flat_map(|c| {
                 let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -3521,7 +3526,86 @@ mod glfw {
     pub fn set_cursor_visible(v: bool) { CURSOR_VISIBLE.store(v, Ordering::Relaxed); }
     /// The cursor's look: ARROW, CROSS, HAND, MOVE, TEXT or WAIT.
     static CURSOR_KIND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    pub fn set_cursor_kind(k: u32) { CURSOR_KIND.store(k, Ordering::Relaxed); }
+    pub fn set_cursor_kind(k: u32) { CURSOR_KIND.store(k, Ordering::Relaxed); set_cursor_image(None); }
+    /// cursor(img, x, y): a picture as the cursor, RGBA bytes with the pixel
+    /// that points. A new picture bumps CURSOR_GEN so the windows apply it.
+    static CURSOR_IMAGE: Mutex<Option<std::sync::Arc<(usize, usize, Vec<u8>, usize, usize)>>> = Mutex::new(None);
+    static CURSOR_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    pub fn set_cursor_image(pic: Option<(usize, usize, Vec<u8>, usize, usize)>) {
+        let mut c = CURSOR_IMAGE.lock().unwrap();
+        if c.is_none() && pic.is_none() { return; }
+        *c = pic.map(std::sync::Arc::new);
+        CURSOR_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+    /// The picture to show as the cursor now, if any (the sketch's own, or
+    /// a drawn one for a kind the window system has no cursor for), and a
+    /// number that changes whenever it does.
+    #[allow(dead_code)]
+    pub(crate) fn cursor_picture(system_has_move: bool) -> (u32, Option<std::sync::Arc<(usize, usize, Vec<u8>, usize, usize)>>) {
+        let gen = CURSOR_GEN.load(Ordering::Relaxed) * 4;
+        if let Some(p) = CURSOR_IMAGE.lock().unwrap().clone() { return (gen, Some(p)); }
+        match CURSOR_KIND.load(Ordering::Relaxed) {
+            crate::WAIT => (gen + 1, Some(drawn_cursor(crate::WAIT))),
+            crate::MOVE if !system_has_move => (gen + 2, Some(drawn_cursor(crate::MOVE))),
+            _ => (gen + 3, None),
+        }
+    }
+    /// Draws a cursor picture with its hotspot at (x, y) into a 0xRRGGBB frame.
+    #[allow(dead_code)]
+    fn stamp_cursor(frame: &mut [u32], fw: usize, fh: usize, p: &(usize, usize, Vec<u8>, usize, usize), x: i64, y: i64) {
+        let (w, h, px, hx, hy) = (p.0, p.1, &p.2, p.3 as i64, p.4 as i64);
+        for cy in 0..h {
+            let fy = y - hy + cy as i64;
+            if fy < 0 || fy >= fh as i64 { continue; }
+            for cx in 0..w {
+                let fx = x - hx + cx as i64;
+                if fx < 0 || fx >= fw as i64 { continue; }
+                let i = (cy * w + cx) * 4;
+                let a = px[i + 3] as u32;
+                if a == 0 { continue; }
+                let d = &mut frame[fy as usize * fw + fx as usize];
+                let mix = |s: u32, d: u32| (s * a + d * (255 - a)) / 255;
+                *d = (mix(px[i] as u32, (*d >> 16) & 255) << 16) | (mix(px[i + 1] as u32, (*d >> 8) & 255) << 8) | mix(px[i + 2] as u32, *d & 255);
+            }
+        }
+    }
+    /// An hourglass (WAIT) or four-way arrows (MOVE), black with a white edge.
+    fn drawn_cursor(kind: u32) -> std::sync::Arc<(usize, usize, Vec<u8>, usize, usize)> {
+        static WAIT_PIC: std::sync::OnceLock<std::sync::Arc<(usize, usize, Vec<u8>, usize, usize)>> = std::sync::OnceLock::new();
+        static MOVE_PIC: std::sync::OnceLock<std::sync::Arc<(usize, usize, Vec<u8>, usize, usize)>> = std::sync::OnceLock::new();
+        let make = |inside: &dyn Fn(i32, i32) -> bool, w: usize, h: usize, hx: usize, hy: usize| {
+            let mut px = vec![0u8; w * h * 4];
+            let at = |x: i32, y: i32| x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h && inside(x, y);
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let i = (y as usize * w + x as usize) * 4;
+                    if at(x, y) {
+                        // black inside, white where it meets the outside
+                        let edge = !(at(x - 1, y) && at(x + 1, y) && at(x, y - 1) && at(x, y + 1));
+                        let v = if edge { 255 } else { 0 };
+                        px[i..i + 4].copy_from_slice(&[v, v, v, 255]);
+                    }
+                }
+            }
+            std::sync::Arc::new((w, h, px, hx, hy))
+        };
+        if kind == crate::WAIT {
+            WAIT_PIC.get_or_init(|| make(&|x, y| {
+                // bars top and bottom, two glass halves meeting in the middle
+                if y <= 2 || y >= 19 { return (1..=14).contains(&x); }
+                let half = 1 + ((y - 10).abs() * 6) / 9;
+                (x - 7).abs() <= half || (x - 8).abs() <= half
+            }, 16, 22, 8, 11)).clone()
+        } else {
+            MOVE_PIC.get_or_init(|| make(&|x, y| {
+                let (dx, dy) = ((x - 11).abs(), (y - 11).abs());
+                // the cross's arms, and an arrow head at each end
+                (dx <= 1 && dy <= 9) || (dy <= 1 && dx <= 9)
+                    || (dy >= 6 && dy <= 10 && dx <= 10 - dy + 1 && dx <= 4)
+                    || (dx >= 6 && dx <= 10 && dy <= 10 - dx + 1 && dy <= 4)
+            }, 23, 23, 11, 11)).clone()
+        }
+    }
     #[allow(dead_code)]
     pub(crate) fn cursor_kind() -> u32 { CURSOR_KIND.load(Ordering::Relaxed) }
     pub fn current_frame_rate() -> f32 { measured_frame_rate() }
@@ -3685,7 +3769,9 @@ mod glfw {
                     // Processing codes: LEFT 37, RIGHT 39, CENTER 3
                     MOUSE_BUTTON.store(if bl { 37 } else if br { 39 } else { 3 }, Ordering::Relaxed);
                 }
-                window.set_cursor_visibility(CURSOR_VISIBLE.load(Ordering::Relaxed));
+                // a picture cursor is drawn into the frame, over the hidden system one
+                let cursor_pic = if CURSOR_VISIBLE.load(Ordering::Relaxed) { cursor_picture(true).1 } else { None };
+                window.set_cursor_visibility(CURSOR_VISIBLE.load(Ordering::Relaxed) && cursor_pic.is_none());
                 window.set_cursor_style(match CURSOR_KIND.load(Ordering::Relaxed) {
                     crate::CROSS => minifb::CursorStyle::Crosshair,
                     crate::TEXT => minifb::CursorStyle::Ibeam,
@@ -3819,7 +3905,19 @@ mod glfw {
                         }
                     }
                     drop(buf);
-                    let _ = window.update_with_buffer(&screen, pw, ph);
+                    if let Some(p) = &cursor_pic {
+                        let shown = screen.clone();
+                        stamp_cursor(&mut screen, pw, ph, p, mx as i64 + dst_x as i64, my as i64 + dst_y as i64);
+                        let _ = window.update_with_buffer(&screen, pw, ph);
+                        screen = shown;
+                    } else {
+                        let _ = window.update_with_buffer(&screen, pw, ph);
+                    }
+                } else if let Some(p) = &cursor_pic {
+                    let mut out = buf.clone();
+                    drop(buf);
+                    stamp_cursor(&mut out, cw, ch, p, mx as i64, my as i64);
+                    let _ = window.update_with_buffer(&out, cw, ch);
                 } else {
                     let _ = window.update_with_buffer(&buf, cw, ch);
                     drop(buf);
@@ -4364,8 +4462,27 @@ pub fn cursor() {
     #[cfg(not(feature = "wasm"))] glfw::set_cursor_visible(true);
     #[cfg(feature = "wasm")]      wasm::set_cursor_visible(true);
 }
+/// cursor(img, x, y): the picture is the cursor, (x, y) is the pixel in it
+/// that points. Transparent pixels show what's under it.
+pub fn cursor_image_at(img: u64, x: impl Num, y: impl Num) {
+    let (w, h) = render::image_size(img);
+    let (w, h) = (w as usize, h as usize);
+    let px = render::image_pixels(img);
+    if w == 0 || h == 0 || px.len() < w * h { return; }
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let rgba: Vec<u8> = px.iter().take(w * h).flat_map(|c| [b(c.r), b(c.g), b(c.b), b(c.a)]).collect();
+    let (hx, hy) = (x.f().max(0.0) as usize, y.f().max(0.0) as usize);
+    #[cfg(not(feature = "wasm"))] glfw::set_cursor_image(Some((w, h, rgba, hx.min(w - 1), hy.min(h - 1))));
+    cursor();
+}
+/// cursor(img): the picture's middle points, like Processing.
+pub fn cursor_image(img: u64) {
+    let (w, h) = render::image_size(img);
+    cursor_image_at(img, w / 2.0, h / 2.0);
+}
+#[inline] pub fn cursorImage(img: u64) { cursor_image(img) }
 /// cursor(HAND): shows the cursor with that look (ARROW, CROSS, HAND, MOVE,
-/// TEXT, WAIT). Processing's cursor(img) with a picture isn't supported.
+/// TEXT, WAIT). cursor_image / cursor_image_at take a picture.
 pub fn cursor_kind(kind: u32) {
     #[cfg(not(feature = "wasm"))] glfw::set_cursor_kind(kind);
     cursor();

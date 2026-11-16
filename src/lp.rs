@@ -223,17 +223,13 @@ fn start_canvas(main: Entity) {
 /// Ends the frame: draws the sketch's canvas, then copies it into the
 /// window at the top left.
 fn finish_frame() {
-    // A frame that drew on a layer (createGraphics) finishes the canvas on its
-    // own: ending a layer in the middle of the frame upsets a canvas that is
-    // only rendered later with the window (it stayed at its first frame).
-    let layered = LAYER_THIS_FRAME.with(|f| f.replace(false));
     #[cfg(lp_filter_now)]
-    if !layered && one_update_frame() { return; }
+    if one_update_frame() { return; }
     let Some((main, win, canvas, (w, h))) = LP.with(|l| l.borrow().as_ref().map(|l| (l.main, l.win, l.canvas, l.size))) else { return };
     // Every engine update renders and waits on the GPU, so the sketch's
     // canvas is not finished on its own: it renders in the same update as the
     // window that shows it (the canvas camera goes first), see show_with().
-    let merged = !layered && to_light_filter().is_some() && canvas_first(main, win);
+    let merged = to_light_filter().is_some() && canvas_first(main, win);
     if !merged { end_draw_guarded(main); }
     let _ = pr::graphics_begin_draw(win);
     let rec = |c: DrawCommand| { if let Err(e) = pr::graphics_record_command(win, c) { fail("showing the frame", e); } };
@@ -325,13 +321,15 @@ fn one_update_frame() -> bool {
     let first = !UNSHOWN.with(|p| p.get()) && SHOW_RAN.with(|r| !r.get());
     // the update: this frame's canvas, and last frame's picture to the window
     show_with(main, true);
-    // The window takes part in every engine update from now on and shows
+    // The canvas and the window take part in every engine update from now
+    // on. An update with the canvas left out (a layer's endDraw()) froze it
+    // at its first frame; one with the window left out dropped its picture.
+    // The window and shows
     // its picture in each: an update with the window left out (a layer's
     // endDraw(), a pixel read) would drop the picture painted into it.
     UNSHOWN.with(|p| p.set(false));
     show_with_window(win, true);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| processing_core::app_mut(|app| { app.update(); Ok(()) })));
-    show_with(main, false);
     if r.is_err() { missing("drawing one of the shapes in this frame (libprocessing couldn't tessellate it)"); }
     // then this frame's picture into the window, on the GPU only
     let set = pr::filter_set(show, "src", ShaderValue::Texture(canvas))
@@ -364,6 +362,24 @@ pub(crate) fn present_pending() {
 
 #[cfg(lp_filter_now)]
 fn show_with_window(win: Entity, on: bool) { show_with(win, on); }
+
+// The engine's flush, readback and filter take their graphics out of later
+// updates when they finish. With one update a frame the canvas and the window
+// must stay in every update (see one_update_frame), so these put them back.
+fn flush_keep(g: Entity) -> Result<(), processing_core::error::ProcessingError> { let r = pr::graphics_flush(g); keep_in_updates(); r }
+fn readback_keep(g: Entity) -> Result<Vec<LinearRgba>, processing_core::error::ProcessingError> { let r = pr::graphics_readback(g); keep_in_updates(); r }
+fn filter_keep(g: Entity, f: Entity) -> Result<(), processing_core::error::ProcessingError> { let r = pr::graphics_apply_filter(g, f); keep_in_updates(); r }
+fn keep_in_updates() {
+    #[cfg(lp_filter_now)]
+    if SHOW_RAN.with(|r| r.get()) {
+        // called while LP may already be borrowed (a window resize, say): then
+        // the cameras are put back by the next frame's update instead
+        if let Some((main, win)) = LP.with(|l| l.try_borrow().ok().and_then(|l| l.as_ref().map(|l| (l.main, l.win)))) {
+            show_with(main, true);
+            show_with(win, true);
+        }
+    }
+}
 
 /// Makes the canvas camera render before the window's, once; false if the
 /// cameras can't be found (then the canvas is finished on its own).
@@ -500,8 +516,8 @@ pub(crate) fn filter_shader(id: usize, src: &str, values: &[(String, crate::glsl
         if let Err(err) = pr::filter_set(filter, name.as_str(), V::Texture(*e)) { fail("setting a shader image", err); }
     }
     let Some(t) = target() else { return };
-    let _ = pr::graphics_flush(t);
-    if let Err(e) = pr::graphics_apply_filter(t, filter) { fail("running a shader", e); }
+    let _ = flush_keep(t);
+    if let Err(e) = filter_keep(t, filter) { fail("running a shader", e); }
     DIRTY.store(true, Ordering::Relaxed);
 }
 
@@ -572,7 +588,7 @@ thread_local! {
 /// the old ones.
 fn flush_shaded() {
     if SHADED_PENDING.with(|p| p.replace(false)) {
-        if let Some(t) = target() { let _ = pr::graphics_flush(t); }
+        if let Some(t) = target() { let _ = flush_keep(t); }
     }
 }
 /// The fill a shape drawn with a shader gets (its vertColor). Shapes with the
@@ -930,7 +946,7 @@ fn col(c: Color) -> BColor { BColor::linear_rgba(c.r.clamp(0.0, 1.0), c.g.clamp(
 
 // ── style ────────────────────────────────────────────────────────────────
 pub(crate) fn background(c: Color) {
-    if DRAWN.swap(false, Ordering::Relaxed) { if let Some(g) = target() { let _ = pr::graphics_flush(g); } }
+    if DRAWN.swap(false, Ordering::Relaxed) { if let Some(g) = target() { let _ = flush_keep(g); } }
     cmd(DrawCommand::BackgroundColor(col(c)));
 }
 pub(crate) fn fill(c: Option<Color>) { cmd(match c { Some(c) => DrawCommand::Fill(col(c)), None => DrawCommand::NoFill }); }
@@ -962,7 +978,7 @@ pub(crate) fn smooth(on: bool) {
     let want = if on { bevy::render::view::Msaa::Sample4 } else { bevy::render::view::Msaa::Off };
     let same = processing_core::app_mut(|app| Ok(app.world().get::<bevy::render::view::Msaa>(t).copied() == Some(want))).unwrap_or(true);
     if same { return; }
-    if DRAWN.swap(false, Ordering::Relaxed) { let _ = pr::graphics_flush(t); }
+    if DRAWN.swap(false, Ordering::Relaxed) { let _ = flush_keep(t); }
     let _ = processing_core::app_mut(|app| {
         if let Ok(mut e) = app.world_mut().get_entity_mut(t) { e.insert(want); }
         Ok(())
@@ -1200,7 +1216,7 @@ fn set_projection(m: bevy::math::Mat4, far: f32) {
     set_projection_on(g, m, far);
 }
 fn set_projection_on(g: Entity, m: bevy::math::Mat4, far: f32) {
-    let _ = pr::graphics_flush(g);
+    let _ = flush_keep(g);
     let _ = processing_core::app_mut(|app| {
         if let Some(mut p) = app.world_mut().get_mut::<bevy::camera::Projection>(g) {
             *p = bevy::camera::Projection::custom(MatrixProjection { m, far });
@@ -1246,19 +1262,23 @@ pub(crate) fn add_light(spec: LightSpec) {
     // once with it in the frame, so make it now and render what came before
     if matches!(spec, LightSpec::Spot(..)) {
         sync_lights();
-        if let Some(t) = target() { let _ = pr::graphics_flush(t); }
+        if let Some(t) = target() { let _ = flush_keep(t); }
     }
 }
 // The material calls, as libprocessing's PBR material: emissive is its glow,
-// shininess its smoothness. A specular color has no match there (the shine
-// takes the light's color), so it only turns the shine off when it's black.
+// shininess its smoothness, specular the shine's color (with the lp-fork;
+// without it a black specular only turns the shine off).
 // Only sent while lights are on: they make libprocessing's material a lit
 // one, which would darken flat shapes. Kept, and sent when lights come on.
 thread_local! { static MATERIAL: std::cell::Cell<([f32; 3], Option<f32>)> = const { std::cell::Cell::new(([0.0; 3], None)) }; }
+#[cfg(lp_specular)]
+thread_local! { static SPECULAR: std::cell::Cell<Option<[f32; 3]>> = const { std::cell::Cell::new(None) }; }
 fn send_material() {
     let (e, rough) = MATERIAL.with(|m| m.get());
     cmd(DrawCommand::Emissive(BColor::linear_rgb(e[0], e[1], e[2])));
     if let Some(r) = rough { cmd(DrawCommand::Roughness(r)); }
+    #[cfg(lp_specular)]
+    if let Some(c) = SPECULAR.with(|s| s.get()) { cmd(DrawCommand::Specular(BColor::srgb(c[0], c[1], c[2]))); }
 }
 pub(crate) fn material_emissive(c: [f32; 3]) {
     MATERIAL.with(|m| { let (_, r) = m.get(); m.set((c, r)); });
@@ -1269,6 +1289,9 @@ pub(crate) fn material_shininess(sh: f32) {
     if LIT.with(|l| l.get()) { send_material(); }
 }
 pub(crate) fn material_specular(c: [f32; 3]) {
+    #[cfg(lp_specular)]
+    SPECULAR.with(|s| s.set(Some(c)));
+    #[cfg(not(lp_specular))]
     if c == [0.0; 3] { MATERIAL.with(|m| { let (e, _) = m.get(); m.set((e, Some(1.0))); }); }
     if LIT.with(|l| l.get()) { send_material(); }
 }
@@ -1386,7 +1409,7 @@ fn sync_lights() {
     // render once now, before anything is drawn with it
     let fresh = !made.is_empty();
     HAVE.with(|h| *h.borrow_mut() = (want, made));
-    if fresh { let _ = pr::graphics_flush(main); }
+    if fresh { let _ = flush_keep(main); }
 }
 
 // ── 3D lines, points and triangles: small meshes made for the frame ──────
@@ -1540,7 +1563,7 @@ fn send_align(h: u8, v: u8) {
 fn text_target() -> Option<Entity> {
     ensure_open();
     let g = target()?;
-    if DIRTY.load(Ordering::Relaxed) { let _ = pr::graphics_flush(g); }
+    if DIRTY.load(Ordering::Relaxed) { let _ = flush_keep(g); }
     Some(g)
 }
 pub(crate) fn text_width(s: &str) -> f32 {
@@ -1606,7 +1629,7 @@ pub(crate) fn read_pixels() -> Option<(Vec<u32>, usize, usize)> {
     sync_lights();
     // the readback renders what's waiting itself: no flush of our own (each
     // one is a whole engine update)
-    let px = match pr::graphics_readback(g) { Ok(p) => p, Err(e) => { fail("reading pixels", e); return None; } };
+    let px = match readback_keep(g) { Ok(p) => p, Err(e) => { fail("reading pixels", e); return None; } };
     let all: Vec<u32> = px.iter().map(|s: &LinearRgba| {
         let s = &unpremultiply(*s);
         let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -1716,9 +1739,7 @@ pub(crate) fn create_layer(id: u64, w: u32, h: u32) -> bool {
     FRESH.with(|f| f.borrow_mut().push(g));
     true
 }
-thread_local! { static LAYER_THIS_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 pub(crate) fn begin_layer(id: u64) -> bool {
-    LAYER_THIS_FRAME.with(|f| f.set(true));
     let ok = LP.with(|l| {
         let mut l = l.borrow_mut();
         let Some(l) = l.as_mut() else { return false };
@@ -1752,7 +1773,7 @@ pub(crate) fn end_layer() {
         if l.target == l.main { return None; }
         l.layers.values().find(|v| v.0 == l.target).copied()
     }) else { return };
-    match pr::graphics_readback(g) {
+    match readback_keep(g) {
         Ok(px) => {
             let rgba: Vec<u8> = px.iter().flat_map(|s: &LinearRgba| {
                 let s = &unpremultiply(*s);
@@ -1803,6 +1824,21 @@ fn sync_window() {
             let icon = match kind { crate::CROSS => I::Crosshair, crate::TEXT => I::Text, crate::WAIT => I::Wait,
                                     crate::HAND => I::Pointer, crate::MOVE => I::Move, _ => I::Default };
             if let Err(e) = input::input_set_cursor_icon(s, icon) { fail("cursor", e); }
+        }
+    }
+    // a picture: the sketch's cursor(img), or a drawn one for WAIT and MOVE,
+    // which GLFW has no cursors for
+    #[cfg(lp_cursor_image)]
+    {
+        thread_local! { static PIC_APPLIED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) }; }
+        let (gen, pic) = crate::glfw::cursor_picture(false);
+        if PIC_APPLIED.with(|c| c.get()) != Some(gen) {
+            PIC_APPLIED.with(|c| c.set(Some(gen)));
+            LP.with(|l| {
+                if let Some(g) = l.borrow_mut().as_mut().and_then(|l| l.glfw.as_mut()) {
+                    g.set_cursor_image(pic.as_ref().map(|p| (p.0 as u32, p.1 as u32, p.2.as_slice(), p.3 as u32, p.4 as u32)));
+                }
+            });
         }
     }
     if had == Some(want) { return; }

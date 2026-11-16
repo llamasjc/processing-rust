@@ -24,13 +24,15 @@ enum Item {
 
 struct Rec { path: String, kind: String, items: Vec<Item>, shape: Option<(u8, Vec<(f32, f32)>, Vec<(f32, f32)>)>,
              /// fonts used by the text: the file and the font, in order of first use
-             fonts: Vec<(std::path::PathBuf, std::sync::Arc<fontdue::Font>)> }
+             fonts: Vec<(std::path::PathBuf, std::sync::Arc<fontdue::Font>)>,
+             /// each shape vertex's z (vertex(x, y, z)); all 0 for a flat shape
+             shape_z: Vec<f32> }
 
 static REC: Mutex<Option<Rec>> = Mutex::new(None);
 
 /// begin_record(kind, path): kind is PDF, SVG or "" (then the extension decides).
 pub fn begin_record(kind: &str, path: &str) {
-    *REC.lock() = Some(Rec { path: path.to_string(), kind: kind.to_lowercase(), items: Vec::new(), shape: None, fonts: Vec::new() });
+    *REC.lock() = Some(Rec { path: path.to_string(), kind: kind.to_lowercase(), items: Vec::new(), shape: None, fonts: Vec::new(), shape_z: Vec::new() });
 }
 /// end_record(): writes the file. False if it couldn't.
 pub fn end_record() -> bool {
@@ -153,9 +155,17 @@ pub(crate) fn screen_path(pts: &[(f32, f32)], closed: bool, fill: Option<Color>,
 }
 
 // begin_shape ... end_shape, followed alongside the renderer
-pub(crate) fn shape_begin(kind: u8) { if let Some(r) = REC.lock().as_mut() { r.shape = Some((kind, Vec::new(), Vec::new())); } }
-pub(crate) fn shape_vertex(x: f32, y: f32) {
-    if let Some(r) = REC.lock().as_mut() { if let Some((_, pts, curve)) = r.shape.as_mut() { pts.push((x, y)); curve.clear(); } }
+pub(crate) fn shape_begin(kind: u8) { if let Some(r) = REC.lock().as_mut() { r.shape = Some((kind, Vec::new(), Vec::new())); r.shape_z.clear(); } }
+pub(crate) fn shape_vertex(x: f32, y: f32) { shape_vertex_z(x, y, 0.0); }
+/// vertex(x, y, z): kept with its depth, and drawn where the camera sees it
+pub(crate) fn shape_vertex_z(x: f32, y: f32, z: f32) {
+    if let Some(r) = REC.lock().as_mut() {
+        if let Some((_, pts, curve)) = r.shape.as_mut() {
+            pts.push((x, y)); curve.clear();
+            r.shape_z.resize(pts.len() - 1, 0.0);
+            r.shape_z.push(z);
+        }
+    }
 }
 pub(crate) fn shape_bezier(cx1: f32, cy1: f32, cx2: f32, cy2: f32, x: f32, y: f32) {
     if let Some(r) = REC.lock().as_mut() { if let Some((_, pts, _)) = r.shape.as_mut() {
@@ -186,8 +196,25 @@ pub(crate) fn shape_curve(x: f32, y: f32) {
     } }
 }
 pub(crate) fn shape_end(close: bool) {
-    let shape = REC.lock().as_mut().and_then(|r| r.shape.take());
-    let Some((kind, p, _)) = shape else { return };
+    let shape = REC.lock().as_mut().map(|r| (r.shape.take(), std::mem::take(&mut r.shape_z)));
+    let Some((Some((kind, p, _)), zs)) = shape else { return };
+    // a shape with depth: its corners go where the camera puts them
+    if zs.iter().any(|z| *z != 0.0) && zs.len() == p.len() {
+        let scr: Vec<(f32, f32)> = p.iter().zip(&zs).map(|(&(x, y), &z)| (crate::three::screen_x(x, y, z), crate::three::screen_y(x, y, z))).collect();
+        let (fill, stroke, weight) = crate::render::style_pub();
+        let path = |pts: &[(f32, f32)], closed: bool, filled: bool| screen_path(pts, closed, if filled { fill } else { None }, stroke, weight);
+        match kind {
+            2 => for c in scr.chunks_exact(2) { path(c, false, false); },
+            3 => for c in scr.chunks_exact(3) { path(c, true, true); },
+            4 => for i in 1..scr.len().saturating_sub(1) { path(&[scr[0], scr[i], scr[i + 1]], true, true); },
+            5 => for i in 0..scr.len().saturating_sub(2) { path(&[scr[i], scr[i + 1], scr[i + 2]], true, true); },
+            6 => for c in scr.chunks_exact(4) { path(c, true, true); },
+            7 => { let mut i = 0; while i + 3 < scr.len() { path(&[scr[i], scr[i + 1], scr[i + 3], scr[i + 2]], true, true); i += 2; } }
+            1 => for &(x, y) in &scr { path(&[(x - weight / 2.0, y), (x + weight / 2.0, y)], false, false); },
+            _ => if scr.len() >= 2 { path(&scr, close, true); },
+        }
+        return;
+    }
     match kind {
         1 => for &(x, y) in &p { point(x, y); },
         2 => for c in p.chunks_exact(2) { push(c, false, false); },

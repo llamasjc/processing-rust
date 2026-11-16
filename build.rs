@@ -9,6 +9,8 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(lp_window_state)");
     println!("cargo::rustc-check-cfg=cfg(lp_depth_test)");
     println!("cargo::rustc-check-cfg=cfg(lp_filter_now)");
+    println!("cargo::rustc-check-cfg=cfg(lp_cursor_image)");
+    println!("cargo::rustc-check-cfg=cfg(lp_specular)");
     println!("cargo:rerun-if-env-changed=LIBPROCESSING_DIR");
     let dir = std::env::var("LIBPROCESSING_DIR").ok().filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
     let Some(dir) = dir else { return };
@@ -24,6 +26,10 @@ fn main() {
     if std::fs::read_to_string(&glfw).is_ok_and(|s| s.contains("pub fn window_state")) {
         println!("cargo:rustc-cfg=lp_window_state");
     }
+    // the lp-fork can show a picture as the mouse cursor
+    if std::fs::read_to_string(&glfw).is_ok_and(|s| s.contains("pub fn set_cursor_image")) {
+        println!("cargo:rustc-cfg=lp_cursor_image");
+    }
     // the lp-fork can run a filter without an engine update first, which
     // lets a frame be shown in one update
     let lib = dir.join("crates/processing_render/src/lib.rs");
@@ -36,6 +42,8 @@ fn main() {
     if let Ok(src) = std::fs::read_to_string(&file) {
         // the lp-fork can turn the depth test off (hint(DISABLE_DEPTH_TEST))
         if src.contains("DepthTest(bool)") { println!("cargo:rustc-cfg=lp_depth_test"); }
+        // the lp-fork has a color for the shine (specular())
+        if src.contains("Specular(Color)") { println!("cargo:rustc-cfg=lp_specular"); }
         if !src.contains("NoTexture") {
             println!("cargo:rustc-cfg=lp_no_texture");
             println!("cargo:warning=your libprocessing checkout has no texture commands; textured shapes draw untextured. Update it to get textures.");

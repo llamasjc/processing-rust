@@ -43,9 +43,6 @@ needs the lp-fork).
   for variables.
 - `mask()` on the canvas and `choice()`: deprecated in Processing.
 - `PShape` tessellation (`getTessellation` and friends) and `setPath`.
-- `cursor(img, x, y)` with a picture: it shows the normal cursor. The named
-  kinds (`HAND`, `CROSS`, `MOVE`, `TEXT`, `WAIT`, `ARROW`) work; `WAIT` is the
-  arrow on the default renderer.
 - `PFont.getGlyph` and `save`: Processing's own glyph bitmaps and .vlw
   files. `getShape(c)` works (the outline, holes as contours).
 - `JSONArray` value iterators (use the `get_*_array` ones).
@@ -55,7 +52,16 @@ needs the lp-fork).
 ## Partial
 
 - `hint()`: `DISABLE_DEPTH_TEST` / `ENABLE_DEPTH_TEST` work on both renderers
-  (libprocessing needs the lp-fork); the other hints do nothing.
-- `begin_record`: shapes, text with its font (embedded), images (embedded)
-  and boxes / spheres (as lit triangles) are written. Shapes made with
-  `vertex(x, y, z)` are flattened, and shader effects aren't written.
+  (libprocessing needs the lp-fork). The other hints tune Processing's
+  OpenGL renderers (stroke sorting, mipmaps, key repeat...) and do nothing
+  here, as in Processing's default renderer.
+- `begin_record`: shapes (also ones made with `vertex(x, y, z)`, drawn where
+  the camera shows them), text with its font (embedded), images (embedded)
+  and boxes / spheres (as lit triangles) are written. Shader effects aren't,
+  as in Processing: a PDF or SVG can't run a shader.
+
+Cursors: `cursor(img)` / `cursor(img, x, y)` show a picture (RustMode:
+`cursor_image(img)` / `cursor_image_at(img, x, y)`; libprocessing needs the
+lp-fork). `WAIT` is a drawn hourglass where the window system has no busy
+cursor, and `MOVE` drawn arrows on libprocessing. Images are numbered from
+65536, so in LuaMode an image is never mistaken for a cursor kind.

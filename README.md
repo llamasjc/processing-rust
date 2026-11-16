@@ -185,8 +185,8 @@ Known differences on libprocessing, for now:
 
 - Lights apply to the whole frame: `no_lights()` makes the shapes after it
   flat again, but the lights stay for the shapes drawn before.
-- `specular()` only turns the shine off (black) or on; the shine takes the
-  light's color. Textures are slightly smoothed.
+- `specular()` sets the shine's color with the lp-fork; with upstream
+  libprocessing it only turns the shine off (black) or on.
 
 The sketch draws on a canvas of exactly its own size, which is then shown in
 the top left of the window. A window manager that won't make a window that
