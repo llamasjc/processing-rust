@@ -457,10 +457,31 @@ public class RustEditor extends Editor {
   public JMenu buildFileMenu() {
     // like Processing's: Ctrl+Shift+E
     int menuKey = java.awt.Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
-    JMenuItem app = new JMenuItem("Export Application");
+    JMenuItem app = new JMenuItem("Export Application...");
     app.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_E, menuKey | InputEvent.SHIFT_DOWN_MASK));
     app.addActionListener(e -> handleExportApplication());
-    return buildFileMenu(new JMenuItem[] { app });
+    JMenuItem pdez = new JMenuItem("Export as PDEZ...");
+    pdez.addActionListener(e -> handleExportPdez());
+    return buildFileMenu(new JMenuItem[] { app, pdez });
+  }
+
+  /** File > Export as PDEZ: the sketch folder zipped next to it (see AppExport.pdez). */
+  private void handleExportPdez() {
+    if (sketch.isUntitled() || sketch.isReadOnly()) {
+      statusError("Save the sketch first.");
+      return;
+    }
+    if (sketch.isModified()) {
+      try { sketch.save(); } catch (Exception ex) { statusError("Couldn't save: " + ex.getMessage()); return; }
+    }
+    try {
+      File pdez = AppExport.pdez(sketch.getFolder());
+      statusNotice("Exported " + pdez.getName());
+      AppExport.show(pdez.getParentFile());
+    } catch (Exception ex) {
+      LOG.log(Level.WARNING, "PDEZ export failed", ex);
+      statusError("Export failed: " + ex.getMessage());
+    }
   }
 
   /**
@@ -487,7 +508,7 @@ public class RustEditor extends Editor {
         File dest = AppExport.write(sketch.getFolder(), sketch.getName(), new File(sketch.getFolder(), "data"),
           AppExport.variant(fallback), binary, new String[0], lp ? "libprocessing" : null);
         statusNotice("Exported to " + sketch.getName() + "/" + dest.getName() + "/");
-        processing.app.Platform.openFolder(dest);
+        AppExport.show(dest);
       } catch (CargoException e) {
         statusError(e.getMessage() != null ? e.getMessage() : "the build failed");
       } catch (Throwable e) {

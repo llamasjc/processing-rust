@@ -240,6 +240,10 @@ the toolbar; a libprocessing export needs GLFW 3.4 and Vulkan on the
 machine that runs it. Like Processing's, an export is for the platform it
 was made on.
 
+File > Export as PDEZ zips the sketch folder next to it as `<sketch>.pdez`,
+like Processing's: open the file in Processing to install the sketch. The
+platform folders Export Application made are left out of it.
+
 ## Sketch syntax
 
 Sketches are valid Rust files.  The Processing conventions:
