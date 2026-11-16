@@ -899,6 +899,11 @@ pub(crate) fn cmd(c: DrawCommand) {
     }
     DIRTY.store(true, Ordering::Relaxed);
     if !matches!(c, DrawCommand::BackgroundColor(_)) { DRAWN.store(true, Ordering::Relaxed); }
+    if LIT.with(|l| l.get()) && matches!(c, DrawCommand::Box { .. } | DrawCommand::Sphere { .. } | DrawCommand::Geometry(_)
+        | DrawCommand::EndShape { .. } | DrawCommand::Rect { .. } | DrawCommand::Ellipse { .. } | DrawCommand::Triangle { .. }
+        | DrawCommand::Quad { .. } | DrawCommand::Arc { .. }) {
+        LIT_DRAWN.with(|d| d.set(true));
+    }
     match target() {
         Some(t) => { if let Err(e) = pr::graphics_record_command(t, c) { fail("drawing", e); } }
         None => EARLY.with(|e| e.borrow_mut().push(c)),
@@ -1255,7 +1260,18 @@ thread_local! {
 // Shapes after the first light of a frame are lit (PBR); before it, and
 // after no_lights(), they are flat colors like Processing without lights.
 thread_local! { static LIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! {
+    /// A shape was drawn with lights on since the scene's lights were last set.
+    static LIT_DRAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 pub(crate) fn add_light(spec: LightSpec) {
+    // libprocessing has one set of lights for everything a render draws, so
+    // a light added after lit shapes were drawn would light them too. Like
+    // Processing, those keep the lights they were drawn with: render them now.
+    if LIT_DRAWN.with(|d| d.replace(false)) {
+        sync_lights();
+        if let Some(t) = target() { let _ = flush_keep(t); }
+    }
     WANT.with(|w| w.borrow_mut().push(spec));
     if !LIT.with(|l| l.replace(true)) { cmd(DrawCommand::Roughness(0.9)); cmd(DrawCommand::Metallic(0.0)); send_material(); }
     // a spot light only lights what is drawn after the canvas has rendered
@@ -1299,9 +1315,15 @@ pub(crate) fn lights() {
     add_light(LightSpec::Ambient([0.5; 3]));
     add_light(LightSpec::Directional([0.5; 3], [0.0, 0.0, -1.0]));
 }
-/// noLights(): shapes from here on are flat again. (The lights stay in the
-/// scene for the shapes drawn before: a libprocessing scene has one set.)
+/// noLights(): shapes from here on are flat again, and lights() after it
+/// starts a new set, like Processing.
 pub(crate) fn no_lights() {
+    // the shapes lit so far keep their lights; the ones after start with none
+    if LIT_DRAWN.with(|d| d.replace(false)) {
+        sync_lights();
+        if let Some(t) = target() { let _ = flush_keep(t); }
+    }
+    WANT.with(|w| w.borrow_mut().clear());
     LIT.with(|l| l.set(false));
     cmd(DrawCommand::Unlit);
 }
@@ -1324,6 +1346,7 @@ fn point_lumens(p: [f32; 3], w: u32, h: u32) -> f32 {
 const POINT_LUMENS_PER_UNIT2: f32 = 2.2e5;
 fn begin_frame_lights() {
     WANT.with(|w| w.borrow_mut().clear());
+    LIT_DRAWN.with(|d| d.set(false));
     LIT.with(|l| l.set(false));
     // A spot light kept from the last frame doesn't light this one on some
     // GPUs (one made in the frame always does), so spot lights are made anew

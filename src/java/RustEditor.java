@@ -455,7 +455,48 @@ public class RustEditor extends Editor {
 
   @Override
   public JMenu buildFileMenu() {
-    return buildFileMenu(new JMenuItem[0]);
+    // like Processing's: Ctrl+Shift+E
+    int menuKey = java.awt.Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
+    JMenuItem app = new JMenuItem("Export Application");
+    app.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_E, menuKey | InputEvent.SHIFT_DOWN_MASK));
+    app.addActionListener(e -> handleExportApplication());
+    return buildFileMenu(new JMenuItem[] { app });
+  }
+
+  /**
+   * File > Export Application: an optimized build of the sketch, in a folder
+   * named for this platform inside the sketch folder, with its data folder
+   * and a launcher named after the sketch (see AppExport). Built for the
+   * renderer picked in the toolbar.
+   */
+  private void handleExportApplication() {
+    if (sketch.isUntitled() || sketch.isReadOnly()) {
+      statusError("Save the sketch first: the export goes inside its folder.");
+      return;
+    }
+    if (sketch.isModified()) {
+      try { sketch.save(); } catch (Exception ex) { statusError("Couldn't save: " + ex.getMessage()); return; }
+    }
+    statusNotice("Exporting " + sketch.getName() + " (an optimized build, this can take a while)...");
+    boolean lp = Renderer.libprocessing();
+    Thread t = new Thread(() -> {
+      try {
+        File binary = new RustBuild(sketch, getRustMode(), true).build();
+        if (binary == null || !binary.isFile()) { statusError("Export failed: the build didn't produce a program"); return; }
+        String fallback = (System.getProperty("os.name", "").toLowerCase().contains("win") ? "windows" : "linux") + "-" + System.getProperty("os.arch", "");
+        File dest = AppExport.write(sketch.getFolder(), sketch.getName(), new File(sketch.getFolder(), "data"),
+          AppExport.variant(fallback), binary, new String[0], lp ? "libprocessing" : null);
+        statusNotice("Exported to " + sketch.getName() + "/" + dest.getName() + "/");
+        processing.app.Platform.openFolder(dest);
+      } catch (CargoException e) {
+        statusError(e.getMessage() != null ? e.getMessage() : "the build failed");
+      } catch (Throwable e) {
+        LOG.log(Level.WARNING, "export failed", e);
+        statusError("Export failed: " + (e.getMessage() != null ? e.getMessage() : e.toString()));
+      }
+    }, "rustmode-export");
+    t.setDaemon(true);
+    t.start();
   }
 
   @Override

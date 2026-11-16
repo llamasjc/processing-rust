@@ -179,12 +179,16 @@ libprocessing shapes; 3D lines, points and triangles are small meshes; lights
 are remade only when a frame asks for different ones.
 
 Needs Rust stable (libprocessing uses the 2024 edition) and GLFW 3.4
-(`pacman -S glfw` on Arch). There is no sound for now.
+(`pacman -S glfw` on Arch).
+
+Lights work like Processing's: a shape is lit by the lights set before it,
+and `no_lights()` starts over. libprocessing has one set of lights for
+everything a render draws, so a light added (or `no_lights()`) after lit
+shapes first renders those shapes; that costs one engine update, only in
+frames that change their lights partway through.
 
 Known differences on libprocessing, for now:
 
-- Lights apply to the whole frame: `no_lights()` makes the shapes after it
-  flat again, but the lights stay for the shapes drawn before.
 - `specular()` sets the shine's color with the lp-fork; with upstream
   libprocessing it only turns the shine off (black) or on.
 
@@ -217,6 +221,24 @@ Sketches build against your own libprocessing checkout when there is one:
 `Cargo.toml`. The build status line says which one it used.
 
 ---
+
+## Export Application
+
+File > Export Application (Ctrl+Shift+E) makes a standalone program, laid
+out like Processing's own export: a folder named for this platform
+(`linux-amd64`, `macos-aarch64`, `windows-amd64`...) inside the sketch
+folder, holding
+
+- a launcher named after the sketch (a shell script; `.bat` on Windows),
+- `lib/`: the sketch, built with optimizations,
+- `data/`: a copy of the sketch's data folder.
+
+The launcher starts the program from its own folder, so files in `data/`
+are found wherever the export is moved, and passes the local time zone so
+`hour()` and friends give local time. It's built for the renderer picked in
+the toolbar; a libprocessing export needs GLFW 3.4 and Vulkan on the
+machine that runs it. Like Processing's, an export is for the platform it
+was made on.
 
 ## Sketch syntax
 
