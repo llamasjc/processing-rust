@@ -8,21 +8,24 @@ RustMode folder. One command, nothing pushed, nothing changed in the repo:
 The version is prettyVersion in mode.properties (0.1.0); change it there
 when you want a new one.
 
-1. Precompiled engine for this machine's platform (cache/<platform>/cpu and
-   .../libprocessing), built only if it's missing or out of date. Builds
-   share one target folder (see build-cache.py), so Bevy compiles once and
-   later builds only redo what changed. libprocessing is the commit pinned
-   in Cargo.toml, what users get, even when ~/lp-fork is there.
+It zips what's in your RustMode folder, like CppMode's script: the caches
+you already have in cache/ (the same ones your IDE uses) plus the jar.
+
+1. Checks cache/<platform>/{cpu,libprocessing}. A cache goes in only if it
+   matches the engine sources and Rust version and, for libprocessing, was
+   built from the pinned commit. Anything stale or missing is listed with
+   the command that rebuilds it; nothing is built unless you ask.
+   cache/*/libprocessing-fork (built from ~/lp-fork for your IDE) never
+   goes in.
 2. Builds the mode jar (gradle jar).
-3. Zips the mode folder. Caches for other platforms that are already in
-   cache/ go in too if they match the engine; stale ones are left out.
+3. Zips the folder.
 
-On platforms without a cache in the zip, sketches build with cargo the
-first time (slower, then fast). Caches for the other platforms can come
-from the build-cache workflow on GitHub later: --ci runs it and downloads
-them into cache/ before zipping (needs the code on GitHub and gh logged in).
+Keep the caches fresh in your own copy with:
+    scripts/build-cache.py all             # cpu + your fork (for your IDE)
+    scripts/build-cache.py all --upstream  # cpu + pinned (what ships)
+They share one target folder, so Bevy compiles once.
 
-    --skip-cache   zip what's in cache/ now, build nothing
+    --build-cache  rebuild stale caches for this platform first
     --ci           also fetch every platform's cache from GitHub first
 """
 import importlib.util, json, os, shutil, subprocess, sys, tempfile, time, zipfile, datetime
@@ -52,18 +55,20 @@ def cache_ok(plat, rend):
         return False
     if m.get("rustc") != bc.toolchain() and not str(m.get("rustc", "")).startswith(bc.toolchain()):
         return False
+    if rend == "libprocessing" and m.get("libprocessing") != "pinned":
+        return False
     return True
 
 
-def local_caches():
+def local_caches(build):
     plat = bc.platform_dir()
-    for rend in RENDERERS:
-        meta = ROOT / "cache" / plat / rend / "cache.json"
-        pinned = rend == "cpu" or (meta.is_file() and json.loads(meta.read_text()).get("libprocessing") == "pinned")
-        if cache_ok(plat, rend) and pinned:
-            print(f"{plat}/{rend}: up to date")
-            continue
-        print(f"{plat}/{rend}: building (the first time takes a while; later only the engine recompiles)")
+    stale = [r for r in RENDERERS if not cache_ok(plat, r)]
+    for r in RENDERERS:
+        print(f"{plat}/{r}: {'stale or missing' if r in stale else 'ok, goes in'}")
+    if stale and not build:
+        print(f"  rebuild with: scripts/build-cache.py {stale[0] if len(stale) == 1 else 'all'} --upstream"
+              "  (or rerun with --build-cache)")
+    for rend in stale if build else []:
         t = time.time()
         r = subprocess.run([sys.executable, str(ROOT / "scripts" / "build-cache.py"), rend, "--upstream"])
         if r.returncode != 0:
@@ -164,8 +169,7 @@ if __name__ == "__main__":
     version = mode_version()
     if "--ci" in sys.argv:
         ci_caches()
-    if "--skip-cache" not in sys.argv:
-        local_caches()
+    local_caches("--build-cache" in sys.argv)
     print(f"RustMode {version or '(no prettyVersion in mode.properties)'}")
     build_jar()
     make_zip(version)

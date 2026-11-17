@@ -641,12 +641,50 @@ public class RustBuild {
   private static final Pattern CACHE_MISMATCH = Pattern.compile(
     "E0514|E0460|E0461|E0462|E0463|E0786|incompatible version of rustc|linking with .* failed|could not find native static library");
 
+  /** Newest modification time (seconds) of the checkout crates RustMode uses; same walk as build-cache.py. */
+  static long forkStamp(File fork) {
+    long newest = 0;
+    for (String c : new String[] { "processing_core", "processing_render", "processing_input", "processing_glfw" }) {
+      File d = new File(fork, "crates/" + c);
+      newest = Math.max(newest, new File(d, "Cargo.toml").lastModified() / 1000);
+      java.util.ArrayDeque<File> todo = new java.util.ArrayDeque<>();
+      todo.add(new File(d, "src"));
+      while (!todo.isEmpty()) {
+        File[] kids = todo.pop().listFiles();
+        if (kids == null) continue;
+        for (File k : kids) {
+          if (k.isDirectory()) todo.add(k);
+          else newest = Math.max(newest, k.lastModified() / 1000);
+        }
+      }
+    }
+    return newest;
+  }
+
+  private static String jsonNumber(String json, String key) {
+    java.util.regex.Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*(\\d+)").matcher(json);
+    return m.find() ? m.group(1) : null;
+  }
+
   private File cachedBuild(File projectDir) throws IOException, InterruptedException {
     String renderer = Renderer.libprocessing() ? "libprocessing" : "cpu";
+    // with a libprocessing checkout of your own, only a cache built from that
+    // checkout (libprocessing-fork) will do; the pinned one lacks its changes
+    File fork = Renderer.libprocessing() ? localFork() : null;
+    if (fork != null) renderer = "libprocessing-fork";
     File dir = new File(mode.getFolder(), "cache/" + platformDir() + "/" + renderer);
     File meta = new File(dir, "cache.json");
     if (!meta.isFile()) return null;
     String json = readFile(meta);
+    if (fork != null) {
+      String from = jsonString(json, "libprocessing");
+      String stamp = jsonNumber(json, "fork_newest");
+      if (from == null || !new File(from).getCanonicalPath().equals(fork.getCanonicalPath())
+          || stamp == null || forkStamp(fork) > Long.parseLong(stamp)) {
+        LOG.info("RustMode: libprocessing checkout changed since the cache was built; using cargo");
+        return null;
+      }
+    }
     String version = jsonString(json, "rustc");
     String engine = jsonString(json, "engine");
     String hash = jsonString(json, "engine_hash");

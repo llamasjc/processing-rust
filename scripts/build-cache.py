@@ -73,17 +73,32 @@ def local_fork():
     return None
 
 
+def fork_stamp(fork: Path) -> int:
+    """Newest modification time (whole seconds) of the libprocessing crates
+    RustMode uses from a checkout: the same walk as RustBuild.forkStamp()."""
+    newest = 0
+    for c in ["processing_core", "processing_render", "processing_input", "processing_glfw"]:
+        d = fork / "crates" / c
+        for f in [d / "Cargo.toml"] + sorted((d / "src").rglob("*")):
+            if f.is_file():
+                newest = max(newest, int(f.stat().st_mtime))
+    return newest
+
+
 def build(renderer: str, upstream: bool = False):
     plat = platform_dir()
-    out = ROOT / "cache" / plat / renderer
+    fork = local_fork() if renderer == "libprocessing" and not upstream else None
+    # a cache built against your own libprocessing checkout is for your IDE
+    # only: it goes in libprocessing-fork, which releases leave out
+    out = ROOT / "cache" / plat / (renderer + ("-fork" if fork else ""))
     # kept between runs, so after an engine change only the engine recompiles
     work = Path(os.environ.get("RUSTMODE_CACHE_WORK", Path.home() / ".cache" / "rustmode-cache")) / plat / (renderer + ("-upstream" if upstream else ""))
     (work / "src").mkdir(parents=True, exist_ok=True)
     feature = '\n[features]\ndefault = ["processing/libprocessing"]\n' if renderer == "libprocessing" else ""
     patch = ""
-    # --upstream: the libprocessing commit pinned in Cargo.toml, what users
-    # get, even when there's a checkout of your own (releases use this)
-    fork = local_fork() if renderer == "libprocessing" and not upstream else None
+    # (--upstream: the libprocessing commit pinned in Cargo.toml, what users
+    # get, even when there's a checkout of your own; releases use this)
+    fork_newest = fork_stamp(fork) if fork else None
     if fork:
         patch = '\n[patch."https://github.com/processing/libprocessing"]\n' + "".join(
             f'{c} = {{ path = "{(fork / "crates" / c).as_posix()}" }}\n'
@@ -171,6 +186,9 @@ incremental = false
         "platform": plat,
         "link_search": search,
         "libprocessing": (str(fork) if fork else "pinned") if renderer == "libprocessing" else None,
+        # the newest file in the checkout's crates when this was built: the
+        # IDE skips the cache once anything there is newer
+        "fork_newest": fork_newest,
         "edition": "2021",
         "opt_level": "1",
     }
