@@ -3,14 +3,11 @@ name: build-cache
 # Precompiles the engine (and every crate it uses) for each platform and
 # renderer, into cache/<platform>/<renderer>/. With it, RustMode builds a
 # sketch with one rustc call instead of compiling everything first.
-# release.yml runs it when a release is published and adds the results to
-# the release's zip; scripts/create-release.py can also run it by hand.
+# scripts/create-release.py --ci runs it and downloads the results into
+# cache/ before zipping a release.
 
 on:
   workflow_dispatch:
-  # release.yml runs this for every published release and puts the results
-  # into the release's zip
-  workflow_call:
 
 jobs:
   cache:

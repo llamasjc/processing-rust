@@ -151,20 +151,18 @@ libprocessing ones.
 ```sh
 scripts/build-cache.py              # this machine, CPU renderer
 scripts/build-cache.py all          # CPU and libprocessing (the second takes a while, once)
-scripts/create-release.py 0.3.0 --publish   # release v0.3.0; CI adds every platform's cache
-scripts/create-release.py 0.3.0     # or: every platform's cache downloaded here, then a zip
+scripts/create-release.py 0.3.0     # a release zip with this machine's caches, one command
 ```
 
-Releasing: push the commit, then `scripts/create-release.py <version>
---publish` (needs `gh`, logged in). It zips the mode without caches and
-publishes it as release `v<version>`. Publishing starts
-`.github/workflows/release.yml`, which runs `build-cache.yml` on Linux,
-macOS (Intel and Apple Silicon) and Windows for both renderers, then puts
-every cache into that zip on the release, replacing it. That takes about an
-hour; the run's summary lists which platforms got a cache. One that failed
-just has none (sketches there build with cargo); fix it and run the release
-workflow again from the Actions tab with the tag. The caches' libprocessing
-is the commit pinned in `Cargo.toml`, the same one users get.
+`scripts/create-release.py <version>` makes `RustMode-<version>.zip` next
+to the RustMode folder, nothing pushed. It builds this machine's caches only
+if they're missing or out of date (with no engine change it skips them),
+against the libprocessing commit pinned in `Cargo.toml`, what users get,
+even when `~/lp-fork` is there. Then it bumps the version, builds the jar and
+zips the mode. Caches for other platforms already in `cache/` go in too if
+they match the engine. Platforms without one build sketches with cargo the
+first time. `--ci` also fetches every platform's cache from the
+`build-cache` workflow on GitHub first, once the code is there.
 
 The cache is tied to the exact Rust version in `rust-toolchain.toml` and to
 the engine sources it was built from. RustMode fetches that Rust version with

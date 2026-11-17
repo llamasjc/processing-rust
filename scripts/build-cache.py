@@ -8,6 +8,8 @@ of building the engine and all its crates first.
     scripts/build-cache.py libprocessing
     scripts/build-cache.py all          both
     scripts/build-cache.py all --bg     both, in the background
+    scripts/build-cache.py all --upstream   with the pinned libprocessing, even
+                                          when ~/lp-fork is there (releases)
 
 --bg detaches from the terminal (its own session, so closing the terminal,
 Ctrl-C or Processing can't stop it) and logs to
@@ -71,15 +73,17 @@ def local_fork():
     return None
 
 
-def build(renderer: str):
+def build(renderer: str, upstream: bool = False):
     plat = platform_dir()
     out = ROOT / "cache" / plat / renderer
     # kept between runs, so after an engine change only the engine recompiles
-    work = Path(os.environ.get("RUSTMODE_CACHE_WORK", Path.home() / ".cache" / "rustmode-cache")) / plat / renderer
+    work = Path(os.environ.get("RUSTMODE_CACHE_WORK", Path.home() / ".cache" / "rustmode-cache")) / plat / (renderer + ("-upstream" if upstream else ""))
     (work / "src").mkdir(parents=True, exist_ok=True)
     feature = '\n[features]\ndefault = ["processing/libprocessing"]\n' if renderer == "libprocessing" else ""
     patch = ""
-    fork = local_fork() if renderer == "libprocessing" else None
+    # --upstream: the libprocessing commit pinned in Cargo.toml, what users
+    # get, even when there's a checkout of your own (releases use this)
+    fork = local_fork() if renderer == "libprocessing" and not upstream else None
     if fork:
         patch = '\n[patch."https://github.com/processing/libprocessing"]\n' + "".join(
             f'{c} = {{ path = "{(fork / "crates" / c).as_posix()}" }}\n'
@@ -160,6 +164,7 @@ incremental = false
         "renderer": renderer,
         "platform": plat,
         "link_search": search,
+        "libprocessing": (str(fork) if fork else "pinned") if renderer == "libprocessing" else None,
         "edition": "2021",
         "opt_level": "1",
     }
@@ -202,7 +207,7 @@ if __name__ == "__main__":
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if "--bg" in flags:
-        background(args)
+        background(args + [f for f in flags if f == "--upstream"])
         sys.exit(0)
     what = args[0] if args else "cpu"
     todo = ["cpu", "libprocessing"] if what == "all" else [what]
@@ -211,7 +216,7 @@ if __name__ == "__main__":
             sys.exit(f"unknown renderer {r}: use cpu, libprocessing or all")
     try:
         for r in todo:
-            build(r)
+            build(r, upstream="--upstream" in flags)
         if "--fg-from-bg" in flags:
             notify(f"Engine cache ready: {', '.join(todo)}")
     except SystemExit as e:

@@ -1,63 +1,90 @@
 #!/usr/bin/env python3
 """
-Makes a RustMode release zip with the precompiled engine for every platform.
+Makes RustMode-<version>.zip, ready to upload as a release, next to the
+RustMode folder. One command, nothing pushed:
 
-    scripts/create-release.py 1.2.0 --publish   the usual way (see below)
-    scripts/create-release.py [version]         everything here, then upload by hand
-    scripts/create-release.py [version] --local zip what's in cache/ now
+    scripts/create-release.py 1.2.0
 
---publish: builds the jar, zips the mode folder (with no caches, so it's
-quick) as RustMode-<version>.zip and publishes it as GitHub release
-v<version>. Publishing starts .github/workflows/release.yml, which builds
-the precompiled engine on Linux, macOS (Intel and Apple Silicon) and
-Windows, for CPU and libprocessing, and puts every one into that zip on the
-release. Push the commit first and run this from a clean checkout of it:
-the caches are built from the tag, and RustMode only uses a cache built
-from the same engine sources as the mode in the zip.
+1. Precompiled engine for this machine's platform (cache/<platform>/cpu and
+   .../libprocessing), built only if it's missing or out of date: after an
+   engine change only the engine recompiles, and with no change it's
+   skipped. libprocessing is the commit pinned in Cargo.toml, what users
+   get, even when ~/lp-fork is there.
+2. Bumps the version in mode.properties.
+3. Builds the mode jar (gradle jar).
+4. Zips the mode folder. Caches for other platforms that are already in
+   cache/ go in too if they match the engine; stale ones are left out.
 
-Without --publish:
-1. Runs the build-cache workflow on GitHub and waits for it.
-2. Downloads each platform's cache into cache/<platform>/<renderer>/.
-3. Builds the mode jar and zips the mode folder as RustMode[-version].zip
-   next to the RustMode folder.
---local skips 1 and 2 and zips whatever is in cache/ now (for example a
-cache you built yourself with build-cache.py).
+On platforms without a cache in the zip, sketches build with cargo the
+first time (slower, then fast). Caches for the other platforms can come
+from the build-cache workflow on GitHub later: --ci runs it and downloads
+them into cache/ before zipping (needs the code on GitHub and gh logged in).
 
-Needs the GitHub CLI (gh), logged in. The repository is RUSTMODE_REPO, or
-else the one gh finds for this folder (its git remote).
+    --skip-cache   zip what's in cache/ now, build nothing
+    --ci           also fetch every platform's cache from GitHub first
 """
-import json, os, shutil, subprocess, sys, tempfile, time, zipfile, datetime
+import importlib.util, json, os, shutil, subprocess, sys, tempfile, time, zipfile, datetime
 from pathlib import Path
 
-def find_repo():
-    if os.environ.get("RUSTMODE_REPO"):
-        return os.environ["RUSTMODE_REPO"]
-    r = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-                       cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True)
-    return r.stdout.strip() or None
-
-
-REPO = find_repo()
 ROOT = Path(__file__).resolve().parent.parent
-WORKFLOW = "build-cache.yml"
-PLATFORMS = ["linux-x86-64", "macos-x86-64", "macos-arm64", "windows-x86-64"]
+PLATFORMS = ["linux-x86-64", "linux-arm64", "macos-x86-64", "macos-arm64", "windows-x86-64"]
 RENDERERS = ["cpu", "libprocessing"]
-SKIP_DIRS = {".git", ".github", "target", "build", ".gradle"}
+SKIP_DIRS = {".git", ".github", "target", "build", ".gradle", "__pycache__"}
+WORKFLOW = "build-cache.yml"
+
+_spec = importlib.util.spec_from_file_location("build_cache", ROOT / "scripts" / "build-cache.py")
+bc = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(bc)
+
+
+def cache_ok(plat, rend):
+    """A cache RustMode would use: same engine sources and Rust version."""
+    meta = ROOT / "cache" / plat / rend / "cache.json"
+    if not meta.is_file():
+        return False
+    try:
+        m = json.loads(meta.read_text())
+    except ValueError:
+        return False
+    if m.get("engine_hash") != bc.engine_hash(ROOT):
+        return False
+    if m.get("rustc") != bc.toolchain() and not str(m.get("rustc", "")).startswith(bc.toolchain()):
+        return False
+    return True
+
+
+def local_caches():
+    plat = bc.platform_dir()
+    for rend in RENDERERS:
+        meta = ROOT / "cache" / plat / rend / "cache.json"
+        pinned = rend == "cpu" or (meta.is_file() and json.loads(meta.read_text()).get("libprocessing") == "pinned")
+        if cache_ok(plat, rend) and pinned:
+            print(f"{plat}/{rend}: up to date")
+            continue
+        print(f"{plat}/{rend}: building (the first time takes a while; later only the engine recompiles)")
+        t = time.time()
+        r = subprocess.run([sys.executable, str(ROOT / "scripts" / "build-cache.py"), rend, "--upstream"])
+        if r.returncode != 0:
+            sys.exit(f"{plat}/{rend}: the cache build failed")
+        print(f"{plat}/{rend}: done in {int(time.time() - t) // 60} min")
 
 
 def gh(*args):
     return subprocess.run(["gh", *args], capture_output=True, text=True)
 
 
-def run_workflow():
+def ci_caches():
+    repo = os.environ.get("RUSTMODE_REPO") or gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").stdout.strip()
+    if not repo:
+        sys.exit("--ci: no GitHub repository (set RUSTMODE_REPO=owner/RustMode or add the git remote)")
     start = time.time()
-    r = gh("workflow", "run", WORKFLOW, "--repo", REPO)
+    r = gh("workflow", "run", WORKFLOW, "--repo", repo)
     if r.returncode != 0:
         sys.exit(f"couldn't start {WORKFLOW}: {r.stderr.strip()}")
     run_id = None
     for _ in range(24):
         time.sleep(5)
-        r = gh("run", "list", "--repo", REPO, "--workflow", WORKFLOW, "--limit", "5", "--json", "databaseId,createdAt")
+        r = gh("run", "list", "--repo", repo, "--workflow", WORKFLOW, "--limit", "5", "--json", "databaseId,createdAt")
         for run in json.loads(r.stdout or "[]"):
             created = datetime.datetime.fromisoformat(run["createdAt"].replace("Z", "+00:00")).timestamp()
             if created >= start - 10:
@@ -67,38 +94,24 @@ def run_workflow():
             break
     if not run_id:
         sys.exit("couldn't find the workflow run")
-    print(f"{WORKFLOW}: run {run_id}")
+    print(f"{WORKFLOW}: run {run_id}, checking every 30s")
     while True:
-        r = gh("run", "view", str(run_id), "--repo", REPO, "--json", "status,conclusion")
-        if r.returncode == 0:
-            d = json.loads(r.stdout)
-            if d["status"] == "completed":
-                print(f"{WORKFLOW}: {d['conclusion']}")
-                return run_id
-            print(f"{WORKFLOW}: {d['status']}, checking again in 30s")
+        d = json.loads(gh("run", "view", str(run_id), "--repo", repo, "--json", "status,conclusion").stdout or "{}")
+        if d.get("status") == "completed":
+            print(f"{WORKFLOW}: {d.get('conclusion')}")
+            break
         time.sleep(30)
-
-
-def download(run_id):
     for plat in PLATFORMS:
         for rend in RENDERERS:
             name = f"cache-{plat}-{rend}"
-            dest = ROOT / "cache" / plat / rend
             with tempfile.TemporaryDirectory() as tmp:
-                r = gh("run", "download", str(run_id), "--repo", REPO, "--name", name, "--dir", tmp)
-                if r.returncode != 0:
-                    print(f"  {name}: not there ({r.stderr.strip()[:80]}), keeping what's in cache/")
+                if gh("run", "download", str(run_id), "--repo", repo, "--name", name, "--dir", tmp).returncode != 0:
                     continue
+                dest = ROOT / "cache" / plat / rend
                 if dest.exists():
                     shutil.rmtree(dest)
                 shutil.copytree(tmp, dest)
-                print(f"  {name}: ok")
-
-
-def build_jar():
-    r = subprocess.run(["gradle", "jar", "-q"], cwd=ROOT)
-    if r.returncode != 0:
-        sys.exit("gradle jar failed")
+                print(f"  {name}: downloaded")
 
 
 def bump(version):
@@ -116,9 +129,17 @@ def bump(version):
             line = f"prettyVersion={version}"
         out.append(line)
     p.write_text("\n".join(out) + "\n")
+    print(f"mode.properties: prettyVersion={version}")
 
 
-def make_zip(version, with_cache=True):
+def build_jar():
+    r = subprocess.run(["gradle", "jar", "-q"], cwd=ROOT)
+    if r.returncode != 0:
+        sys.exit("gradle jar failed")
+
+
+def make_zip(version):
+    good = {(p, r) for p in PLATFORMS for r in RENDERERS if cache_ok(p, r)}
     name = f"RustMode-{version}.zip" if version else "RustMode.zip"
     path = ROOT.parent / name
     if path.exists():
@@ -127,7 +148,13 @@ def make_zip(version, with_cache=True):
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         for dirpath, dirs, files in os.walk(ROOT):
             rel = Path(dirpath).relative_to(ROOT)
-            dirs[:] = [d for d in dirs if not (rel == Path(".") and (d in SKIP_DIRS or (d == "cache" and not with_cache)))]
+            if rel == Path("."):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            # cache/<platform>/<renderer>: only the ones RustMode would use
+            parts = rel.parts
+            if len(parts) == 2 and parts[0] == "cache":
+                dirs[:] = [d for d in dirs if (parts[1], d) in good]
             for f in files:
                 full = Path(dirpath) / f
                 if f.endswith((".log", ".bak")) or f.startswith("hs_err_pid"):
@@ -136,43 +163,19 @@ def make_zip(version, with_cache=True):
                 n += 1
     print(f"\n{path}  ({path.stat().st_size // (1024 * 1024)} MB, {n} files)")
     for plat in PLATFORMS:
-        have = [r for r in RENDERERS if (ROOT / "cache" / plat / r / "cache.json").exists()]
-        print(f"  {plat}: {', '.join(have) if have else 'no cache (cargo builds there)'}")
+        have = [r for r in RENDERERS if (plat, r) in good]
+        print(f"  {plat}: {', '.join(have) if have else 'no cache (sketches build with cargo the first time)'}")
     return path
-
-
-def publish(version, zip_path):
-    tag = f"v{version}"
-    r = gh("release", "create", tag, str(zip_path), "--repo", REPO, "--title", f"RustMode {version}",
-           "--generate-notes", "--target", subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
-                                                          capture_output=True, text=True).stdout.strip())
-    if r.returncode != 0:
-        sys.exit(f"couldn't publish {tag}: {r.stderr.strip()}")
-    print(f"published {tag}: {r.stdout.strip()}")
-    print("the release workflow is now adding every platform's cache to the zip (about an hour);")
-    print(f"watch it with: gh run watch --repo {REPO} $(gh run list --repo {REPO} --workflow release.yml --limit 1 --json databaseId -q '.[0].databaseId')")
 
 
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     version = args[0] if args else None
-    publishing = "--publish" in sys.argv
-    if (publishing or "--local" not in sys.argv) and not REPO:
-        sys.exit("no GitHub repository: set RUSTMODE_REPO=owner/RustMode, or add the git remote")
-    if publishing and not version:
-        sys.exit("--publish needs a version: scripts/create-release.py 1.2.0 --publish")
-    if publishing:
-        changed = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no", "--", "src", "Cargo.toml",
-                                  "Cargo.lock", "build.rs"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
-        if changed:
-            sys.exit("the engine has uncommitted changes; commit and push them first, "
-                     "since the release's caches are built from what's on GitHub")
+    if "--ci" in sys.argv:
+        ci_caches()
+    if "--skip-cache" not in sys.argv:
+        local_caches()
     if version:
         bump(version)
-    if "--local" not in sys.argv and not publishing:
-        download(run_workflow())
     build_jar()
-    # published zips get their caches from the release workflow
-    path = make_zip(version, with_cache=not publishing)
-    if publishing:
-        publish(version, path)
+    make_zip(version)
