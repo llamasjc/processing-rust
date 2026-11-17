@@ -109,7 +109,13 @@ incremental = false
     shutil.copy(ROOT / "Cargo.lock", work / "Cargo.lock")
 
     tc = os.environ.get("RUSTUP_TOOLCHAIN") or toolchain()
-    env = dict(os.environ, RUSTUP_TOOLCHAIN=tc, CARGO_TARGET_DIR=str(work / "target"))
+    # One target folder for every cache build on this platform: CPU,
+    # libprocessing, your fork and the pinned commit. Cargo keeps each
+    # crate's build there and reuses it whenever the crate, its features and
+    # the settings are the same, so Bevy and the other big crates compile
+    # once and every later build only compiles what changed.
+    target = work.parent / "target"
+    env = dict(os.environ, RUSTUP_TOOLCHAIN=tc, CARGO_TARGET_DIR=str(target))
     # the engine's build.rs checks the same checkout for what it supports
     env["LIBPROCESSING_DIR"] = str(fork) if fork else ""
     print(f"Platform: {plat}  renderer: {renderer}  Rust: {tc}" + (f"  libprocessing: {fork}" if fork else ""))
@@ -135,7 +141,7 @@ incremental = false
         elif m.get("reason") == "build-script-executed":
             for lp in m["linked_paths"]:
                 kind, _, path = lp.rpartition("=")
-                if str(work) in path:
+                if str(target) in path:
                     # a C library a crate built for itself: copy the static libraries
                     for a in Path(path).glob("*"):
                         if a.suffix in (".a", ".lib"):

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
 Makes RustMode-<version>.zip, ready to upload as a release, next to the
-RustMode folder. One command, nothing pushed:
+RustMode folder. One command, nothing pushed, nothing changed in the repo:
 
-    scripts/create-release.py 1.2.0
+    scripts/create-release.py
+
+The version is prettyVersion in mode.properties (0.1.0); change it there
+when you want a new one.
 
 1. Precompiled engine for this machine's platform (cache/<platform>/cpu and
-   .../libprocessing), built only if it's missing or out of date: after an
-   engine change only the engine recompiles, and with no change it's
-   skipped. libprocessing is the commit pinned in Cargo.toml, what users
-   get, even when ~/lp-fork is there.
-2. Bumps the version in mode.properties.
-3. Builds the mode jar (gradle jar).
-4. Zips the mode folder. Caches for other platforms that are already in
+   .../libprocessing), built only if it's missing or out of date. Builds
+   share one target folder (see build-cache.py), so Bevy compiles once and
+   later builds only redo what changed. libprocessing is the commit pinned
+   in Cargo.toml, what users get, even when ~/lp-fork is there.
+2. Builds the mode jar (gradle jar).
+3. Zips the mode folder. Caches for other platforms that are already in
    cache/ go in too if they match the engine; stale ones are left out.
 
 On platforms without a cache in the zip, sketches build with cargo the
@@ -114,22 +116,12 @@ def ci_caches():
                 print(f"  {name}: downloaded")
 
 
-def bump(version):
+def mode_version():
     p = ROOT / "mode.properties"
-    if not p.exists():
-        return
-    out = []
-    for line in p.read_text().splitlines():
-        if line.startswith("version="):
-            try:
-                line = f"version={int(line.split('=', 1)[1]) + 1}"
-            except ValueError:
-                pass
-        elif line.startswith("prettyVersion="):
-            line = f"prettyVersion={version}"
-        out.append(line)
-    p.write_text("\n".join(out) + "\n")
-    print(f"mode.properties: prettyVersion={version}")
+    for line in p.read_text().splitlines() if p.exists() else []:
+        if line.startswith("prettyVersion="):
+            return line.split("=", 1)[1].strip()
+    return None
 
 
 def build_jar():
@@ -169,13 +161,11 @@ def make_zip(version):
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    version = args[0] if args else None
+    version = mode_version()
     if "--ci" in sys.argv:
         ci_caches()
     if "--skip-cache" not in sys.argv:
         local_caches()
-    if version:
-        bump(version)
+    print(f"RustMode {version or '(no prettyVersion in mode.properties)'}")
     build_jar()
     make_zip(version)

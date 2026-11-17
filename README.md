@@ -151,15 +151,19 @@ libprocessing ones.
 ```sh
 scripts/build-cache.py              # this machine, CPU renderer
 scripts/build-cache.py all          # CPU and libprocessing (the second takes a while, once)
-scripts/create-release.py 0.3.0     # a release zip with this machine's caches, one command
+scripts/create-release.py           # RustMode-0.1.0.zip with this machine's caches, one command
 ```
 
-`scripts/create-release.py <version>` makes `RustMode-<version>.zip` next
-to the RustMode folder, nothing pushed. It builds this machine's caches only
-if they're missing or out of date (with no engine change it skips them),
-against the libprocessing commit pinned in `Cargo.toml`, what users get,
-even when `~/lp-fork` is there. Then it bumps the version, builds the jar and
-zips the mode. Caches for other platforms already in `cache/` go in too if
+`scripts/create-release.py` makes `RustMode-<version>.zip` next to the
+RustMode folder (the version is `prettyVersion` in `mode.properties`),
+nothing pushed or changed. It builds this machine's caches only if they're
+missing or out of date, against the libprocessing commit pinned in
+`Cargo.toml`, what users get, even when `~/lp-fork` is there. Every cache
+build shares one target folder (`~/.cache/rustmode-cache/<platform>/target`),
+so Bevy compiles once: after that an engine change rebuilds just the engine
+(about 20 s), and switching between your fork and the pinned libprocessing
+rebuilds just libprocessing's own crates (about 2 minutes). Then it builds
+the jar and zips the mode. Caches for other platforms already in `cache/` go in too if
 they match the engine. Platforms without one build sketches with cargo the
 first time. `--ci` also fetches every platform's cache from the
 `build-cache` workflow on GitHub first, once the code is there.
