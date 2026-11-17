@@ -3,12 +3,14 @@ name: build-cache
 # Precompiles the engine (and every crate it uses) for each platform and
 # renderer, into cache/<platform>/<renderer>/. With it, RustMode builds a
 # sketch with one rustc call instead of compiling everything first.
-# scripts/create-release.py runs this and puts the results into the release.
+# release.yml runs it when a release is published and adds the results to
+# the release's zip; scripts/create-release.py can also run it by hand.
 
 on:
   workflow_dispatch:
-  push:
-    tags: ['v*']
+  # release.yml runs this for every published release and puts the results
+  # into the release's zip
+  workflow_call:
 
 jobs:
   cache:
@@ -17,11 +19,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-13, macos-latest, windows-latest]
+        os: [ubuntu-22.04, macos-15-intel, macos-latest, windows-latest]
         renderer: [cpu, libprocessing]
         include:
           - { os: ubuntu-22.04,   platform: linux-x86-64 }
-          - { os: macos-13,       platform: macos-x86-64 }
+          - { os: macos-15-intel, platform: macos-x86-64 }
           - { os: macos-latest,   platform: macos-arm64 }
           - { os: windows-latest, platform: windows-x86-64 }
     # libprocessing on Windows still needs GLFW sorted out; don't hold up the rest

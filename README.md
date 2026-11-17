@@ -151,8 +151,20 @@ libprocessing ones.
 ```sh
 scripts/build-cache.py              # this machine, CPU renderer
 scripts/build-cache.py all          # CPU and libprocessing (the second takes a while, once)
-scripts/create-release.py 0.3.0     # every platform via the build-cache workflow, then a zip
+scripts/create-release.py 0.3.0 --publish   # release v0.3.0; CI adds every platform's cache
+scripts/create-release.py 0.3.0     # or: every platform's cache downloaded here, then a zip
 ```
+
+Releasing: push the commit, then `scripts/create-release.py <version>
+--publish` (needs `gh`, logged in). It zips the mode without caches and
+publishes it as release `v<version>`. Publishing starts
+`.github/workflows/release.yml`, which runs `build-cache.yml` on Linux,
+macOS (Intel and Apple Silicon) and Windows for both renderers, then puts
+every cache into that zip on the release, replacing it. That takes about an
+hour; the run's summary lists which platforms got a cache. One that failed
+just has none (sketches there build with cargo); fix it and run the release
+workflow again from the Actions tab with the tag. The caches' libprocessing
+is the commit pinned in `Cargo.toml`, the same one users get.
 
 The cache is tied to the exact Rust version in `rust-toolchain.toml` and to
 the engine sources it was built from. RustMode fetches that Rust version with

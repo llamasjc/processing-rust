@@ -1,74 +1,97 @@
 name: release
 
+# Publish a release with the mode zip attached (scripts/create-release.py
+# <version> --publish does both), and this adds the precompiled engine for
+# every platform and renderer to that zip:
+#
+#   1. build-cache.yml builds cache/<platform>/<renderer>/ on Linux, macOS
+#      (Intel and Apple Silicon) and Windows, for CPU and libprocessing.
+#   2. The zip attached to the release is downloaded, each cache is put in
+#      RustMode/cache/<platform>/<renderer>/, and the zip is uploaded again
+#      in its place.
+#
+# The caches are built from the release's tag, so the zip must come from
+# that same commit: RustMode only uses a cache whose engine sources match
+# its own (engine_hash in cache.json), and builds with cargo otherwise.
+# A platform whose build failed just has no cache in the zip; sketches still
+# build there, the slow way. Run it again by hand from the Actions tab
+# (release tag as input) after fixing it.
+
 on:
-  push:
-    tags: ['v*']
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to add the caches to (e.g. v1.2.0)
+        required: true
+
+permissions:
+  contents: write
 
 jobs:
-  # ── Build the mode jar (once, on Linux) ──────────────────────────────────
-  jar:
+  cache:
+    uses: ./.github/workflows/build-cache.yml
+
+  add-caches:
+    needs: cache
+    # whatever finished goes in, even when one platform failed
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: 17 }
-      - name: Download Processing jars
-        run: |
-          curl -sL https://github.com/processing/processing4/releases/download/processing-1294-4.3/processing-4.3-linux-x64.tgz \
-            | tar xz --strip-components=1 -C /tmp processing-4.3/core/library/core.jar \
-                                                     processing-4.3/lib/app.jar 2>/dev/null || true
-          # fallback: build from source is too slow; use pre-downloaded jars from cache
-          ls /tmp/core.jar /tmp/app.jar 2>/dev/null || \
-            echo "WARNING: processing jars not found, jar build may fail"
-      - name: Build jar
-        run: gradle jar
-      - uses: actions/upload-artifact@v4
+      - name: Download the caches
+        uses: actions/download-artifact@v5
         with:
-          name: RustMode-jar
-          path: mode/RustMode.jar
+          pattern: cache-*
+          path: caches
 
-  # ── Assemble per-platform zips and release ────────────────────────────────
-  release:
-    needs: [jar]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
-
-      - name: Assemble platform zips
+      - name: Download the release zip
         run: |
-          for platform in linux-x86-64 macos-x86-64 macos-arm64 windows-x86-64; do
-            mkdir -p dist/RustMode/mode
-            mkdir -p dist/RustMode/lib/$platform
+          mkdir -p zips
+          # a zip uploaded just after publishing gets a few minutes to arrive
+          for i in $(seq 1 10); do
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'RustMode*.zip' --dir zips --clobber 2>/dev/null && break
+            echo "no RustMode zip on $TAG yet, checking again in 30s"; sleep 30
+          done
+          ls zips/RustMode*.zip >/dev/null 2>&1 || { echo "::error::$TAG has no RustMode*.zip attached (scripts/create-release.py <version> --publish makes and attaches one)"; exit 1; }
+          ls -l zips
 
-            cp artifacts/RustMode-jar/RustMode.jar dist/RustMode/mode/
-            cp mode.properties dist/RustMode/
-            cp keywords.txt dist/RustMode/
-
-            # Native libs for this platform
-            if [ -d "lib/$platform" ]; then
-              cp lib/$platform/* dist/RustMode/lib/$platform/ 2>/dev/null || true
-            fi
-
-            # The precompiled engine comes from build-cache.yml; see
-            # scripts/create-release.py for a release with every platform's cache.
-
-            cd dist
-            zip -r ../RustMode-$platform.zip RustMode/
-            cd ..
-            rm -rf dist/RustMode
+      - name: Put the caches into the zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          for zip in zips/RustMode*.zip; do
+            rm -rf work && mkdir work
+            unzip -q "$zip" -d work
+            root=$(find work -mindepth 1 -maxdepth 1 -type d | head -1)
+            [ -f "$root/mode.properties" ] || { echo "$zip: no mode.properties at its top folder"; exit 1; }
+            for dir in caches/cache-*; do
+              name=${dir#caches/cache-}            # e.g. linux-x86-64-libprocessing
+              renderer=${name##*-}
+              platform=${name%-*}
+              [ -f "$dir/cache.json" ] || { echo "$name: no cache.json, skipped"; continue; }
+              rm -rf "$root/cache/$platform/$renderer"
+              mkdir -p "$root/cache/$platform"
+              cp -r "$dir" "$root/cache/$platform/$renderer"
+              echo "$name: added"
+            done
+            out="$PWD/$(basename "$zip")"
+            rm -f "$out"
+            (cd work && zip -qr -9 "$out" "$(basename "$root")")
+            ls -lh "$out"
+            gh release upload "$TAG" "$out" --repo "$GITHUB_REPOSITORY" --clobber
           done
 
-      - name: Create GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: RustMode-*.zip
-          generate_release_notes: true
+      - name: What the release has now
+        if: always()
+        shell: bash
+        run: |
+          for p in linux-x86-64 macos-x86-64 macos-arm64 windows-x86-64; do
+            have=""
+            for r in cpu libprocessing; do [ -f "caches/cache-$p-$r/cache.json" ] && have="$have $r"; done
+            echo "$p:${have:- no cache (cargo builds there)}"
+          done >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"

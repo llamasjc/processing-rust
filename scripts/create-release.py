@@ -2,22 +2,42 @@
 """
 Makes a RustMode release zip with the precompiled engine for every platform.
 
-    scripts/create-release.py [version]
+    scripts/create-release.py 1.2.0 --publish   the usual way (see below)
+    scripts/create-release.py [version]         everything here, then upload by hand
+    scripts/create-release.py [version] --local zip what's in cache/ now
 
-1. Runs the build-cache workflow on GitHub (Linux, Windows, macOS; CPU and
-   libprocessing) and waits for it.
+--publish: builds the jar, zips the mode folder (with no caches, so it's
+quick) as RustMode-<version>.zip and publishes it as GitHub release
+v<version>. Publishing starts .github/workflows/release.yml, which builds
+the precompiled engine on Linux, macOS (Intel and Apple Silicon) and
+Windows, for CPU and libprocessing, and puts every one into that zip on the
+release. Push the commit first and run this from a clean checkout of it:
+the caches are built from the tag, and RustMode only uses a cache built
+from the same engine sources as the mode in the zip.
+
+Without --publish:
+1. Runs the build-cache workflow on GitHub and waits for it.
 2. Downloads each platform's cache into cache/<platform>/<renderer>/.
 3. Builds the mode jar and zips the mode folder as RustMode[-version].zip
    next to the RustMode folder.
+--local skips 1 and 2 and zips whatever is in cache/ now (for example a
+cache you built yourself with build-cache.py).
 
-Needs the GitHub CLI (gh), logged in. Nothing is pushed: the workflow runs
-on what is already on GitHub. --local skips GitHub and zips whatever is in
-cache/ now (for example a cache you built yourself with build-cache.py).
+Needs the GitHub CLI (gh), logged in. The repository is RUSTMODE_REPO, or
+else the one gh finds for this folder (its git remote).
 """
 import json, os, shutil, subprocess, sys, tempfile, time, zipfile, datetime
 from pathlib import Path
 
-REPO = os.environ.get("RUSTMODE_REPO", "pepc84/RustMode")
+def find_repo():
+    if os.environ.get("RUSTMODE_REPO"):
+        return os.environ["RUSTMODE_REPO"]
+    r = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+                       cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True)
+    return r.stdout.strip() or None
+
+
+REPO = find_repo()
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = "build-cache.yml"
 PLATFORMS = ["linux-x86-64", "macos-x86-64", "macos-arm64", "windows-x86-64"]
@@ -98,7 +118,7 @@ def bump(version):
     p.write_text("\n".join(out) + "\n")
 
 
-def make_zip(version):
+def make_zip(version, with_cache=True):
     name = f"RustMode-{version}.zip" if version else "RustMode.zip"
     path = ROOT.parent / name
     if path.exists():
@@ -107,7 +127,7 @@ def make_zip(version):
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         for dirpath, dirs, files in os.walk(ROOT):
             rel = Path(dirpath).relative_to(ROOT)
-            dirs[:] = [d for d in dirs if not (rel == Path(".") and d in SKIP_DIRS)]
+            dirs[:] = [d for d in dirs if not (rel == Path(".") and (d in SKIP_DIRS or (d == "cache" and not with_cache)))]
             for f in files:
                 full = Path(dirpath) / f
                 if f.endswith((".log", ".bak")) or f.startswith("hs_err_pid"):
@@ -118,14 +138,41 @@ def make_zip(version):
     for plat in PLATFORMS:
         have = [r for r in RENDERERS if (ROOT / "cache" / plat / r / "cache.json").exists()]
         print(f"  {plat}: {', '.join(have) if have else 'no cache (cargo builds there)'}")
+    return path
+
+
+def publish(version, zip_path):
+    tag = f"v{version}"
+    r = gh("release", "create", tag, str(zip_path), "--repo", REPO, "--title", f"RustMode {version}",
+           "--generate-notes", "--target", subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
+                                                          capture_output=True, text=True).stdout.strip())
+    if r.returncode != 0:
+        sys.exit(f"couldn't publish {tag}: {r.stderr.strip()}")
+    print(f"published {tag}: {r.stdout.strip()}")
+    print("the release workflow is now adding every platform's cache to the zip (about an hour);")
+    print(f"watch it with: gh run watch --repo {REPO} $(gh run list --repo {REPO} --workflow release.yml --limit 1 --json databaseId -q '.[0].databaseId')")
 
 
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     version = args[0] if args else None
+    publishing = "--publish" in sys.argv
+    if (publishing or "--local" not in sys.argv) and not REPO:
+        sys.exit("no GitHub repository: set RUSTMODE_REPO=owner/RustMode, or add the git remote")
+    if publishing and not version:
+        sys.exit("--publish needs a version: scripts/create-release.py 1.2.0 --publish")
+    if publishing:
+        changed = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no", "--", "src", "Cargo.toml",
+                                  "Cargo.lock", "build.rs"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        if changed:
+            sys.exit("the engine has uncommitted changes; commit and push them first, "
+                     "since the release's caches are built from what's on GitHub")
     if version:
         bump(version)
-    if "--local" not in sys.argv:
+    if "--local" not in sys.argv and not publishing:
         download(run_workflow())
     build_jar()
-    make_zip(version)
+    # published zips get their caches from the release workflow
+    path = make_zip(version, with_cache=not publishing)
+    if publishing:
+        publish(version, path)
