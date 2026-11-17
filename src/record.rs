@@ -156,7 +156,6 @@ pub(crate) fn screen_path(pts: &[(f32, f32)], closed: bool, fill: Option<Color>,
 
 // begin_shape ... end_shape, followed alongside the renderer
 pub(crate) fn shape_begin(kind: u8) { if let Some(r) = REC.lock().as_mut() { r.shape = Some((kind, Vec::new(), Vec::new())); r.shape_z.clear(); } }
-pub(crate) fn shape_vertex(x: f32, y: f32) { shape_vertex_z(x, y, 0.0); }
 /// vertex(x, y, z): kept with its depth, and drawn where the camera sees it
 pub(crate) fn shape_vertex_z(x: f32, y: f32, z: f32) {
     if let Some(r) = REC.lock().as_mut() {
