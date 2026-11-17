@@ -11,6 +11,8 @@ parking_lot = "0.12"
 minifb = "0.27"
 # PNG decoding for loadImage()
 png = "0.17"
+# GIF decoding for loadImage() (the first frame)
+gif = "0.14"
 # JPEG decoding for loadImage()
 zune-jpeg = "0.4"
 # TrueType / OpenType text for createFont() and textFont()

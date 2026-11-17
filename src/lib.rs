@@ -2285,15 +2285,19 @@ mod render {
     /// Load a PNG. Returns a 1-based id, or 0 if it couldn't be read.
     pub fn load_image(path: &str) -> u64 {
         let decode = || -> Result<Img, String> {
-            let data = std::fs::read(path).map_err(|e| e.to_string())?;
+            // next to the sketch, or in its data folder, as in Processing
+            let file = std::path::Path::new(path);
+            let file = if file.is_file() { file.to_path_buf() } else { crate::paths::data_file(path) };
+            let data = std::fs::read(&file).map_err(|e| e.to_string())?;
             // by what the file is, not what it is called
             if data.starts_with(&[0xFF, 0xD8]) { decode_jpeg(&data) }
             else if data.starts_with(&[0x89, b'P', b'N', b'G']) { decode_png(&data) }
-            else { Err("not a PNG or JPEG file".into()) }
+            else if data.starts_with(b"GIF8") { decode_gif(&data) }
+            else { Err("not a PNG, JPEG or GIF file".into()) }
         };
         match decode() {
             Ok(img) => { let mut v = images().lock(); v.push(img); v.len() as u64 + IMAGE_BASE - 1 }
-            Err(e)  => { eprintln!("loadImage(\"{}\"): {} (PNG and JPEG are supported)", path, e); 0 }
+            Err(e)  => { eprintln!("loadImage(\"{}\"): {} (PNG, JPEG and GIF are supported)", path, e); 0 }
         }
     }
 
@@ -2317,6 +2321,30 @@ mod render {
                 _ => Color::from_rgba(f(p[0]), f(p[1]), f(p[2]), f(p[3])),
             }
         }).collect();
+        Ok(Img { w, h, px })
+    }
+
+    /// The first frame of a GIF, as Processing shows it.
+    fn decode_gif(data: &[u8]) -> Result<Img, String> {
+        let mut opts = gif::DecodeOptions::new();
+        opts.set_color_output(gif::ColorOutput::RGBA);
+        let mut dec = opts.read_info(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
+        let (w, h) = (dec.width() as usize, dec.height() as usize);
+        if w == 0 || h == 0 { return Err("empty image".into()); }
+        if w * h > MAX_IMAGE_PIXELS { return Err("image is too large".into()); }
+        let frame = dec.read_next_frame().map_err(|e| e.to_string())?.ok_or("no frames")?;
+        // a frame can be smaller than the image and placed inside it
+        let mut px = vec![Color::from_rgba(0.0, 0.0, 0.0, 0.0); w * h];
+        let (fl, ft, fw, fh) = (frame.left as usize, frame.top as usize, frame.width as usize, frame.height as usize);
+        for y in 0..fh {
+            for x in 0..fw {
+                let (dx, dy) = (fl + x, ft + y);
+                if dx >= w || dy >= h { continue; }
+                let p = &frame.buffer[(y * fw + x) * 4..][..4];
+                let f = |v: u8| v as f32 / 255.0;
+                px[dy * w + dx] = Color::from_rgba(f(p[0]), f(p[1]), f(p[2]), f(p[3]));
+            }
+        }
         Ok(Img { w, h, px })
     }
 
