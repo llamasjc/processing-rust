@@ -404,9 +404,6 @@ public class RustBuild {
       File fork = localFork();
       mode.statusMessage("Building for libprocessing" + (fork != null ? " from " + fork : " (pinned upstream)")
         + ". The first build compiles Bevy and takes several minutes.");
-      if (fork == null && !new File(mode.getFolder(), "cache/" + platformDir() + "/libprocessing").isDirectory())
-        mode.statusMessage("RustMode-lite.zip is CPU only. RustMode.zip has libprocessing precompiled:"
-          + " unzip it over this one and restart Processing, and this wait goes away.");
     }
 
     ProcessBuilder pb = new ProcessBuilder(cmd);

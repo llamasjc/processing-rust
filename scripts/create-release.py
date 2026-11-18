@@ -162,22 +162,7 @@ def make_zip(version):
     for plat in PLATFORMS:
         have = [r for r in RENDERERS if (plat, r) in good]
         print(f"  {plat}: {', '.join(have) if have else 'no cache (sketches build with cargo the first time)'}")
-    make_lite(path)
     return path
-
-
-def make_lite(full):
-    """RustMode-lite.zip: the same zip without the libprocessing caches, for
-    people who only want the CPU renderer. RustMode.zip stays a superset, so
-    switching is installing it over the lite one."""
-    lite = full.with_name("RustMode-lite.zip")
-    with zipfile.ZipFile(full) as src, zipfile.ZipFile(lite, "w", zipfile.ZIP_DEFLATED) as out:
-        for info in src.infolist():
-            parts = Path(info.filename).parts
-            if len(parts) > 3 and parts[1] == "cache" and parts[3].startswith("libprocessing"):
-                continue
-            out.writestr(info, src.read(info))
-    print(f"{lite}  ({lite.stat().st_size // (1024 * 1024)} MB, CPU only)")
 
 
 if __name__ == "__main__":
