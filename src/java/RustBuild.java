@@ -374,6 +374,10 @@ public class RustBuild {
   // ── Step 6 – cargo build ────────────────────────────────────────────────────
 
   private File runCargo(File projectDir) throws IOException, InterruptedException {
+    // the first build of the session: Rust, a linker and (for libprocessing)
+    // the dev files are there, or get installed (see RustSetup)
+    RustSetup.ensure(mode, Renderer.libprocessing());
+
     // ── Fast path: one rustc call against the precompiled engine ─────────────
     if (!release) {
       File fast = cachedBuild(projectDir);
@@ -387,7 +391,7 @@ public class RustBuild {
     }
 
     List<String> cmd = new ArrayList<>();
-    cmd.add("cargo");
+    cmd.add(RustSetup.tool("cargo"));
     cmd.add("build");
     if (release) cmd.add("--release");
     cmd.add("--message-format=short");
@@ -403,6 +407,7 @@ public class RustBuild {
     ProcessBuilder pb = new ProcessBuilder(cmd);
     pb.directory(projectDir);
     pb.redirectErrorStream(true);  // merge stderr into stdout
+    RustSetup.prepare(pb.environment(), mode.getFolder());
 
     // Propagate CARGO_HOME / RUSTUP_HOME from the environment; add sccache if
     // available so that the processing crate and minifb are cached across sketches.
@@ -437,6 +442,7 @@ public class RustBuild {
       // Forward all output to the IDE console.
       mode.statusMessage(rewritten);
       if (rewritten.contains("failed to find glfw") || rewritten.contains("glfw3.pc")) missingGlfw = true;
+      if (RustSetup.looksMissing(rewritten)) missingTools = true;
 
       // --message-format=short gives one line per problem:
       //   Sketch.pde:12:5: error[E0308]: mismatched types: ...
@@ -462,6 +468,11 @@ public class RustBuild {
       cargoProc = null;
     }
     if (cancelled) throw new InterruptedException("build cancelled");
+    if (exitCode != 0 && missingTools) {
+      // something to build with isn't installed: offer it, as before the first build
+      RustSetup.recheck(mode, Renderer.libprocessing());
+      throw new CargoException("Something Rust Mode needs to build isn't installed yet (see above). Press Run again once it is.", diagnostics);
+    }
     if (exitCode != 0 && missingGlfw) {
       throw new CargoException(glfwHelp(), diagnostics);
     }
@@ -631,7 +642,10 @@ public class RustBuild {
   /** Runs a short command, returns its output, or null when it can't run. */
   private static String runQuiet(List<String> cmd, java.util.Map<String, String> env) {
     try {
-      ProcessBuilder pb = new ProcessBuilder(cmd).redirectErrorStream(true);
+      List<String> c = new ArrayList<>(cmd);
+      c.set(0, RustSetup.tool(c.get(0)));
+      ProcessBuilder pb = new ProcessBuilder(c).redirectErrorStream(true);
+      RustSetup.prepare(pb.environment(), null);
       if (env != null) pb.environment().putAll(env);
       Process p = pb.start();
       String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
@@ -671,6 +685,7 @@ public class RustBuild {
   }
 
   private boolean missingGlfw;
+  private boolean missingTools;
 
   /**
    * libprocessing needs GLFW 3.4 when a sketch builds without the prebuilt
@@ -740,13 +755,14 @@ public class RustBuild {
     // the cache's exact Rust: through rustup (fetched once), or a matching rustc
     java.util.Map<String, String> env = new java.util.HashMap<>();
     String have = runQuiet(List.of("rustup", "toolchain", "list"), null);
+    String tc = RustSetup.toolchain(version);
     if (have != null) {
-      if (!have.contains(version)) {
+      if (!have.contains(tc)) {
         mode.statusMessage("Getting Rust " + version + " for fast builds (once, a minute or so)...");
-        String got = runQuiet(List.of("rustup", "toolchain", "install", version, "--profile", "minimal"), null);
+        String got = runQuiet(List.of("rustup", "toolchain", "install", tc, "--profile", "minimal"), null);
         if (got == null) { LOG.info("RustMode: couldn't install Rust " + version + "; using cargo"); return null; }
       }
-      env.put("RUSTUP_TOOLCHAIN", version);
+      env.put("RUSTUP_TOOLCHAIN", tc);
     } else {
       String v = runQuiet(List.of("rustc", "-V"), null);
       if (v == null || !v.contains(" " + version + " ")) return null;
@@ -769,9 +785,11 @@ public class RustBuild {
     }
     cmd.add("src/main.rs");
 
+    cmd.set(0, RustSetup.tool(cmd.get(0)));
     ProcessBuilder pb = new ProcessBuilder(cmd);
     pb.directory(projectDir);
     pb.redirectErrorStream(true);
+    RustSetup.prepare(pb.environment(), null);
     pb.environment().putAll(env);
     if (cancelled) throw new InterruptedException("build cancelled");
     Process proc = pb.start();
@@ -811,7 +829,7 @@ public class RustBuild {
   /** Returns true if {@code cargo} is reachable on the current PATH. */
   private static boolean isCargoAvailable() {
     try {
-      Process p = new ProcessBuilder("cargo", "--version")
+      Process p = new ProcessBuilder(RustSetup.tool("cargo"), "--version")
         .redirectErrorStream(true)
         .start();
       p.getInputStream().transferTo(java.io.OutputStream.nullOutputStream());

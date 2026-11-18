@@ -30,6 +30,8 @@ public class RustMode extends Mode {
 
   public RustMode(Base base, File folder) {
     super(base, folder);
+    // macOS: files from a downloaded zip are quarantined and won't start
+    RustSetup.clearQuarantine(folder);
     loadNativeTreeSitter();
   }
 

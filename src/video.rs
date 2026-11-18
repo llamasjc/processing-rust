@@ -20,7 +20,12 @@ use std::time::{Duration, Instant};
 static WARNED: AtomicBool = AtomicBool::new(false);
 fn no_ffmpeg(what: &str, e: impl std::fmt::Display) {
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!("{what}: couldn't start ffmpeg ({e}). Video needs ffmpeg installed and on the PATH.");
+        let how = if cfg!(target_os = "macos") { "brew install ffmpeg" }
+            else if cfg!(windows) { "winget install ffmpeg" }
+            else if std::path::Path::new("/usr/bin/pacman").exists() { "sudo pacman -S ffmpeg" }
+            else if std::path::Path::new("/usr/bin/dnf").exists() { "sudo dnf install ffmpeg" }
+            else { "sudo apt install ffmpeg" };
+        eprintln!("{what}: couldn't start ffmpeg ({e}). Video needs ffmpeg: install it with `{how}`, then run the sketch again.");
     }
 }
 

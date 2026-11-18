@@ -22,7 +22,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04,   platform: linux-x86-64 }
+          - { os: ubuntu-22.04,     platform: linux-x86-64 }
+          - { os: ubuntu-22.04-arm, platform: linux-arm64 }
           - { os: macos-15-intel, platform: macos-x86-64 }
           - { os: macos-latest,   platform: macos-arm64 }
           - { os: windows-latest, platform: windows-x86-64 }
@@ -41,6 +42,9 @@ jobs:
         shell: bash
         run: |
           v=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          # Windows: the windows-gnu toolchain, the one Rust Mode builds sketches
+          # with there (it brings its own linker, so users need no Visual Studio)
+          if [ "$RUNNER_OS" = Windows ]; then v="$v-x86_64-pc-windows-gnu"; fi
           rustup toolchain install "$v" --profile minimal
           echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
 
@@ -92,6 +96,32 @@ jobs:
         run: |
           PY=$(command -v python3 || command -v python)
           "$PY" scripts/build-cache.py cpu
+
+      # Each cache builds a sketch the way RustMode does and runs it, so a
+      # cache that doesn't work on its platform never ships
+      - name: Smoke test (CPU)
+        shell: bash
+        run: |
+          PY=$(command -v python3 || command -v python)
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get install -y -q xvfb
+            xvfb-run -a "$PY" scripts/ci/smoke.py cpu
+          else
+            "$PY" scripts/ci/smoke.py cpu
+          fi
+
+      - name: Smoke test (libprocessing)
+        if: steps.lp.outcome == 'success'
+        shell: bash
+        continue-on-error: true   # GPU drivers on CI machines vary; the result is in the log
+        run: |
+          PY=$(command -v python3 || command -v python)
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get install -y -q xvfb mesa-vulkan-drivers
+            xvfb-run -a "$PY" scripts/ci/smoke.py libprocessing
+          else
+            "$PY" scripts/ci/smoke.py libprocessing
+          fi
 
       # Saved even when a build failed, so the next run starts from what got done
       - name: Save compiled crates
