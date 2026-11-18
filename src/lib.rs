@@ -48,10 +48,24 @@ fn resize_canvas(w: u32, h: u32) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 mod core {
-    #[derive(Debug, Clone, Copy, PartialEq)]
+    /// Default is 0 in Processing's terms: transparent black.
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
     pub struct Color { pub r: f32, pub g: f32, pub b: f32, pub a: f32 }
 
+    impl From<u32> for Color { fn from(p: u32) -> Color { Color::from_u32(p) } }
+
     impl Color {
+        /// A color from Processing's packed 0xAARRGGBB, the form pixels[] and
+        /// load_pixels() use: `let c = Color::from_u32(pixels[i]);`
+        pub fn from_u32(p: u32) -> Self {
+            let f = |s: u32| ((p >> s) & 0xFF) as f32 / 255.0;
+            Self { r: f(16), g: f(8), b: f(0), a: f(24) }
+        }
+        /// Processing's packed 0xAARRGGBB, for pixels[]: `pixels[i] = c.to_argb();`
+        pub fn to_argb(self) -> u32 {
+            let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+            (b(self.a) << 24) | (b(self.r) << 16) | (b(self.g) << 8) | b(self.b)
+        }
         pub fn from_gray(v: f32) -> Self { Self { r: v, g: v, b: v, a: 1.0 } }
         pub fn from_rgb(r: f32, g: f32, b: f32) -> Self { Self { r, g, b, a: 1.0 } }
         pub fn from_rgba(r: f32, g: f32, b: f32, a: f32) -> Self { Self { r, g, b, a } }
@@ -80,9 +94,12 @@ mod core {
         pub fn new(x: f32, y: f32) -> Self { Self { x, y, z: 0.0 } }
         pub fn new3(x: f32, y: f32, z: f32) -> Self { Self { x, y, z } }
         pub fn mag(&self) -> f32 { (self.x*self.x + self.y*self.y + self.z*self.z).sqrt() }
-        pub fn normalize(&mut self) {
+        /// Makes the length 1 and returns the vector, so calls chain as in
+        /// Processing: `v.normalize().mult(2.0)`.
+        pub fn normalize(&mut self) -> &mut Self {
             let m = self.mag();
             if m > 0.0 { self.x /= m; self.y /= m; self.z /= m; }
+            self
         }
     }
 
@@ -1790,7 +1807,46 @@ mod render {
 
     /// Loads a font. Returns its id (1 or more), or 0 if it couldn't be loaded;
     /// text then stays in the built-in font.
+    /// A .vlw font (Processing's own bitmap format): its size and the name of
+    /// the font it was made from, read from the file.
+    fn vlw_info(name: &str) -> Option<(f32, Vec<String>)> {
+        let file = std::path::Path::new(name);
+        let file = if file.is_file() { file.to_path_buf() } else { crate::paths::data_file(name) };
+        let d = std::fs::read(file).ok()?;
+        let int = |o: usize| d.get(o..o + 4).map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+        let (count, version, size) = (int(0)?, int(4)?, int(8)?);
+        if count < 0 || count > 1 << 20 || size <= 0 { return None; }
+        // 6 ints of header, then 7 ints per glyph, then each glyph's bitmap
+        let mut o = 24usize;
+        let mut pix = 0usize;
+        for _ in 0..count {
+            let (h, w) = (int(o + 4)?, int(o + 8)?);
+            pix += (h.max(0) as usize) * (w.max(0) as usize);
+            o += 28;
+        }
+        o += pix;
+        let mut names = Vec::new();
+        if version >= 10 {
+            for _ in 0..2 {
+                let len = d.get(o..o + 2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)?;
+                if let Some(b) = d.get(o + 2..o + 2 + len) { names.push(String::from_utf8_lossy(b).into_owned()); }
+                o += 2 + len;
+            }
+        }
+        Some((size as f32, names))
+    }
+
     pub fn load_font(name: &str, size: f32) -> u64 {
+        // .vlw: drawn with the font it was made from (or a common sans) at its size
+        if name.to_ascii_lowercase().ends_with(".vlw") {
+            let (vsize, names) = vlw_info(name).unwrap_or((12.0, Vec::new()));
+            let size = if size > 0.0 { size } else { vsize };
+            let fallback = ["DejaVu Sans", "Arial", "Helvetica", "Liberation Sans", "Noto Sans", "Segoe UI"];
+            for n in names.iter().map(|s| s.as_str()).chain(fallback) {
+                if find_font(n).is_some() { return load_font(n, size); }
+            }
+            return 0;
+        }
         let load = || -> Result<LoadedFont, String> {
             let path = find_font(name).ok_or("no such file, and no installed font with that name")?;
             let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
@@ -2287,8 +2343,16 @@ mod render {
         let decode = || -> Result<Img, String> {
             // next to the sketch, or in its data folder, as in Processing
             let file = std::path::Path::new(path);
-            let file = if file.is_file() { file.to_path_buf() } else { crate::paths::data_file(path) };
-            let data = std::fs::read(&file).map_err(|e| e.to_string())?;
+            // an address: fetched, as Processing does
+            let data = if path.contains("://") {
+                let out = std::process::Command::new("curl").args(["-fsSL", "--max-time", "30", path]).output()
+                    .map_err(|e| format!("couldn't run curl to fetch it ({e})"))?;
+                if !out.status.success() || out.stdout.is_empty() { return Err("couldn't fetch it".into()); }
+                out.stdout
+            } else {
+                let file = if file.is_file() { file.to_path_buf() } else { crate::paths::data_file(path) };
+                std::fs::read(&file).map_err(|e| e.to_string())?
+            };
             // by what the file is, not what it is called
             if data.starts_with(&[0xFF, 0xD8]) { decode_jpeg(&data) }
             else if data.starts_with(&[0x89, b'P', b'N', b'G']) { decode_png(&data) }
@@ -2610,13 +2674,18 @@ mod render {
     // coordinates when it is loaded, so drawing a shape is as cheap as
     // drawing its polygons.
 
+    #[derive(Clone)]
     struct SvgItem {
         contours: Vec<(Vec<(f32, f32)>, bool)>,   // points, closed?
         fill: Option<Color>,
         stroke: Option<Color>,
         weight: f32,
+        /// ids of the elements it sits in (and its own), for getChild("name")
+        ids: Vec<String>,
+        /// which child of the top group it belongs to, for getChild(i)
+        top: usize,
     }
-    struct SvgShape { x: f32, y: f32, w: f32, h: f32, items: Vec<SvgItem>, own_style: bool, mesh: Option<ObjMesh> }
+    struct SvgShape { x: f32, y: f32, w: f32, h: f32, items: Vec<SvgItem>, own_style: bool, mesh: Option<ObjMesh>, children: usize }
     /// A model from an OBJ file: one corner per face corner, in groups by material.
     struct ObjMesh { verts: Vec<[f32; 3]>, uvs: Vec<(f32, f32)>, groups: Vec<ObjGroup> }
     struct ObjGroup { tris: Vec<[usize; 3]>, color: Option<Color>, tex: Option<u64> }
@@ -2651,6 +2720,32 @@ mod render {
             Err(e) => { eprintln!("loadShape(\"{}\"): {} (SVG and OBJ files are supported)", path, e); 0 }
         }
     }
+    /// getChild(name) / getChild(i): a new shape id with just that part of the
+    /// drawing (same size and place as the whole), or 0 if there is none.
+    pub fn shape_child(id: u64, name: Option<&str>, index: usize) -> u64 {
+        let mut all = shapes().lock();
+        let Some(s) = all.get((id as usize).wrapping_sub(1)) else { return 0 };
+        let items: Vec<SvgItem> = s.items.iter().filter(|it| match name {
+            Some(n) => it.ids.iter().any(|i| i == n),
+            None => it.top == index,
+        }).cloned().collect();
+        if items.is_empty() || all.len() >= MAX_SHAPES { return 0; }
+        let child = SvgShape { x: s.x, y: s.y, w: s.w, h: s.h, items, own_style: s.own_style, mesh: None, children: 0 };
+        all.push(child);
+        all.len() as u64
+    }
+    /// getChildCount(): the children of the top group of an SVG.
+    pub fn shape_child_count(id: u64) -> usize {
+        shapes().lock().get((id as usize).wrapping_sub(1)).map(|s| s.children).unwrap_or(0)
+    }
+    /// The points of the shape's outlines, in order (curves as the short
+    /// segments they are drawn with), for getVertexCount() / getVertex(i).
+    pub fn shape_points(id: u64) -> Vec<(f32, f32)> {
+        shapes().lock().get((id as usize).wrapping_sub(1))
+            .map(|s| s.items.iter().flat_map(|it| it.contours.iter().flat_map(|c| c.0.iter().copied())).collect())
+            .unwrap_or_default()
+    }
+
     pub fn shape_size(id: u64) -> (f32, f32) {
         shapes().lock().get((id as usize).wrapping_sub(1)).map(|s| (s.w, s.h)).unwrap_or((0.0, 0.0))
     }
@@ -2816,7 +2911,7 @@ mod render {
         if mesh.groups.is_empty() { return Err("no faces in the file".into()); }
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for v in &mesh.verts { for k in 0..3 { lo[k] = lo[k].min(v[k]); hi[k] = hi[k].max(v[k]); } }
-        Ok(SvgShape { x: lo[0], y: lo[1], w: hi[0] - lo[0], h: hi[1] - lo[1], items: Vec::new(), own_style: true, mesh: Some(mesh) })
+        Ok(SvgShape { x: lo[0], y: lo[1], w: hi[0] - lo[0], h: hi[1] - lo[1], items: Vec::new(), own_style: true, mesh: Some(mesh), children: 0 })
     }
 
     /// Draws an OBJ model at (x, y), scaled to fit (w, h) when given.
@@ -2861,7 +2956,10 @@ mod render {
     }
 
     fn parse_svg(text: &str) -> Result<SvgShape, String> {
-        let mut shape = SvgShape { x: 0.0, y: 0.0, w: 0.0, h: 0.0, items: Vec::new(), own_style: true, mesh: None };
+        let mut shape = SvgShape { x: 0.0, y: 0.0, w: 0.0, h: 0.0, items: Vec::new(), own_style: true, mesh: None, children: 0 };
+        // the ids of the open elements, and which top-level child is open
+        let mut ids: Vec<Option<String>> = vec![None];
+        let mut top = 0usize;
         let base = SvgStyle { fill: Some(Color::from_gray(0.0)), stroke: None, weight: 1.0, fill_a: 1.0, stroke_a: 1.0, opacity: 1.0 };
         // one entry per open element: its transform and style, and whether its contents are drawn
         let mut stack: Vec<(Mat, SvgStyle, bool)> = vec![(identity(), base, true)];
@@ -2890,7 +2988,7 @@ mod render {
             i = end + 1;
             if let Some(name) = tag.strip_prefix('/') {
                 let _ = name;
-                if stack.len() > 1 { stack.pop(); }
+                if stack.len() > 1 { stack.pop(); ids.pop(); }
                 continue;
             }
             let self_closing = tag.ends_with('/');
@@ -2911,6 +3009,14 @@ mod render {
                 | "linearGradient" | "radialGradient" | "metadata" | "title" | "desc" | "style" | "script")
                 && get("display") != Some("none");
 
+            // a direct child of the <svg> element starts a new top-level child
+            let depth = stack.len();
+            if seen_svg && depth == 2 && drawn && name != "svg" {
+                top = shape.children;
+                shape.children += 1;
+            }
+            let mut item_ids: Vec<String> = ids.iter().flatten().cloned().collect();
+            if let Some(id) = get("id") { item_ids.push(id.to_string()); }
             if name == "svg" && !seen_svg {
                 seen_svg = true;
                 let vb: Vec<f32> = get("viewBox").map(svg_numbers).unwrap_or_default();
@@ -2983,9 +3089,11 @@ mod render {
                     contours, fill,
                     stroke: with_alpha(style.stroke, style.stroke_a),
                     weight: style.weight * if det.is_finite() { det } else { 1.0 },
+                    ids: item_ids,
+                    top,
                 });
             }
-            if !self_closing { stack.push((m, style, drawn)); }
+            if !self_closing { stack.push((m, style, drawn)); ids.push(get("id").map(|v| v.to_string())); }
             if stack.len() > 256 { return Err("nested too deeply".into()); }
         }
         if !seen_svg { return Err("not an SVG file".into()); }
@@ -4153,6 +4261,14 @@ pub fn __set_wheel_delta(d: f32) { *wheel_cell().lock() = d; }
 // ──────────────────────────── Canvas / window ────────────────────────────────
 
 pub fn size(w: u32, h: u32) {
+    // width and height take the new size right away, as in Processing, so
+    // setup() can use them on the next line (new float[width] and the like)
+    {
+        let (cw, ch) = (w.clamp(1, MAX_CANVAS), h.clamp(1, MAX_CANVAS));
+        let mut g = globals().write();
+        g.width = cw as f32;
+        g.height = ch as f32;
+    }
     lp_route! {
         let (w, h) = (w.clamp(1, MAX_CANVAS), h.clamp(1, MAX_CANVAS));
         glfw::set_size(w, h);
@@ -4721,9 +4837,46 @@ pub fn shape_sized(s: impl ShapeRef, x: impl Num, y: impl Num, w: impl Num, h: i
 static SHAPE_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// shape_mode(CORNER | CORNERS | CENTER): how shape() reads its position and size.
 pub fn shape_mode(mode: u32) { SHAPE_MODE.store(mode, Ordering::Relaxed); }
+/// shape(s): at (0, 0), its own size.
+pub fn shape_origin(s: impl ShapeRef) { shape(s, 0.0, 0.0) }
 #[inline] pub fn shapeMode(mode: u32) { shape_mode(mode) }
 /// Draw the shape with the sketch's fill and stroke, not the file's colors.
 pub fn shape_disable_style(id: u64) { render::shape_own_style(id, false); }
+
+/// Which child getChild() picks: a name (the element's id in the SVG) or a number.
+pub trait ChildKey { fn pick(self, id: u64) -> u64; }
+impl ChildKey for &str { fn pick(self, id: u64) -> u64 { render::shape_child(id, Some(self), 0) } }
+impl ChildKey for &String { fn pick(self, id: u64) -> u64 { render::shape_child(id, Some(self.as_str()), 0) } }
+macro_rules! child_index { ($($t:ty),*) => { $(impl ChildKey for $t { fn pick(self, id: u64) -> u64 { render::shape_child(id, None, self as usize) } })* } }
+child_index!(i32, i64, u32, u64, usize);
+
+/// Processing's PShape methods for a shape from load_shape():
+/// `let mi = usa.get_child("MI");  mi.disable_style();  shape(mi, 0, 0);`
+pub trait LoadedShapeExt {
+    fn get_child(&self, key: impl ChildKey) -> u64;
+    fn get_child_count(&self) -> usize;
+    fn get_vertex_count(&self) -> usize;
+    fn get_vertex(&self, i: impl Num) -> PVector;
+    fn disable_style(&self);
+    fn enable_style(&self);
+    #[inline] fn getChild(&self, key: impl ChildKey) -> u64 { self.get_child(key) }
+    #[inline] fn getChildCount(&self) -> usize { self.get_child_count() }
+    #[inline] fn getVertexCount(&self) -> usize { self.get_vertex_count() }
+    #[inline] fn getVertex(&self, i: impl Num) -> PVector { self.get_vertex(i) }
+    #[inline] fn disableStyle(&self) { self.disable_style() }
+    #[inline] fn enableStyle(&self) { self.enable_style() }
+}
+impl LoadedShapeExt for u64 {
+    fn get_child(&self, key: impl ChildKey) -> u64 { key.pick(*self) }
+    fn get_child_count(&self) -> usize { render::shape_child_count(*self) }
+    fn get_vertex_count(&self) -> usize { render::shape_points(*self).len() }
+    fn get_vertex(&self, i: impl Num) -> PVector {
+        let (x, y) = render::shape_points(*self).get(i.f() as usize).copied().unwrap_or((0.0, 0.0));
+        PVector::new(x, y)
+    }
+    fn disable_style(&self) { shape_disable_style(*self) }
+    fn enable_style(&self) { shape_enable_style(*self) }
+}
 /// Back to the colors in the file.
 pub fn shape_enable_style(id: u64) { render::shape_own_style(id, true); }
 #[inline] pub fn loadShape(path: &str) -> u64 { load_shape(path) }
@@ -4977,11 +5130,38 @@ pub fn rect_radii(x: f32, y: f32, w: f32, h: f32, tl: f32, tr: f32, br: f32, bl:
 }
 
 /// Sets one canvas pixel (r, g, b each 0..255). Not affected by transforms.
+/// What set(x, y, ...) takes, as in Processing: a color, a gray level, or an image.
+pub trait SetArg { fn set_at(self, x: f32, y: f32); }
+impl SetArg for Color { fn set_at(self, x: f32, y: f32) { render::set_pixel(x.floor() as i32, y.floor() as i32, self) } }
+impl SetArg for f32 { fn set_at(self, x: f32, y: f32) { render::set_pixel(x.floor() as i32, y.floor() as i32, cm_gray(self, None)) } }
+impl SetArg for i32 { fn set_at(self, x: f32, y: f32) { (self as f32).set_at(x, y) } }
+/// An image id: its pixels go on the canvas at (x, y), untransformed.
+impl SetArg for u64 {
+    fn set_at(self, x: f32, y: f32) {
+        let (w, h) = render::image_size(self);
+        let px = render::image_pixels(self);
+        let (w, h) = (w as usize, h as usize);
+        for j in 0..h { for i in 0..w {
+            if let Some(c) = px.get(j * w + i) { render::set_pixel(x as i32 + i as i32, y as i32 + j as i32, *c); }
+        } }
+    }
+}
+/// set(x, y, c): one pixel of the canvas (no transform, no blending), or a
+/// whole image with its top-left corner at (x, y).
+pub fn set(x: impl Num, y: impl Num, v: impl SetArg) { v.set_at(x.f(), y.f()) }
+
 pub fn set_pixel(x: i32, y: i32, r: f32, g: f32, b: f32) {
     render::set_pixel(x, y, Color::from_rgb(r / 255.0, g / 255.0, b / 255.0));
 }
 
 /// Color of one canvas pixel as (r, g, b), each 0..255. Black outside the canvas.
+/// get(x, y): the canvas color at a pixel, as in Processing (opaque; black
+/// outside the canvas).
+pub fn get(x: impl Num, y: impl Num) -> Color {
+    let (r, g, b) = get_pixel(x.f().floor() as i32, y.f().floor() as i32);
+    Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+}
+
 pub fn get_pixel(x: i32, y: i32) -> (u8, u8, u8) {
     lp_route! { crate::lp::pull(); }
     let (w, h) = (CANVAS_W.load(Ordering::Relaxed) as i32, CANVAS_H.load(Ordering::Relaxed) as i32);
@@ -5316,9 +5496,9 @@ impl<S> WindowFns<S> {
 }
 
 // Gray + alpha, used by OverloadRewriter for fill(gray, alpha) etc.
-pub fn fill_ga(gray: impl Num, alpha: impl Num)       { let gray = gray.f(); let alpha = alpha.f(); render::set_fill_color(cm_gray(gray, Some(alpha))); }
-pub fn stroke_ga(gray: impl Num, alpha: impl Num)     { let gray = gray.f(); let alpha = alpha.f(); render::set_stroke_color(cm_gray(gray, Some(alpha))); }
-pub fn background_ga(gray: impl Num, alpha: impl Num) { let gray = gray.f(); let alpha = alpha.f(); render::background_color(cm_gray(gray, Some(alpha))); }
+pub fn fill_ga(v: impl Paint, alpha: impl Num)       { render::set_fill_color(v.paint_alpha(alpha.f())); }
+pub fn stroke_ga(v: impl Paint, alpha: impl Num)     { render::set_stroke_color(v.paint_alpha(alpha.f())); }
+pub fn background_ga(v: impl Paint, alpha: impl Num) { render::background_color(v.paint_alpha(alpha.f())); }
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
 pub const POINTS: u8 = 1;
@@ -5387,7 +5567,7 @@ mod shader;
 mod vector;
 pub use vector::{create_vector, create_vector3, createVector, createVector3};
 mod image_ext;
-pub use image_ext::{PImageExt, PFontExt};
+pub use image_ext::{PImageExt, PFontExt, PFont};
 mod matrix;
 pub use matrix::{PMatrix2D, PMatrix3D, get_matrix, get_matrix_2d, set_matrix, set_matrix_2d, apply_pmatrix, apply_pmatrix_2d,
                  getMatrix, setMatrix};
@@ -5420,9 +5600,19 @@ pub trait Num: Copy { fn f(self) -> f32; }
 macro_rules! num_impl { ($($t:ty),*) => { $(impl Num for $t { #[inline] fn f(self) -> f32 { self as f32 } })* } }
 num_impl!(f32, f64, i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
 /// fill(), stroke() and background() take a gray level or a Color.
-pub trait Paint { fn paint(self) -> Color; }
-impl<T: Num> Paint for T { fn paint(self) -> Color { cm_gray(self.f(), None) } }
-impl Paint for Color { fn paint(self) -> Color { self } }
+pub trait Paint {
+    fn paint(self) -> Color;
+    /// The same with an alpha in the color mode's range: fill(c, 128), fill(200, 128).
+    fn paint_alpha(self, a: f32) -> Color;
+}
+impl<T: Num> Paint for T {
+    fn paint(self) -> Color { cm_gray(self.f(), None) }
+    fn paint_alpha(self, a: f32) -> Color { cm_gray(self.f(), Some(a)) }
+}
+impl Paint for Color {
+    fn paint(self) -> Color { self }
+    fn paint_alpha(self, a: f32) -> Color { Color { a: (a / COLOR_MODE.read().max[3]).clamp(0.0, 1.0), ..self } }
+}
 
 // ──────────────────────────── Color mode ─────────────────────────────────────
 
@@ -5643,6 +5833,9 @@ mod color_tests {
 /// createImage(w, h): a blank transparent image to draw pixels into.
 pub fn create_image(w: u32, h: u32) -> u64 { render::create_image(w as usize, h as usize) }
 #[inline] pub fn createImage(w: u32, h: u32) -> u64 { create_image(w, h) }
+/// createImage(w, h, format): Processing's form. Images here always keep an
+/// alpha channel, so RGB, ARGB and ALPHA all give the same blank image.
+pub fn create_image_format(w: u32, h: u32, _format: u32) -> u64 { create_image(w, h) }
 /// img.get(x, y): the color of one pixel (transparent outside the image).
 pub fn image_get(id: u64, x: i32, y: i32) -> Color { render::image_get(id, x as i64, y as i64) }
 pub fn image_set(id: u64, x: i32, y: i32, c: Color) { render::image_set(id, x as i64, y as i64, c) }

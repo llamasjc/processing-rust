@@ -489,6 +489,53 @@ pub fn print_array<T: std::fmt::Debug>(items: &[T]) {
 /// thread(f): runs f on its own thread. Drawing calls belong in draw().
 pub fn thread(f: impl FnOnce() + Send + 'static) { std::thread::spawn(f); }
 
+// ── Processing's array functions ────────────────────────────────────────────
+// They take a slice and give a new Vec, as Processing's give a new array.
+// (Vec's own methods do the same in place: push, extend, reverse, sort...)
+
+/// append(arr, v): a copy of arr with v added at the end.
+pub fn append<T: Clone>(arr: &[T], v: T) -> Vec<T> { let mut out = arr.to_vec(); out.push(v); out }
+/// concat(a, b): a then b, in one new list.
+pub fn concat<T: Clone>(a: &[T], b: &[T]) -> Vec<T> { let mut out = a.to_vec(); out.extend_from_slice(b); out }
+/// expand(arr): twice as long, the new half filled with zeros (or empty values).
+pub fn expand<T: Clone + Default>(arr: &[T]) -> Vec<T> { expand_to(arr, (arr.len() * 2).max(1)) }
+/// expand(arr, n): n items long.
+pub fn expand_to<T: Clone + Default>(arr: &[T], n: usize) -> Vec<T> { let mut out = arr.to_vec(); out.resize(n.max(arr.len()), T::default()); out }
+/// reverse(arr): the items in the opposite order.
+pub fn reverse<T: Clone>(arr: &[T]) -> Vec<T> { arr.iter().rev().cloned().collect() }
+/// shorten(arr): without its last item.
+pub fn shorten<T: Clone>(arr: &[T]) -> Vec<T> { arr[..arr.len().saturating_sub(1)].to_vec() }
+/// sort(arr): from smallest to largest (numbers, or strings alphabetically).
+pub fn sort<T: Clone + PartialOrd>(arr: &[T]) -> Vec<T> { sort_count(arr, arr.len()) }
+/// sort(arr, count): only the first count items are sorted.
+pub fn sort_count<T: Clone + PartialOrd>(arr: &[T], count: usize) -> Vec<T> {
+    let mut out = arr.to_vec();
+    let n = count.min(out.len());
+    out[..n].sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+/// splice(arr, v, index): v put in at index, the rest moved along.
+pub fn splice<T: Clone>(arr: &[T], v: T, index: usize) -> Vec<T> { let mut out = arr.to_vec(); out.insert(index.min(out.len()), v); out }
+/// subset(arr, start): the items from start to the end.
+pub fn subset<T: Clone>(arr: &[T], start: usize) -> Vec<T> { arr[start.min(arr.len())..].to_vec() }
+/// subset(arr, start, count): count items from start.
+pub fn subset_count<T: Clone>(arr: &[T], start: usize, count: usize) -> Vec<T> {
+    let s = start.min(arr.len());
+    arr[s..(s + count).min(arr.len())].to_vec()
+}
+/// arrayCopy(src, dst): as many items as fit, from the start of each.
+pub fn array_copy_all<T: Clone>(src: &[T], dst: &mut [T]) { let n = src.len().min(dst.len()); dst[..n].clone_from_slice(&src[..n]); }
+/// arrayCopy(src, dst, length)
+pub fn array_copy_len<T: Clone>(src: &[T], dst: &mut [T], length: usize) { let n = length.min(src.len()).min(dst.len()); dst[..n].clone_from_slice(&src[..n]); }
+/// arrayCopy(src, srcPos, dst, dstPos, length)
+pub fn array_copy<T: Clone>(src: &[T], src_pos: usize, dst: &mut [T], dst_pos: usize, length: usize) {
+    let n = length.min(src.len().saturating_sub(src_pos)).min(dst.len().saturating_sub(dst_pos));
+    dst[dst_pos..dst_pos + n].clone_from_slice(&src[src_pos..src_pos + n]);
+}
+#[inline] pub fn arrayCopy<T: Clone>(src: &[T], src_pos: usize, dst: &mut [T], dst_pos: usize, length: usize) { array_copy(src, src_pos, dst, dst_pos, length) }
+/// str(v): any value as text, as Processing's str().
+pub fn str(v: impl std::fmt::Display) -> String { v.to_string() }
+
 #[cfg(test)]
 mod tests {
     use super::*;

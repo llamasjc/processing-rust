@@ -465,3 +465,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+
+/// `PFont::list()`: the fonts installed on the computer, by name, as in
+/// Processing's PFont.list(). Any of them works with create_font(name, size).
+pub struct PFont;
+impl PFont {
+    pub fn list() -> Vec<String> {
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
+        for d in ["/usr/share/fonts", "/usr/local/share/fonts", "/System/Library/Fonts", "/Library/Fonts", "C:\\Windows\\Fonts"] {
+            dirs.push(d.into());
+        }
+        if let Some(h) = &home {
+            for d in [".fonts", ".local/share/fonts", "Library/Fonts", "AppData/Local/Microsoft/Windows/Fonts"] { dirs.push(h.join(d)); }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut todo = dirs;
+        let mut seen = 0usize;
+        while let Some(d) = todo.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { todo.push(p); continue; }
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                if !matches!(ext.as_str(), "ttf" | "otf" | "ttc") { continue; }
+                seen += 1;
+                if seen > 5000 { break; }
+                let Ok(data) = std::fs::read(&p) else { continue };
+                if let Ok(face) = ttf_parser::Face::parse(&data, 0) {
+                    let full = face.names().into_iter()
+                        .find(|n| n.name_id == ttf_parser::name_id::FULL_NAME && n.is_unicode())
+                        .and_then(|n| n.to_string());
+                    if let Some(n) = full { names.insert(n); }
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+}
