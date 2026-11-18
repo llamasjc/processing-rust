@@ -281,6 +281,7 @@ public class RustEditor extends Editor {
     // The sketch's stdin stays open and unused: if the IDE dies without a
     // chance to clean up, the pipe closes and the sketch closes with it.
     pb.environment().put("PROCESSING_WATCH_STDIN", "1");
+    FfmpegSetup.prepare(pb.environment());
     // the GLFW 3.4 the mode ships, for libprocessing (see RustBuild.glfwDir)
     File glfw = RustBuild.glfwDir(getRustMode().getFolder());
     if (glfw != null) {

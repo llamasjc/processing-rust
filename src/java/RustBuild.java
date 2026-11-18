@@ -377,6 +377,8 @@ public class RustBuild {
     // the first build of the session: Rust, a linker and (for libprocessing)
     // the dev files are there, or get installed (see RustSetup)
     RustSetup.ensure(mode, Renderer.libprocessing());
+    // Movie or Capture without ffmpeg: offer to install it (see FfmpegSetup)
+    FfmpegSetup.ensure(sketch.getFolder(), ".pde", mode::statusMessage);
 
     // ── Fast path: one rustc call against the precompiled engine ─────────────
     if (!release) {
