@@ -118,8 +118,73 @@ final class AppExport {
       File launcher = new File(dest, safe);
       Files.writeString(launcher.toPath(), b.toString(), StandardCharsets.UTF_8);
       launcher.setExecutable(true, false);
+      if (mac()) macApp(dest, sketchName, safe, prog);
     }
     return dest;
+  }
+
+  static boolean mac() {
+    return System.getProperty("os.name", "").toLowerCase().contains("mac");
+  }
+
+  /**
+   * macOS: wrap the export in a real .app (as C++ Mode does) and sign it
+   * ad hoc. Without a signature Apple Silicon calls a downloaded app
+   * "damaged" and won't open it at all; with one it's only an app from an
+   * unidentified developer, which opens with right-click, Open. Notarizing
+   * would remove that last step but needs a paid Apple developer account.
+   */
+  static void macApp(File dest, String sketchName, String safe, File prog) throws IOException {
+    File app = new File(dest, safe + ".app");
+    File contents = new File(app, "Contents");
+    File res = new File(contents, "Resources");
+    File macos = new File(contents, "MacOS");
+    if (!macos.mkdirs() || !res.mkdirs()) throw new IOException("can't make " + app);
+    File[] top = dest.listFiles();
+    if (top != null) for (File f : top) {
+      if (f.equals(app)) continue;
+      if (f.isDirectory()) copyTree(f.toPath(), new File(res, f.getName()).toPath());
+      else Files.copy(f.toPath(), new File(res, f.getName()).toPath(), StandardCopyOption.REPLACE_EXISTING);
+    }
+    new File(res, safe).setExecutable(true, false);
+    new File(new File(res, "lib"), prog.getName()).setExecutable(true, false);
+    File exe = new File(macos, safe);
+    Files.writeString(exe.toPath(), "#!/bin/sh\nexec \"$(dirname \"$0\")/../Resources/" + safe + "\" \"$@\"\n", StandardCharsets.UTF_8);
+    exe.setExecutable(true, false);
+    String id = safe.replaceAll("[^A-Za-z0-9.-]", "-");
+    Files.writeString(new File(contents, "Info.plist").toPath(),
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+      + "<plist version=\"1.0\"><dict>\n"
+      + "<key>CFBundleName</key><string>" + sketchName.replace("&", "&amp;").replace("<", "&lt;") + "</string>\n"
+      + "<key>CFBundleExecutable</key><string>" + safe + "</string>\n"
+      + "<key>CFBundleIdentifier</key><string>org.processing.sketch." + id + "</string>\n"
+      + "<key>CFBundlePackageType</key><string>APPL</string>\n"
+      + "<key>CFBundleShortVersionString</key><string>1.0</string>\n"
+      + "<key>NSHighResolutionCapable</key><true/>\n"
+      + "<key>NSCameraUsageDescription</key><string>The sketch uses the camera.</string>\n"
+      + "<key>NSMicrophoneUsageDescription</key><string>The sketch uses the microphone.</string>\n"
+      + "</dict></plist>\n", StandardCharsets.UTF_8);
+    // sign the libraries and the program first, then the bundle
+    File[] libs = new File(res, "lib").listFiles();
+    if (libs != null) for (File l : libs) sign(l);
+    sign(app);
+    // our own copy came from the IDE, so it isn't quarantined; a downloaded one is
+    Files.writeString(new File(dest, "If macOS won't open it.txt").toPath(),
+      "macOS only opens apps from the App Store or from paid Apple developers without asking.\n\n"
+      + "The first time: right-click " + safe + ".app and choose Open, then Open again.\n"
+      + "On macOS 15 and newer: try to open it once, then go to System Settings > Privacy & Security\n"
+      + "and click Open Anyway.\n\n"
+      + "Or in Terminal:  xattr -dr com.apple.quarantine " + safe + ".app\n", StandardCharsets.UTF_8);
+  }
+
+  private static void sign(File f) {
+    try {
+      Process p = new ProcessBuilder("codesign", "--force", "--sign", "-", f.getAbsolutePath())
+        .redirectErrorStream(true).start();
+      p.getInputStream().transferTo(java.io.OutputStream.nullOutputStream());
+      p.waitFor();
+    } catch (Exception ignored) {}
   }
 
   /**
