@@ -554,7 +554,7 @@ public class RustEditor extends Editor {
   public JMenu buildHelpMenu() {
     JMenu help = new JMenu("Help");
     JMenuItem site = new JMenuItem("Rust Mode on GitHub");
-    site.addActionListener(e -> openUrl("https://github.com/llamasjc/RustMode"));
+    site.addActionListener(e -> openUrl("https://github.com/llamasjc/processing-rust"));
     help.add(site);
     JMenuItem book = new JMenuItem("The Rust Book");
     book.addActionListener(e -> openUrl("https://doc.rust-lang.org/book/"));
