@@ -1,0 +1,10 @@
+name=Rust Mode
+category=Other
+authors=[Jose Llamas](https://github.com/llamasjc)
+url=https://github.com/llamasjc/processing-rust
+sentence=Write Processing sketches in Rust.
+paragraph=Write sketches in Rust with the Processing API you already know: setup(), draw(), ellipse(), mouse_x(). Two renderers, a CPU one that works everywhere and libprocessing on your graphics card. The engine comes precompiled, so Run is quick, and if Rust isn't installed yet Rust Mode offers to install it.
+version=1
+prettyVersion=0.1.0
+minRevision=1270
+maxRevision=0
