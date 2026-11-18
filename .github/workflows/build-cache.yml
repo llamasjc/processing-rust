@@ -6,13 +6,17 @@ name: build-cache
 # scripts/create-release.py --ci runs it and downloads the results into
 # cache/ before zipping a release.
 
+# Pushing a v* tag also makes the GitHub release: RustMode.zip and
+# RustMode-lite.zip, with every platform's caches (release job, below).
 on:
   workflow_dispatch:
+  push:
+    tags: ['v*']
 
-# Only the newest run of this workflow matters; a newer one cancels it.
+# Only the newest run matters; a newer one cancels it (but never a release).
 concurrency:
-  group: build-cache
-  cancel-in-progress: true
+  group: build-cache-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   cache:
@@ -149,3 +153,69 @@ jobs:
           path: cache/${{ matrix.platform }}/libprocessing
           if-no-files-found: error
           compression-level: 1
+
+  # ── GitHub release (v* tags) ───────────────────────────────────────────────
+  release:
+    name: Release
+    needs: cache
+    # a platform whose cache failed just builds with cargo the first time
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Rust (for the cache version check)
+        run: rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+
+      - name: Processing (pde and core jars)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/processing.tgz" \
+            https://github.com/processing/processing4/releases/download/processing-1293-4.3/processing-4.3-linux-x64.tgz
+          mkdir "$RUNNER_TEMP/processing"
+          tar xzf "$RUNNER_TEMP/processing.tgz" -C "$RUNNER_TEMP/processing" --strip-components=1 \
+            --wildcards '*/lib/pde.jar' '*/core/library/core.jar'
+          echo "PROCESSING_DIR=$RUNNER_TEMP/processing" >> "$GITHUB_ENV"
+
+      - name: Download the caches
+        uses: actions/download-artifact@v6
+        with:
+          pattern: cache-*
+          path: artifacts/
+
+      - name: Put them in cache/
+        run: |
+          for d in artifacts/cache-*; do
+            n=${d#artifacts/cache-}; rend=${n##*-}; plat=${n%-*}
+            mkdir -p "cache/$plat"; rm -rf "cache/$plat/$rend"; mv "$d" "cache/$plat/$rend"
+            echo "cache/$plat/$rend"
+          done
+          rm -rf artifacts
+
+      - name: Zips
+        run: python3 scripts/create-release.py
+
+      # notes from release-notes/<tag>.md when there is one; a re-pushed tag
+      # replaces the zips on the release that's already there
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zips="../RustMode.zip ../RustMode-lite.zip"
+          notes="release-notes/$GITHUB_REF_NAME.md"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" $zips --clobber
+            [ -f "$notes" ] && gh release edit "$GITHUB_REF_NAME" --notes-file "$notes"
+          elif [ -f "$notes" ]; then
+            gh release create "$GITHUB_REF_NAME" $zips --title "Rust Mode ${GITHUB_REF_NAME#v}" --notes-file "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" $zips --title "Rust Mode ${GITHUB_REF_NAME#v}" --generate-notes
+          fi
