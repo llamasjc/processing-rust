@@ -670,11 +670,6 @@ public class RustBuild {
     return m.find() ? m.group(1) : null;
   }
 
-  /**
-   * The GLFW the libprocessing cache ships (cache/<platform>/libprocessing*/native),
-   * or null. Sketches link against it, and it goes on the library path when
-   * they run and into exported applications, so nobody has to install GLFW 3.4.
-   */
   private boolean missingGlfw;
 
   /**
@@ -697,6 +692,11 @@ public class RustBuild {
       + ", or pick the CPU renderer in the toolbar, which needs nothing.";
   }
 
+  /**
+   * The GLFW the libprocessing cache ships (its native folder), or null.
+   * Sketches link against it, and it goes on the library path when they run
+   * and into exported applications, so nobody has to install GLFW 3.4.
+   */
   static File glfwDir(File modeFolder) {
     if (!Renderer.libprocessing()) return null;
     String plat = platformDir();
