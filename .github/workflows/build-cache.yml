@@ -9,22 +9,30 @@ name: build-cache
 on:
   workflow_dispatch:
 
+# Only the newest run of this workflow matters; a newer one cancels it.
+concurrency:
+  group: build-cache
+  cancel-in-progress: true
+
 jobs:
   cache:
-    name: ${{ matrix.platform }} / ${{ matrix.renderer }}
+    name: ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15-intel, macos-latest, windows-latest]
-        renderer: [cpu, libprocessing]
         include:
           - { os: ubuntu-22.04,   platform: linux-x86-64 }
           - { os: macos-15-intel, platform: macos-x86-64 }
           - { os: macos-latest,   platform: macos-arm64 }
           - { os: windows-latest, platform: windows-x86-64 }
-    # libprocessing on Windows still needs GLFW sorted out; don't hold up the rest
-    continue-on-error: ${{ matrix.renderer == 'libprocessing' && matrix.os == 'windows-latest' }}
+    env:
+      # one folder for everything this job compiles: the CPU build reuses
+      # what the libprocessing build already made, and the folder is kept
+      # between runs (below) so only what changed compiles next time
+      RUSTMODE_CACHE_WORK: ${{ github.workspace }}/../rustmode-cache
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
 
     steps:
       - uses: actions/checkout@v5
@@ -36,42 +44,78 @@ jobs:
           rustup toolchain install "$v" --profile minimal
           echo "RUSTUP_TOOLCHAIN=$v" >> "$GITHUB_ENV"
 
-      - name: Linux libraries
+      - name: Linux libraries and GLFW 3.4
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libx11-dev libxkbcommon-dev libxcursor-dev libxrandr-dev libxi-dev \
             libxinerama-dev libwayland-dev wayland-protocols libasound2-dev libudev-dev pkg-config cmake
-
-      - name: GLFW 3.4 (Linux, libprocessing)
-        if: runner.os == 'Linux' && matrix.renderer == 'libprocessing'
-        run: |
           curl -fsSL https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.zip -o glfw.zip
           unzip -q glfw.zip
           cmake -S glfw-3.4 -B glfw-build -DBUILD_SHARED_LIBS=ON -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF -DGLFW_BUILD_DOCS=OFF
           sudo cmake --build glfw-build --target install
           sudo ldconfig
 
-      - name: GLFW (macOS, libprocessing)
-        if: runner.os == 'macOS' && matrix.renderer == 'libprocessing'
+      - name: GLFW (macOS)
+        if: runner.os == 'macOS'
         run: brew install glfw
 
-      - name: Cargo registry
-        uses: actions/cache@v5
+      # Downloaded crates, and everything compiled last time. The key changes
+      # with the lock file and the engine's code; when it doesn't match, the
+      # newest older one is used, so only the difference compiles.
+      - name: Restore compiled crates
+        id: restore
+        uses: actions/cache/restore@v5
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ matrix.platform }}-${{ matrix.renderer }}-${{ hashFiles('Cargo.lock') }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ github.workspace }}/../rustmode-cache/${{ matrix.platform }}/target
+          key: build-${{ matrix.platform }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'build.rs', 'Cargo.toml') }}
+          restore-keys: |
+            build-${{ matrix.platform }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-
+            build-${{ matrix.platform }}-${{ env.RUSTUP_TOOLCHAIN }}-
 
-      - name: Build the cache
+      # libprocessing first: it compiles everything the CPU build needs too
+      - name: Build the libprocessing cache
+        id: lp
+        shell: bash
+        # GLFW on Windows isn't sorted out yet; don't let it stop the CPU cache
+        continue-on-error: ${{ runner.os == 'Windows' }}
+        run: |
+          PY=$(command -v python3 || command -v python)
+          "$PY" scripts/build-cache.py libprocessing
+
+      - name: Build the CPU cache
         shell: bash
         run: |
           PY=$(command -v python3 || command -v python)
-          "$PY" scripts/build-cache.py ${{ matrix.renderer }}
+          "$PY" scripts/build-cache.py cpu
+
+      # Saved even when a build failed, so the next run starts from what got done
+      - name: Save compiled crates
+        if: always() && steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ github.workspace }}/../rustmode-cache/${{ matrix.platform }}/target
+          key: build-${{ matrix.platform }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'build.rs', 'Cargo.toml') }}
 
       - uses: actions/upload-artifact@v6
         with:
-          name: cache-${{ matrix.platform }}-${{ matrix.renderer }}
-          path: cache/${{ matrix.platform }}/${{ matrix.renderer }}
+          name: cache-${{ matrix.platform }}-cpu
+          path: cache/${{ matrix.platform }}/cpu
           if-no-files-found: error
+          compression-level: 1
+
+      - uses: actions/upload-artifact@v6
+        if: steps.lp.outcome == 'success'
+        with:
+          name: cache-${{ matrix.platform }}-libprocessing
+          path: cache/${{ matrix.platform }}/libprocessing
+          if-no-files-found: error
+          compression-level: 1
