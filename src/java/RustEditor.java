@@ -281,6 +281,13 @@ public class RustEditor extends Editor {
     // The sketch's stdin stays open and unused: if the IDE dies without a
     // chance to clean up, the pipe closes and the sketch closes with it.
     pb.environment().put("PROCESSING_WATCH_STDIN", "1");
+    // the GLFW 3.4 the mode ships, for libprocessing (see RustBuild.glfwDir)
+    File glfw = RustBuild.glfwDir(getRustMode().getFolder());
+    if (glfw != null) {
+      String var = isWindowsOS() ? "PATH" : System.getProperty("os.name", "").toLowerCase().contains("mac") ? "DYLD_LIBRARY_PATH" : "LD_LIBRARY_PATH";
+      String old = pb.environment().get(var);
+      pb.environment().put(var, glfw.getAbsolutePath() + (old == null || old.isEmpty() ? "" : File.pathSeparator + old));
+    }
     // the sketch was built for this renderer (RustBuild adds the feature)
     if (Renderer.libprocessing()) pb.environment().put("PROCESSING_RENDERER", "libprocessing");
     else pb.environment().remove("PROCESSING_RENDERER");
@@ -506,7 +513,8 @@ public class RustEditor extends Editor {
         if (binary == null || !binary.isFile()) { statusError("Export failed: the build didn't produce a program"); return; }
         String fallback = (System.getProperty("os.name", "").toLowerCase().contains("win") ? "windows" : "linux") + "-" + System.getProperty("os.arch", "");
         File dest = AppExport.write(sketch.getFolder(), sketch.getName(), new File(sketch.getFolder(), "data"),
-          AppExport.variant(fallback), binary, new String[0], lp ? "libprocessing" : null);
+          AppExport.variant(fallback), binary, new String[0], lp ? "libprocessing" : null,
+          lp ? AppExport.glfwLibs(RustBuild.glfwDir(getRustMode().getFolder())) : null);
         statusNotice("Exported to " + sketch.getName() + "/" + dest.getName() + "/");
         AppExport.show(dest);
       } catch (CargoException e) {
@@ -580,4 +588,6 @@ public class RustEditor extends Editor {
     t.setDaemon(true);
     t.start();
   }
+
+  private static boolean isWindowsOS() { return System.getProperty("os.name", "").toLowerCase().contains("win"); }
 }

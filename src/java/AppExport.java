@@ -56,6 +56,22 @@ final class AppExport {
    */
   static File write(File sketchFolder, String sketchName, File dataFolder, String variant,
                     File program, String[] args, String renderer) throws IOException {
+    return write(sketchFolder, sketchName, dataFolder, variant, program, args, renderer, null);
+  }
+
+  /** GLFW the mode ships (libglfw.so.3, libglfw.3.dylib, glfw3.dll) in a folder. */
+  static File[] glfwLibs(File dir) {
+    if (dir == null) return new File[0];
+    File[] fs = dir.listFiles((d, n) -> n.startsWith("libglfw.so.3") || n.matches("libglfw\\.3.*\\.dylib") || n.equalsIgnoreCase("glfw3.dll"));
+    return fs == null ? new File[0] : fs;
+  }
+
+  /**
+   * The same, also copying {@code libs} (the GLFW the mode ships) into lib/
+   * next to the program, so the export runs where GLFW 3.4 isn't installed.
+   */
+  static File write(File sketchFolder, String sketchName, File dataFolder, String variant,
+                    File program, String[] args, String renderer, File[] libs) throws IOException {
     File dest = new File(sketchFolder, variant);
     deleteTree(dest.toPath());
     File lib = new File(dest, "lib");
@@ -64,6 +80,9 @@ final class AppExport {
     File prog = new File(lib, program.getName());
     Files.copy(program.toPath(), prog.toPath(), StandardCopyOption.REPLACE_EXISTING);
     prog.setExecutable(true, false);
+    if (libs != null) {
+      for (File l : libs) Files.copy(l.toPath(), new File(lib, l.getName()).toPath(), StandardCopyOption.REPLACE_EXISTING);
+    }
 
     if (dataFolder != null && dataFolder.isDirectory()) copyTree(dataFolder.toPath(), new File(dest, "data").toPath());
 
@@ -83,6 +102,9 @@ final class AppExport {
       b.append("APPDIR=$(cd \"$(dirname \"$0\")\" && pwd -P)\n");
       b.append("cd \"$APPDIR\" || exit 1\n");
       if (renderer != null) b.append("export PROCESSING_RENDERER=").append(renderer).append("\n");
+      // the GLFW shipped in lib/ is found before (or instead of) the system's
+      b.append("export LD_LIBRARY_PATH=\"$APPDIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\n");
+      b.append("export DYLD_LIBRARY_PATH=\"$APPDIR/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}\"\n");
       // hour(), minute()... in local time, as when run from the IDE
       b.append("z=$(date +%z 2>/dev/null)\n");
       b.append("case \"$z\" in [+-][0-9][0-9][0-9][0-9])\n");

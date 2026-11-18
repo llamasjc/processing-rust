@@ -436,6 +436,7 @@ public class RustBuild {
       String rewritten = rewriteLocations(line);
       // Forward all output to the IDE console.
       mode.statusMessage(rewritten);
+      if (rewritten.contains("failed to find glfw") || rewritten.contains("glfw3.pc")) missingGlfw = true;
 
       // --message-format=short gives one line per problem:
       //   Sketch.pde:12:5: error[E0308]: mismatched types: ...
@@ -461,6 +462,9 @@ public class RustBuild {
       cargoProc = null;
     }
     if (cancelled) throw new InterruptedException("build cancelled");
+    if (exitCode != 0 && missingGlfw) {
+      throw new CargoException(glfwHelp(), diagnostics);
+    }
     if (exitCode != 0) {
       String msg = firstError != null
         ? firstError
@@ -664,6 +668,43 @@ public class RustBuild {
   private static String jsonNumber(String json, String key) {
     java.util.regex.Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*(\\d+)").matcher(json);
     return m.find() ? m.group(1) : null;
+  }
+
+  /**
+   * The GLFW the libprocessing cache ships (cache/<platform>/libprocessing*/native),
+   * or null. Sketches link against it, and it goes on the library path when
+   * they run and into exported applications, so nobody has to install GLFW 3.4.
+   */
+  private boolean missingGlfw;
+
+  /**
+   * libprocessing needs GLFW 3.4 when a sketch builds without the prebuilt
+   * cache (the cache brings its own). Like C++ Mode's installer, say exactly
+   * what to run on this system.
+   */
+  static String glfwHelp() {
+    String os = System.getProperty("os.name", "").toLowerCase();
+    String cmd;
+    if (os.contains("mac")) cmd = "brew install glfw";
+    else if (os.contains("win")) cmd = "reinstall Rust Mode (GLFW comes with it on Windows)";
+    else if (new File("/usr/bin/pacman").exists()) cmd = "sudo pacman -S glfw";
+    else if (new File("/usr/bin/dnf").exists()) cmd = "sudo dnf install glfw-devel";
+    else if (new File("/usr/bin/zypper").exists()) cmd = "sudo zypper install glfw-devel";
+    else if (new File("/usr/bin/apt").exists())
+      cmd = "sudo apt install libglfw3-dev (Ubuntu 24.04 or newer; 22.04 only has GLFW 3.3, so build 3.4 from glfw.org)";
+    else cmd = "your package manager";
+    return "The libprocessing renderer needs GLFW 3.4, which isn't installed. Install it with " + cmd
+      + ", or pick the CPU renderer in the toolbar, which needs nothing.";
+  }
+
+  static File glfwDir(File modeFolder) {
+    if (!Renderer.libprocessing()) return null;
+    String plat = platformDir();
+    for (String r : new String[] { "libprocessing-fork", "libprocessing" }) {
+      File d = new File(modeFolder, "cache/" + plat + "/" + r + "/native");
+      if (AppExport.glfwLibs(d).length > 0) return d;
+    }
+    return null;
   }
 
   private File cachedBuild(File projectDir) throws IOException, InterruptedException {

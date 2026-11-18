@@ -85,6 +85,36 @@ def fork_stamp(fork: Path) -> int:
     return newest
 
 
+def bundle_glfw(native: Path):
+    """GLFW 3.4 goes in the cache next to the engine, so a sketch links and runs
+    against it on computers without GLFW 3.4 installed (Ubuntu 22.04 has 3.3).
+    RustMode puts this folder on the library path when it runs a sketch and
+    copies it into exported applications."""
+    if sys.platform.startswith("linux"):
+        libdir = subprocess.run(["pkg-config", "--variable=libdir", "glfw3"], capture_output=True, text=True).stdout.strip()
+        cands = [Path(libdir)] if libdir else []
+        cands += [Path("/usr/local/lib"), Path("/usr/lib"), Path("/usr/lib/x86_64-linux-gnu"), Path("/usr/lib/aarch64-linux-gnu")]
+        for d in cands:
+            so = d / "libglfw.so.3"
+            if so.exists():
+                real = so.resolve()
+                shutil.copy2(real, native / "libglfw.so.3")
+                # the name the linker looks for
+                shutil.copy2(real, native / "libglfw.so")
+                print(f"GLFW: {real} bundled")
+                return
+        print("GLFW: not found to bundle; sketches will need GLFW 3.4 installed")
+    elif sys.platform == "darwin":
+        if any(native.glob("libglfw*.dylib")):
+            return
+        brew = subprocess.run(["brew", "--prefix", "glfw"], capture_output=True, text=True).stdout.strip()
+        for d in [Path(brew) / "lib"] if brew else []:
+            for f in d.glob("libglfw.3*.dylib"):
+                shutil.copy2(f.resolve(), native / "libglfw.3.dylib")
+                print(f"GLFW: {f} bundled")
+                return
+
+
 def build(renderer: str, upstream: bool = False):
     plat = platform_dir()
     fork = local_fork() if renderer == "libprocessing" and not upstream else None
@@ -157,9 +187,11 @@ incremental = false
             for lp in m["linked_paths"]:
                 kind, _, path = lp.rpartition("=")
                 if str(target) in path:
-                    # a C library a crate built for itself: copy the static libraries
+                    # a C library a crate built or fetched for itself: the
+                    # static libraries, and shared ones (glfw-sys downloads
+                    # GLFW 3.4 as a .dylib / .dll on macOS and Windows)
                     for a in Path(path).glob("*"):
-                        if a.suffix in (".a", ".lib"):
+                        if a.suffix in (".a", ".lib", ".dylib", ".dll") or ".so" in a.name:
                             native.add(str(a))
                 elif path not in search:
                     search.append(path)
@@ -177,6 +209,8 @@ incremental = false
         shutil.copy2(f, out / "deps" / Path(f).name)
     for f in native:
         shutil.copy2(f, out / "native" / Path(f).name)
+    if renderer == "libprocessing":
+        bundle_glfw(out / "native")
     meta = {
         "rustc": version,
         "rustc_full": rustc,
