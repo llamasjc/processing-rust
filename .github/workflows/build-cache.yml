@@ -230,6 +230,11 @@ jobs:
 
       # notes from release-notes/<tag>.md when there is one; a re-pushed tag
       # replaces the zips on the release that's already there
+      # the engine for people not using the Processing IDE: a Cargo starter
+      # project and the crate (like C++ Mode's plug-and-play and CMake packages)
+      - name: Starter and crate packages
+        run: python3 scripts/generate_packages.py --out "$RUNNER_TEMP/packages"
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -237,7 +242,7 @@ jobs:
           # a draft first, published with: gh release edit <tag> --draft=false
           # (repository variable RELEASE_DIRECT=true publishes right away)
           DRAFT=--draft; [ "${{ vars.RELEASE_DIRECT }}" = true ] && DRAFT=
-          zips="../RustMode.zip $(ls ../RustMode-libprocessing-*.zip 2>/dev/null) RustMode.txt"
+          zips="../RustMode.zip $(ls ../RustMode-libprocessing-*.zip 2>/dev/null) RustMode.txt $(ls $RUNNER_TEMP/packages/*.zip)"
           notes="release-notes/$GITHUB_REF_NAME.md"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             # each file goes up under a temporary name first and replaces the

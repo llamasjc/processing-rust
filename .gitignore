@@ -11,3 +11,4 @@ core.*
 hs_err_pid*
 cache/
 __pycache__/
+dist/

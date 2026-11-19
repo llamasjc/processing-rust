@@ -34,7 +34,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PLATFORMS = ["linux-x86-64", "linux-arm64", "macos-x86-64", "macos-arm64", "windows-x86-64"]
 RENDERERS = ["cpu", "libprocessing"]
-SKIP_DIRS = {".git", ".github", "release-notes", "artifacts", "target", "build", ".gradle", "__pycache__"}
+SKIP_DIRS = {".git", ".github", "dist", "release-notes", "artifacts", "target", "build", ".gradle", "__pycache__"}
 WORKFLOW = "build-cache.yml"
 LP_SKIP = {p for p in os.environ.get("RUSTMODE_LP_SKIP", "").replace(",", " ").split() if p}
 
