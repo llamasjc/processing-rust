@@ -68,8 +68,10 @@ final class ExportDialog {
     final java.io.File icon;
     /** Linux exports also as one AppImage file */
     final boolean appImage;
-    Choice(List<Target> targets, String renderer, java.io.File icon, boolean appImage) {
-      this.targets = targets; this.renderer = renderer; this.icon = icon; this.appImage = appImage;
+    /** where the platform folders go (the sketch folder unless changed) */
+    final java.io.File outDir;
+    Choice(List<Target> targets, String renderer, java.io.File icon, boolean appImage, java.io.File outDir) {
+      this.targets = targets; this.renderer = renderer; this.icon = icon; this.appImage = appImage; this.outDir = outDir;
     }
   }
 
@@ -170,6 +172,25 @@ final class ExportDialog {
     panel.add(iconPanel);
     panel.add(Box.createVerticalStrut(8));
 
+    // where it goes: the sketch folder, as in Processing, unless picked
+    JPanel outPanel = new JPanel(new BorderLayout(8, 0));
+    outPanel.setBorder(BorderFactory.createTitledBorder("Export to"));
+    outPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+    javax.swing.JTextField outPath = new javax.swing.JTextField(sketchFolder.getAbsolutePath(), 18);
+    outPath.setEditable(false);
+    javax.swing.JButton outChoose = new javax.swing.JButton("Choose...");
+    outChoose.addActionListener(e -> {
+      javax.swing.JFileChooser fc = new javax.swing.JFileChooser(new java.io.File(outPath.getText()));
+      fc.setDialogTitle("Export to");
+      fc.setFileSelectionMode(javax.swing.JFileChooser.DIRECTORIES_ONLY);
+      if (fc.showOpenDialog(panel) == javax.swing.JFileChooser.APPROVE_OPTION)
+        outPath.setText(fc.getSelectedFile().getAbsolutePath());
+    });
+    outPanel.add(outPath, BorderLayout.CENTER);
+    outPanel.add(outChoose, BorderLayout.EAST);
+    panel.add(outPanel);
+    panel.add(Box.createVerticalStrut(8));
+
     JCheckBox appImage = new JCheckBox("Linux: also make an AppImage (one file that runs on most distributions)");
     appImage.setAlignmentX(Component.LEFT_ALIGNMENT);
     if (AppImage.possible()) appImage.setSelected(true);
@@ -204,6 +225,7 @@ final class ExportDialog {
     if (picked.isEmpty()) return null;
     String ip = iconPath.getText();
     return new Choice(picked, (String) renderer.getSelectedItem(),
-      ip.isEmpty() ? null : new java.io.File(ip), appImage.isSelected() && appImage.isEnabled());
+      ip.isEmpty() ? null : new java.io.File(ip), appImage.isSelected() && appImage.isEnabled(),
+      new java.io.File(outPath.getText()));
   }
 }

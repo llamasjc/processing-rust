@@ -3,12 +3,7 @@ package processing.mode.rust;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
@@ -38,12 +33,7 @@ final class AppImage {
     status.accept("Downloading appimagetool (once)...");
     f.getParentFile().mkdirs();
     String url = "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-" + hostArch() + ".AppImage";
-    HttpClient c = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.ALWAYS).build();
-    HttpResponse<InputStream> r = c.send(HttpRequest.newBuilder(URI.create(url)).build(), HttpResponse.BodyHandlers.ofInputStream());
-    if (r.statusCode() != 200) throw new IOException("couldn't download appimagetool (HTTP " + r.statusCode() + ")");
-    File tmp = new File(f.getPath() + ".part");
-    try (InputStream in = r.body()) { Files.copy(in, tmp.toPath(), StandardCopyOption.REPLACE_EXISTING); }
-    Files.move(tmp.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING);
+    Http.download(url, f, null);
     f.setExecutable(true, false);
     return f;
   }

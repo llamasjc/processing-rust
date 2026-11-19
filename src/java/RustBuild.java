@@ -111,6 +111,15 @@ public class RustBuild {
     this.release = release;
   }
 
+  /** Export for another platform (see CrossTarget); null builds for this computer. */
+  private CrossTarget cross;
+  private boolean crossWindows;
+
+  RustBuild crossTo(ExportDialog.Target t) {
+    if (t != ExportDialog.Target.here()) { cross = CrossTarget.to(t); crossWindows = t.windows(); }
+    return this;
+  }
+
   // ── Public entry-point ──────────────────────────────────────────────────────
 
   /**
@@ -396,6 +405,12 @@ public class RustBuild {
     cmd.add(RustSetup.tool("cargo"));
     cmd.add("build");
     if (release) cmd.add("--release");
+    if (cross != null) {
+      mode.statusMessage("Getting Rust's standard library for " + cross.triple + " (once)...");
+      cross.addRustTarget(RustSetup.toolchain(RustSetup.pinnedVersion(mode.getFolder())));
+      cmd.add("--target");
+      cmd.add(cross.triple);
+    }
     cmd.add("--message-format=short");
     boolean lp = Renderer.libprocessing();
     if (lp) {
@@ -419,6 +434,10 @@ public class RustBuild {
     // Point all sketches at a shared target dir so deps are compiled once.
     // (libprocessing builds get their own, so switching back and forth doesn't rebuild everything)
     pb.environment().put("CARGO_TARGET_DIR", targetDir().getAbsolutePath());
+    if (cross != null) {
+      pb.environment().put(cross.linkerVar(), cross.linker);
+      pb.environment().put(cross.ccVar(), cross.linker);
+    }
     // the engine's build.rs checks this same checkout for what it supports
     // (empty: the pinned upstream commit)
     File fork = localFork();
@@ -488,8 +507,9 @@ public class RustBuild {
     // Find the binary in the shared target dir.
     String profile   = release ? "release" : "debug";
     String sketchBin = sanitiseName(sketch.getName());
-    String binaryName = isWindows() ? sketchBin + ".exe" : sketchBin;
-    File binary = new File(targetDir(), profile + "/" + binaryName);
+    boolean exe = cross != null ? crossWindows : isWindows();
+    String binaryName = exe ? sketchBin + ".exe" : sketchBin;
+    File binary = new File(targetDir(), (cross != null ? cross.triple + "/" : "") + profile + "/" + binaryName);
 
     if (!binary.exists()) {
       throw new IOException("Build succeeded but binary not found: " + binary);

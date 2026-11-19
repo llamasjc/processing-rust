@@ -3,10 +3,6 @@ package processing.mode.rust;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -79,27 +75,10 @@ final class EngineDownload {
 
   private static void download(RustMode mode, String url) throws IOException, InterruptedException {
     mode.statusMessage("Downloading the libprocessing engine...");
-    HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.ALWAYS).build();
     Path tmp = Files.createTempFile("rustmode-engine", ".zip");
     try {
-      HttpResponse<InputStream> r = client.send(HttpRequest.newBuilder(URI.create(url)).build(),
-        HttpResponse.BodyHandlers.ofInputStream());
-      if (r.statusCode() != 200) throw new IOException("HTTP " + r.statusCode());
-      long total = r.headers().firstValueAsLong("content-length").orElse(-1);
-      try (InputStream in = r.body(); var out = Files.newOutputStream(tmp)) {
-        byte[] buf = new byte[1 << 16];
-        long done = 0, shown = 0;
-        int n;
-        while ((n = in.read(buf)) > 0) {
-          out.write(buf, 0, n);
-          done += n;
-          if (done - shown > (8 << 20)) {
-            shown = done;
-            mode.statusMessage("Downloading the libprocessing engine: " + (done >> 20) + " MB"
-              + (total > 0 ? " of " + (total >> 20) + " MB" : ""));
-          }
-        }
-      }
+      Http.download(url, tmp.toFile(), done -> mode.statusMessage(
+        "Downloading the libprocessing engine: " + (done >> 20) + " MB"));
       mode.statusMessage("Unpacking the libprocessing engine...");
       unzip(tmp, mode.getFolder().toPath());
       mode.statusMessage("libprocessing engine installed.");

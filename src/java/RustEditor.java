@@ -26,6 +26,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
@@ -512,7 +513,7 @@ public class RustEditor extends Editor {
     ExportDialog.Choice choice = ExportDialog.show(this, sketch.getFolder(),
       new String[] { Renderer.SOFTWARE, Renderer.LIBPROCESSING },
       Renderer.libprocessing() ? Renderer.LIBPROCESSING : Renderer.SOFTWARE,
-      (t, r) -> t == here ? null : "export from that platform");
+      (t, r) -> CrossTarget.why(t, Renderer.LIBPROCESSING.equals(r)));
     if (choice == null) return;
     boolean lp = Renderer.LIBPROCESSING.equals(choice.renderer);
     statusNotice("Exporting " + sketch.getName() + " (an optimized build, this can take a while)...");
@@ -523,20 +524,25 @@ public class RustEditor extends Editor {
       Renderer.set(lp ? Renderer.LIBPROCESSING : Renderer.SOFTWARE);
       AppExport.icon = choice.icon;
       try {
-        File binary = new RustBuild(sketch, getRustMode(), true).build();
-        if (binary == null || !binary.isFile()) { statusError("Export failed: the build didn't produce a program"); return; }
-        File dest = AppExport.write(sketch.getFolder(), sketch.getName(), new File(sketch.getFolder(), "data"),
-          here, binary, new String[0], lp ? "libprocessing" : null,
-          lp ? AppExport.glfwLibs(RustBuild.glfwDir(getRustMode().getFolder())) : null);
-        String made = dest.getName();
-        if (choice.appImage && (here == ExportDialog.Target.LINUX_X64 || here == ExportDialog.Target.LINUX_ARM64)) {
-          String safe = sketch.getName().replaceAll("[^A-Za-z0-9_.-]", "_");
-          File img = AppImage.make(getRustMode().getFolder(), dest, sketch.getName(), safe,
-            here == ExportDialog.Target.LINUX_X64 ? "x86_64" : "aarch64", choice.icon, this::statusNotice);
-          made += ", " + img.getName();
+        choice.outDir.mkdirs();
+        List<String> made = new ArrayList<>();
+        for (ExportDialog.Target target : choice.targets) {
+          statusNotice("Exporting for " + target.label + " (an optimized build, this can take a while)...");
+          File binary = new RustBuild(sketch, getRustMode(), true).crossTo(target).build();
+          if (binary == null || !binary.isFile()) { statusError("Export failed: the build didn't produce a program"); return; }
+          File dest = AppExport.write(choice.outDir, sketch.getName(), new File(sketch.getFolder(), "data"),
+            target, binary, new String[0], lp ? "libprocessing" : null,
+            lp ? AppExport.glfwLibs(RustBuild.glfwDir(getRustMode().getFolder())) : null);
+          made.add(dest.getName());
+          if (choice.appImage && (target == ExportDialog.Target.LINUX_X64 || target == ExportDialog.Target.LINUX_ARM64)) {
+            String safe = sketch.getName().replaceAll("[^A-Za-z0-9_.-]", "_");
+            File img = AppImage.make(getRustMode().getFolder(), dest, sketch.getName(), safe,
+              target == ExportDialog.Target.LINUX_X64 ? "x86_64" : "aarch64", choice.icon, this::statusNotice);
+            made.add(img.getName());
+          }
         }
-        statusNotice("Exported to " + sketch.getName() + "/: " + made);
-        AppExport.show(dest);
+        statusNotice("Exported to " + choice.outDir.getName() + "/: " + String.join(", ", made));
+        AppExport.show(choice.outDir);
       } catch (CargoException e) {
         statusError(e.getMessage() != null ? e.getMessage() : "the build failed");
       } catch (Throwable e) {
