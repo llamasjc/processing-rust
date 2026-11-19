@@ -213,7 +213,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          zips="../RustMode.zip RustMode.txt"
+          zips="../RustMode.zip $(ls ../RustMode-libprocessing-*.zip 2>/dev/null) RustMode.txt"
           notes="release-notes/$GITHUB_REF_NAME.md"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             # each file goes up under a temporary name first and replaces the

@@ -168,11 +168,30 @@ def make_zip(version):
         if plat in LP_SKIP and "libprocessing" in have:
             have.remove("libprocessing")
         print(f"  {plat}: {', '.join(have) if have else 'no cache (sketches build with cargo the first time)'}")
+    # the libprocessing caches left out go up on their own, for the IDE to
+    # download (EngineDownload.java) or to unzip by hand into the modes folder
+    for plat in sorted(LP_SKIP):
+        if (plat, "libprocessing") in good:
+            lp_zip(plat)
     # GitHub takes release files up to 2 GiB
     if path.stat().st_size >= 2 * 1024 ** 3:
         sys.exit(f"{path.name} is {path.stat().st_size // (1024 * 1024)} MB, over the 2048 MB GitHub allows."
                  " Leave a platform's libprocessing cache out with RUSTMODE_LP_SKIP=<platform>.")
     return path
+
+
+def lp_zip(plat):
+    """RustMode-libprocessing-<platform>.zip: one platform's precompiled
+    libprocessing engine, laid out so it unzips into RustMode/cache/<platform>/libprocessing."""
+    src = ROOT / "cache" / plat / "libprocessing"
+    path = ROOT.parent / f"RustMode-libprocessing-{plat}.zip"
+    if path.exists():
+        path.unlink()
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for f in sorted(src.rglob("*")):
+            if f.is_file():
+                z.write(f, Path("RustMode") / f.relative_to(ROOT))
+    print(f"{path}  ({path.stat().st_size // (1024 * 1024)} MB, {plat} libprocessing engine)")
 
 
 if __name__ == "__main__":

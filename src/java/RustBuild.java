@@ -732,6 +732,9 @@ public class RustBuild {
     if (fork != null) renderer = "libprocessing-fork";
     File dir = new File(mode.getFolder(), "cache/" + platformDir() + "/" + renderer);
     File meta = new File(dir, "cache.json");
+    // platforms whose engine isn't in RustMode.zip: offer the release's
+    // RustMode-libprocessing-<platform>.zip instead of compiling it
+    if (!meta.isFile() && "libprocessing".equals(renderer)) EngineDownload.offer(mode, platformDir());
     if (!meta.isFile()) return null;
     String json = readFile(meta);
     if (fork != null) {
