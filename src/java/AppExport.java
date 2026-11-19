@@ -87,6 +87,8 @@ final class AppExport {
                             File program, String[] args, String renderer, File[] libs) throws IOException {
     File dest = new File(sketchFolder, variant);
     deleteTree(dest.toPath());
+    String safe = sketchName.replaceAll("[^A-Za-z0-9_.-]", "_");
+    if (forWindows) return writeWindows(dest, sketchName, safe, dataFolder, program, renderer, libs);
     File lib = new File(dest, "lib");
     if (!lib.mkdirs()) throw new IOException("can't make " + lib);
 
@@ -99,8 +101,6 @@ final class AppExport {
 
     if (dataFolder != null && dataFolder.isDirectory()) copyTree(dataFolder.toPath(), new File(dest, "data").toPath());
 
-    String safe = sketchName.replaceAll("[^A-Za-z0-9_.-]", "_");
-    if (forWindows) iconFiles(dest, sketchName, safe, true);
     if (forWindows) {
       StringBuilder b = new StringBuilder("@echo off\r\ncd /d \"%~dp0\"\r\n");
       if (renderer != null) b.append("set PROCESSING_RENDERER=").append(renderer).append("\r\n");
@@ -134,6 +134,40 @@ final class AppExport {
       launcher.setExecutable(true, false);
       if (forMac) macApp(dest, sketchName, safe, prog);
       else iconFiles(dest, sketchName, safe, false);
+    }
+    return dest;
+  }
+
+  /**
+   * Windows: the program itself is &lt;Sketch&gt;.exe, at the top of the export
+   * with its icon built in, so it's what you double-click (a .bat can't have
+   * an icon). The DLLs sit next to it, where Windows looks; launch.txt has
+   * what a launcher would set (the renderer), and the program makes its own
+   * folder the working folder and asks Windows for the time zone.
+   */
+  private static File writeWindows(File dest, String sketchName, String safe, File dataFolder,
+                                   File program, String renderer, File[] libs) throws IOException {
+    if (!dest.mkdirs()) throw new IOException("can't make " + dest);
+    File exe = new File(dest, safe + ".exe");
+    Files.copy(program.toPath(), exe.toPath(), StandardCopyOption.REPLACE_EXISTING);
+    if (libs != null)
+      for (File l : libs) Files.copy(l.toPath(), new File(dest, l.getName()).toPath(), StandardCopyOption.REPLACE_EXISTING);
+    if (dataFolder != null && dataFolder.isDirectory()) copyTree(dataFolder.toPath(), new File(dest, "data").toPath());
+    if (renderer != null)
+      Files.writeString(new File(dest, "launch.txt").toPath(), "PROCESSING_RENDERER=" + renderer + "\r\n", StandardCharsets.UTF_8);
+    File png = icon;
+    if (png != null && png.isFile()) {
+      try {
+        java.awt.image.BufferedImage img = AppIcons.read(png);
+        int[] sizes = { 16, 32, 48, 64, 128, 256 };
+        java.util.List<byte[]> pngs = new java.util.ArrayList<>();
+        for (int s : sizes) pngs.add(AppIcons.pngBytes(img, s));
+        PeIcon.embed(exe, pngs, sizes);
+      } catch (IOException e) {
+        // the program still works; the icon goes next to it instead
+        System.err.println("icon: couldn't put it into the .exe (" + e.getMessage() + "); left " + safe + ".ico next to it");
+        AppIcons.writeIco(AppIcons.read(png), new File(dest, safe + ".ico"));
+      }
     }
     return dest;
   }
@@ -265,7 +299,11 @@ final class AppExport {
       for (Path p : (Iterable<Path>) all::iterator) {
         Path t = to.resolve(from.relativize(p).toString());
         if (Files.isDirectory(p)) Files.createDirectories(t);
-        else Files.copy(p, t, StandardCopyOption.REPLACE_EXISTING);
+        else {
+          Files.copy(p, t, StandardCopyOption.REPLACE_EXISTING);
+          // programs stay programs (Python's bin/, launchers)
+          if (!windows() && Files.isExecutable(p)) t.toFile().setExecutable(true, false);
+        }
       }
     }
   }

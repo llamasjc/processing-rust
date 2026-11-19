@@ -44,6 +44,10 @@ final class AppIcons {
     return b.toByteArray();
   }
 
+  static byte[] pngBytes(BufferedImage src, int size) throws IOException {
+    return png(scale(src, size));
+  }
+
   static void writePng(BufferedImage src, int size, File dest) throws IOException {
     Files.write(dest.toPath(), png(scale(src, size)));
   }

@@ -32,7 +32,9 @@ final class ExportDialog {
     MACOS_X64("macos-x86_64", "macOS (Intel 64-bit)", "macos-x86_64", "macos-x86-64"),
     MACOS_ARM64("macos-aarch64", "macOS (Apple Silicon)", "macos-aarch64", "macos-arm64"),
     LINUX_X64("linux-amd64", "Linux (64-bit)", "linux-x86_64", "linux-x86-64"),
-    LINUX_ARM64("linux-aarch64", "Linux (ARM 64-bit)", "linux-aarch64", "linux-arm64");
+    LINUX_ARM64("linux-aarch64", "Linux (ARM 64-bit)", "linux-aarch64", "linux-arm64"),
+    /** 32-bit Raspberry Pi; only C++ Mode builds for it */
+    LINUX_ARM32("linux-arm", "Linux (ARM 32-bit)", "linux-arm", "linux-arm");
 
     /** the export folder, Processing's names */
     final String folder;
@@ -94,8 +96,16 @@ final class ExportDialog {
     return show(parent, sketchFolder, renderers, current, why, null);
   }
 
+  /** The platforms every mode exports for (not the 32-bit Raspberry Pi). */
+  static final Target[] COMMON = { Target.WINDOWS_X64, Target.MACOS_X64, Target.MACOS_ARM64, Target.LINUX_X64, Target.LINUX_ARM64 };
+
   static Choice show(Component parent, java.io.File sketchFolder, String[] renderers, String current,
                      BiFunction<Target, String, String> why, Installer installer) {
+    return show(parent, sketchFolder, renderers, current, why, installer, COMMON);
+  }
+
+  static Choice show(Component parent, java.io.File sketchFolder, String[] renderers, String current,
+                     BiFunction<Target, String, String> why, Installer installer, Target[] shown) {
     JPanel panel = new JPanel();
     panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
 
@@ -113,7 +123,7 @@ final class ExportDialog {
     Map<Target, javax.swing.JButton> installs = new LinkedHashMap<>();
     Runnable[] refreshRef = { null };
     JComboBox<String> rendererBox = new JComboBox<>(renderers);
-    for (Target t : Target.values()) {
+    for (Target t : shown) {
       JPanel row = new JPanel(new BorderLayout(8, 0));
       JCheckBox box = new JCheckBox(t.label);
       JLabel note = new JLabel();
@@ -237,7 +247,7 @@ final class ExportDialog {
     Target here = Target.here();
     Runnable refresh = () -> {
       String r = (String) renderer.getSelectedItem();
-      for (Target t : Target.values()) {
+      for (Target t : shown) {
         String reason = why.apply(t, r);
         JCheckBox box = boxes.get(t);
         box.setEnabled(reason == null);
@@ -250,7 +260,7 @@ final class ExportDialog {
     };
     refreshRef[0] = refresh;
     refresh.run();
-    if (boxes.get(here).isEnabled()) boxes.get(here).setSelected(true);
+    if (boxes.containsKey(here) && boxes.get(here).isEnabled()) boxes.get(here).setSelected(true);
     renderer.addActionListener(e -> refresh.run());
 
     Object[] options = { "Export", "Cancel" };

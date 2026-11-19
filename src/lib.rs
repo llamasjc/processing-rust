@@ -4261,6 +4261,7 @@ pub fn __set_wheel_delta(d: f32) { *wheel_cell().lock() = d; }
 // ──────────────────────────── Canvas / window ────────────────────────────────
 
 pub fn size(w: u32, h: u32) {
+    apply_launch_file();
     // width and height take the new size right away, as in Processing, so
     // setup() can use them on the next line (new float[width] and the like)
     {
@@ -4733,8 +4734,51 @@ fn local_seconds() -> i64 {
         .map(|d| d.as_secs() as i64).unwrap_or(0);
     let offset = std::env::var("PROCESSING_UTC_OFFSET").ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|o| o.abs() <= 18 * 3600).unwrap_or(0);
+        .filter(|o| o.abs() <= 18 * 3600).unwrap_or_else(system_utc_offset);
     now + offset
+}
+
+/// Windows exports start the program itself (double-clicked, with its icon),
+/// not through a launcher that passes the offset: ask Windows for it.
+#[cfg(windows)]
+fn system_utc_offset() -> i64 {
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32, standard_name: [u16; 32], standard_date: [u16; 8], standard_bias: i32,
+        daylight_name: [u16; 32], daylight_date: [u16; 8], daylight_bias: i32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" { fn GetTimeZoneInformation(tz: *mut TimeZoneInformation) -> u32; }
+    let mut tz: TimeZoneInformation = unsafe { std::mem::zeroed() };
+    let rc = unsafe { GetTimeZoneInformation(&mut tz) };
+    let bias = tz.bias + if rc == 2 { tz.daylight_bias } else if rc == 1 { tz.standard_bias } else { 0 };
+    -(bias as i64) * 60
+}
+#[cfg(not(windows))]
+fn system_utc_offset() -> i64 { 0 }
+
+/// Exported programs on Windows are started directly, so the settings a
+/// launcher would set come from launch.txt next to the program (KEY=VALUE
+/// lines, e.g. PROCESSING_RENDERER=libprocessing), and the working folder is
+/// the program's, where its data/ folder is. Set variables win.
+pub fn apply_launch_file() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) else { return };
+        if let Ok(text) = std::fs::read_to_string(dir.join("launch.txt")) {
+            for line in text.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    let k = k.trim();
+                    if !k.is_empty() && !k.starts_with('#') && std::env::var_os(k).is_none() {
+                        std::env::set_var(k, v.trim());
+                    }
+                }
+            }
+        }
+        if dir.join("data").is_dir() && !std::path::Path::new("data").is_dir() {
+            let _ = std::env::set_current_dir(&dir);
+        }
+    });
 }
 /// (year, month 1..12, day 1..31) of a day count since 1970-01-01.
 fn civil(days: i64) -> (i32, i32, i32) {
@@ -5359,6 +5403,7 @@ impl<S: 'static> App<S> {
     pub fn window_resized(mut self, f: fn(&mut S)) -> Self { self.win_fns.window_resized = Some(f); self }
 
     pub fn run(mut self) {
+        apply_launch_file();
         #[cfg(feature = "libprocessing")]
         if crate::lp::on() { return crate::lp::run(self); }
         #[cfg(not(feature = "wasm"))]

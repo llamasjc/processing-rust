@@ -33,6 +33,7 @@ static CHECKED: AtomicBool = AtomicBool::new(false);
 /// Whether drawing goes to libprocessing. Decided once, from the environment.
 pub(crate) fn on() -> bool {
     if !CHECKED.load(Ordering::Relaxed) {
+        crate::apply_launch_file();
         let want = std::env::var("PROCESSING_RENDERER").map(|v| v.eq_ignore_ascii_case("libprocessing")).unwrap_or(false);
         ACTIVE.store(want, Ordering::Relaxed);
         CHECKED.store(true, Ordering::Relaxed);
