@@ -201,6 +201,10 @@ jobs:
           rm -rf artifacts
 
       - name: Zips
+        env:
+          # libprocessing caches left out of RustMode.zip to stay under 2 GB
+          # (set the repository variable RUSTMODE_LP_SKIP, e.g. linux-arm64)
+          RUSTMODE_LP_SKIP: ${{ vars.RUSTMODE_LP_SKIP }}
         run: python3 scripts/create-release.py
 
       # notes from release-notes/<tag>.md when there is one; a re-pushed tag
@@ -212,7 +216,19 @@ jobs:
           zips="../RustMode.zip RustMode.txt"
           notes="release-notes/$GITHUB_REF_NAME.md"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" $zips --clobber
+            # each file goes up under a temporary name first and replaces the
+            # old one only once it's there: --clobber deletes first, so a
+            # failed upload would leave the release without it
+            for f in $zips; do
+              n=$(basename "$f"); tmp="new-$n"
+              cp "$f" "$RUNNER_TEMP/$tmp"
+              gh release delete-asset "$GITHUB_REF_NAME" "$tmp" -y 2>/dev/null || true
+              gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/$tmp"
+              old=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" -q ".assets[] | select(.name==\"$n\") | .id")
+              [ -n "$old" ] && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+              new=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" -q ".assets[] | select(.name==\"$tmp\") | .id")
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/assets/$new" -f name="$n" >/dev/null
+            done
             [ -f "$notes" ] && gh release edit "$GITHUB_REF_NAME" --notes-file "$notes"
           elif [ -f "$notes" ]; then
             gh release create "$GITHUB_REF_NAME" $zips --title "Rust Mode ${GITHUB_REF_NAME#v}" --notes-file "$notes"

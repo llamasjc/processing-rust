@@ -115,6 +115,38 @@ def bundle_glfw(native: Path):
                 return
 
 
+def prune_unlinked(out: Path, engine: str, env: dict):
+    """Drops the libraries a sketch never links: build-script dependencies
+    (lalrpop and the like) and the ones only proc macros use. That's about a
+    seventh of the libprocessing cache. rustc prints what it would link for a
+    program that only uses the engine, and that list is the same for every
+    sketch. Proc macros themselves (.so, .dylib, .dll) stay: rustc loads them
+    when it reads the engine."""
+    import re, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "m.rs"
+        src.write_text("extern crate processing;\nfn main() {}\n")
+        p = subprocess.run(["rustc", "--edition", "2021", "--crate-type", "bin",
+                            "-L", f"dependency={out / 'deps'}", "-L", f"native={out / 'native'}",
+                            "--extern", f"processing={out / 'deps' / engine}",
+                            "--print", "link-args", "-o", str(Path(tmp) / "m"), str(src)],
+                           env=env, capture_output=True, text=True)
+    text = p.stdout
+    linked = set()
+    for body in re.findall(r"\{([^}]*)\}\.rlib", text):   # deps/{liba-1,libb-2}.rlib
+        linked.update(n + ".rlib" for n in body.split(","))
+    linked.update(re.findall(r"([\w\-]+\.rlib)", re.sub(r"\{[^}]*\}", "", text)))
+    if engine not in linked:
+        print("  (couldn't read what a sketch links; keeping every library)")
+        return
+    dropped = 0
+    for f in (out / "deps").glob("*.rlib"):
+        if f.name not in linked:
+            dropped += f.stat().st_size
+            f.unlink()
+    print(f"  dropped {dropped // (1024 * 1024)} MB a sketch never links")
+
+
 def build(renderer: str, upstream: bool = False):
     plat = platform_dir()
     fork = local_fork() if renderer == "libprocessing" and not upstream else None
@@ -211,6 +243,7 @@ incremental = false
         shutil.copy2(f, out / "native" / Path(f).name)
     if renderer == "libprocessing":
         bundle_glfw(out / "native")
+    prune_unlinked(out, engine, env)
     meta = {
         "rustc": version,
         "rustc_full": rustc,

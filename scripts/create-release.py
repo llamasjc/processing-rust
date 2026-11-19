@@ -36,6 +36,7 @@ PLATFORMS = ["linux-x86-64", "linux-arm64", "macos-x86-64", "macos-arm64", "wind
 RENDERERS = ["cpu", "libprocessing"]
 SKIP_DIRS = {".git", ".github", "release-notes", "artifacts", "target", "build", ".gradle", "__pycache__"}
 WORKFLOW = "build-cache.yml"
+LP_SKIP = {p for p in os.environ.get("RUSTMODE_LP_SKIP", "").replace(",", " ").split() if p}
 
 _spec = importlib.util.spec_from_file_location("build_cache", ROOT / "scripts" / "build-cache.py")
 bc = importlib.util.module_from_spec(_spec)
@@ -142,16 +143,19 @@ def make_zip(version):
     if path.exists():
         path.unlink()
     n = 0
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for dirpath, dirs, files in os.walk(ROOT):
             rel = Path(dirpath).relative_to(ROOT)
             if rel == Path("."):
                 dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             dirs[:] = [d for d in dirs if d != "__pycache__"]
-            # cache/<platform>/<renderer>: only the ones RustMode would use
+            # cache/<platform>/<renderer>: only the ones RustMode would use,
+            # minus the libprocessing caches listed in RUSTMODE_LP_SKIP
+            # (those platforms build libprocessing once on first use)
             parts = rel.parts
             if len(parts) == 2 and parts[0] == "cache":
-                dirs[:] = [d for d in dirs if (parts[1], d) in good]
+                dirs[:] = [d for d in dirs if (parts[1], d) in good
+                           and not (d == "libprocessing" and parts[1] in LP_SKIP)]
             for f in files:
                 full = Path(dirpath) / f
                 if f.endswith((".log", ".bak")) or f.startswith("hs_err_pid"):
@@ -161,7 +165,13 @@ def make_zip(version):
     print(f"\n{path}  ({path.stat().st_size // (1024 * 1024)} MB, {n} files)")
     for plat in PLATFORMS:
         have = [r for r in RENDERERS if (plat, r) in good]
+        if plat in LP_SKIP and "libprocessing" in have:
+            have.remove("libprocessing")
         print(f"  {plat}: {', '.join(have) if have else 'no cache (sketches build with cargo the first time)'}")
+    # GitHub takes release files up to 2 GiB
+    if path.stat().st_size >= 2 * 1024 ** 3:
+        sys.exit(f"{path.name} is {path.stat().st_size // (1024 * 1024)} MB, over the 2048 MB GitHub allows."
+                 " Leave a platform's libprocessing cache out with RUSTMODE_LP_SKIP=<platform>.")
     return path
 
 
