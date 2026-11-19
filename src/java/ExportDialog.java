@@ -60,6 +60,13 @@ final class ExportDialog {
     }
   }
 
+  /** For a greyed-out platform whose missing piece can be installed from the dialog. */
+  interface Installer {
+    boolean can(Target t, String renderer);
+    /** installs off the Swing thread; returns when done */
+    void install(Target t);
+  }
+
   /** What was picked. */
   static final class Choice {
     final List<Target> targets;
@@ -84,6 +91,11 @@ final class ExportDialog {
    */
   static Choice show(Component parent, java.io.File sketchFolder, String[] renderers, String current,
                      BiFunction<Target, String, String> why) {
+    return show(parent, sketchFolder, renderers, current, why, null);
+  }
+
+  static Choice show(Component parent, java.io.File sketchFolder, String[] renderers, String current,
+                     BiFunction<Target, String, String> why, Installer installer) {
     JPanel panel = new JPanel();
     panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
 
@@ -98,6 +110,9 @@ final class ExportDialog {
     platforms.setAlignmentX(Component.LEFT_ALIGNMENT);
     Map<Target, JCheckBox> boxes = new LinkedHashMap<>();
     Map<Target, JLabel> notes = new LinkedHashMap<>();
+    Map<Target, javax.swing.JButton> installs = new LinkedHashMap<>();
+    Runnable[] refreshRef = { null };
+    JComboBox<String> rendererBox = new JComboBox<>(renderers);
     for (Target t : Target.values()) {
       JPanel row = new JPanel(new BorderLayout(8, 0));
       JCheckBox box = new JCheckBox(t.label);
@@ -106,6 +121,25 @@ final class ExportDialog {
       note.setFont(note.getFont().deriveFont(note.getFont().getSize2D() - 1f));
       row.add(box, BorderLayout.WEST);
       row.add(note, BorderLayout.CENTER);
+      if (installer != null) {
+        javax.swing.JButton install = new javax.swing.JButton("Install");
+        install.setVisible(false);
+        install.addActionListener(e -> {
+          install.setEnabled(false);
+          install.setText("Installing...");
+          new Thread(() -> {
+            installer.install(t);
+            javax.swing.SwingUtilities.invokeLater(() -> {
+              install.setText("Install");
+              install.setEnabled(true);
+              refreshRef[0].run();
+              if (boxes.get(t).isEnabled()) boxes.get(t).setSelected(true);
+            });
+          }, "export-install").start();
+        });
+        row.add(install, BorderLayout.EAST);
+        installs.put(t, install);
+      }
       platforms.add(row);
       boxes.put(t, box);
       notes.put(t, note);
@@ -116,7 +150,7 @@ final class ExportDialog {
     JPanel rendererRow = new JPanel(new BorderLayout(8, 0));
     rendererRow.setAlignmentX(Component.LEFT_ALIGNMENT);
     rendererRow.add(new JLabel("Renderer"), BorderLayout.WEST);
-    JComboBox<String> renderer = new JComboBox<>(renderers);
+    JComboBox<String> renderer = rendererBox;
     renderer.setSelectedItem(current);
     rendererRow.add(renderer, BorderLayout.CENTER);
     panel.add(rendererRow);
@@ -209,8 +243,12 @@ final class ExportDialog {
         box.setEnabled(reason == null);
         if (reason != null) box.setSelected(false);
         notes.get(t).setText(reason == null ? "" : reason);
+        javax.swing.JButton ib = installs.get(t);
+        if (ib != null) ib.setVisible(reason != null && installer.can(t, r));
       }
+      platforms.revalidate();
     };
+    refreshRef[0] = refresh;
     refresh.run();
     if (boxes.get(here).isEnabled()) boxes.get(here).setSelected(true);
     renderer.addActionListener(e -> refresh.run());

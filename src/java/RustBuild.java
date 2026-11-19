@@ -113,10 +113,11 @@ public class RustBuild {
 
   /** Export for another platform (see CrossTarget); null builds for this computer. */
   private CrossTarget cross;
+  private ExportDialog.Target crossTarget;
   private boolean crossWindows;
 
   RustBuild crossTo(ExportDialog.Target t) {
-    if (t != ExportDialog.Target.here()) { cross = CrossTarget.to(t); crossWindows = t.windows(); }
+    if (t != ExportDialog.Target.here()) { cross = CrossTarget.to(t); crossTarget = t; crossWindows = t.windows(); }
     return this;
   }
 
@@ -390,9 +391,13 @@ public class RustBuild {
     FfmpegSetup.ensure(sketch.getFolder(), ".pde", mode::statusMessage);
 
     // ── Fast path: one rustc call against the precompiled engine ─────────────
-    if (!release) {
+    if (!release || cross != null) {
       File fast = cachedBuild(projectDir);
       if (fast != null) return fast;
+      // libprocessing for another platform only links against its precompiled engine
+      if (cross != null && Renderer.libprocessing())
+        throw new IOException("there's no precompiled libprocessing engine for " + crossTarget.label
+          + " in this copy of Rust Mode (it comes in the release's RustMode.zip)");
     }
 
     // ── Pre-flight: ensure cargo is on PATH ───────────────────────────────────
@@ -748,13 +753,14 @@ public class RustBuild {
     String renderer = Renderer.libprocessing() ? "libprocessing" : "cpu";
     // with a libprocessing checkout of your own, only a cache built from that
     // checkout (libprocessing-fork) will do; the pinned one lacks its changes
-    File fork = Renderer.libprocessing() ? localFork() : null;
+    File fork = Renderer.libprocessing() && cross == null ? localFork() : null;
     if (fork != null) renderer = "libprocessing-fork";
-    File dir = new File(mode.getFolder(), "cache/" + platformDir() + "/" + renderer);
+    String plat = cross != null ? crossTarget.rust : platformDir();
+    File dir = new File(mode.getFolder(), "cache/" + plat + "/" + renderer);
     File meta = new File(dir, "cache.json");
     // platforms whose engine isn't in RustMode.zip: offer the release's
     // RustMode-libprocessing-<platform>.zip instead of compiling it
-    if (!meta.isFile() && "libprocessing".equals(renderer)) EngineDownload.offer(mode, platformDir());
+    if (!meta.isFile() && "libprocessing".equals(renderer)) EngineDownload.offer(mode, plat);
     if (!meta.isFile()) return null;
     String json = readFile(meta);
     if (fork != null) {
@@ -788,25 +794,43 @@ public class RustBuild {
         if (got == null) { LOG.info("RustMode: couldn't install Rust " + version + "; using cargo"); return null; }
       }
       env.put("RUSTUP_TOOLCHAIN", tc);
+      if (cross != null) {
+        mode.statusMessage("Getting Rust's standard library for " + crossTarget.label + " (once)...");
+        cross.addRustTarget(tc);
+      }
     } else {
       String v = runQuiet(List.of("rustc", "-V"), null);
       if (v == null || !v.contains(" " + version + " ")) return null;
     }
 
     String bin = sanitiseName(sketch.getName());
-    File outDir = new File(targetDir(), "fast");
+    File outDir = new File(targetDir(), cross != null ? "fast-" + cross.triple : "fast");
     outDir.mkdirs();
-    File binary = new File(outDir, isWindows() ? bin + ".exe" : bin);
+    boolean exe = cross != null ? crossWindows : isWindows();
+    File binary = new File(outDir, exe ? bin + ".exe" : bin);
 
     List<String> cmd = new ArrayList<>(List.of(
       "rustc", "--edition", "2021", "--crate-name", bin, "--crate-type", "bin",
-      "-C", "opt-level=1", "--error-format=short",
+      "-C", release ? "opt-level=3" : "opt-level=1", "--error-format=short",
       "-L", "dependency=" + new File(dir, "deps").getAbsolutePath(),
       "-L", "native=" + new File(dir, "native").getAbsolutePath(),
       "--extern", "processing=" + engineLib.getAbsolutePath(),
       "-o", binary.getAbsolutePath()));
-    for (String p : jsonStrings(json, "link_search")) {
-      if (new File(p).isDirectory()) { cmd.add("-L"); cmd.add("native=" + p); }
+    if (cross == null) {
+      for (String p : jsonStrings(json, "link_search")) {
+        if (new File(p).isDirectory()) { cmd.add("-L"); cmd.add("native=" + p); }
+      }
+    } else {
+      cmd.add("--target"); cmd.add(cross.triple);
+      cmd.add("-C"); cmd.add("linker=" + cross.linker);
+      // Linux: the target's system libraries come with its cache (CI packs them)
+      File kit = new File(dir, "linkkit");
+      if (new File(kit, "usr/lib").isDirectory()) {
+        String lib = new File(kit, "usr/lib").getAbsolutePath();
+        cmd.add("-L"); cmd.add("native=" + lib);
+        cmd.add("-C"); cmd.add("link-arg=--sysroot=" + kit.getAbsolutePath());
+        cmd.add("-C"); cmd.add("link-arg=-B" + lib);
+      }
     }
     cmd.add("src/main.rs");
 

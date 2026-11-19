@@ -133,18 +133,81 @@ def prune_unlinked(out: Path, engine: str, env: dict):
                            env=env, capture_output=True, text=True)
     text = p.stdout
     linked = set()
+    if not text:
+        return ""
     for body in re.findall(r"\{([^}]*)\}\.rlib", text):   # deps/{liba-1,libb-2}.rlib
         linked.update(n + ".rlib" for n in body.split(","))
     linked.update(re.findall(r"([\w\-]+\.rlib)", re.sub(r"\{[^}]*\}", "", text)))
     if engine not in linked:
         print("  (couldn't read what a sketch links; keeping every library)")
-        return
+        return text
     dropped = 0
     for f in (out / "deps").glob("*.rlib"):
         if f.name not in linked:
             dropped += f.stat().st_size
             f.unlink()
     print(f"  dropped {dropped // (1024 * 1024)} MB a sketch never links")
+    return text
+
+
+def link_kit(kit: Path, link_args: str):
+    """The system files a sketch links against on this Linux: glibc's start
+    files and libraries, libgcc_s, and whatever the engine asks for (-lX11,
+    -lasound...). With them, another computer's cross linker can link a
+    sketch for this platform (Export Application on Linux), and the program
+    asks for this glibc, not a newer one. Copies, no symlinks, all in
+    usr/lib; linker scripts like libc.so are rewritten to plain names."""
+    import re
+    lib = kit / "usr" / "lib"
+    if kit.exists():
+        shutil.rmtree(kit)
+    lib.mkdir(parents=True)
+
+    def find(name):
+        r = subprocess.run(["cc", f"-print-file-name={name}"], capture_output=True, text=True).stdout.strip()
+        return Path(r) if r and r != name and Path(r).exists() else None
+
+    def copy_lib(path: Path, as_name: str):
+        real = path.resolve()
+        data = real.read_bytes()
+        if not data.startswith(b"\x7fELF"):
+            # a linker script: copy what it names, refer to them by name
+            text = data.decode(errors="replace")
+            body = re.sub(r"/\*.*?\*/", "", text, flags=re.S)   # not the comments
+            for ref in set(re.findall(r"((?:/[\w.+-]+)+|lib[\w.+-]+\.(?:so[.\d]*|a))", body)):
+                rp = Path(ref) if ref.startswith("/") else real.parent / ref
+                if not rp.exists() and not ref.startswith("/"):
+                    rp = find(ref) or rp
+                if rp.exists():
+                    shutil.copy2(rp.resolve(), lib / rp.name)
+                text = text.replace(ref, rp.name)
+            (lib / as_name).write_text(text)
+        else:
+            # the linker takes the name a program asks for (libX11.so.6)
+            # from inside the file, so one copy under the plain name will do
+            shutil.copyfile(real, lib / as_name)
+
+    for f in ["crt1.o", "Scrt1.o", "crti.o", "crtn.o", "libc_nonshared.a"]:
+        p = find(f)
+        if p:
+            shutil.copy2(p, lib / f)
+    names = set(re.findall(r'"-l([^"\s]+)"|\s-l([^\s"]+)', link_args))
+    wanted = {a or b for a, b in names} | {"c", "m", "pthread", "dl", "rt", "util", "gcc_s"}
+    for n in sorted(wanted):
+        p = find(f"lib{n}.so")
+        if p:
+            copy_lib(p, f"lib{n}.so")
+        elif find(f"lib{n}.a"):
+            # glibc 2.34+: libpthread, libdl... are empty archives now
+            shutil.copy2(find(f"lib{n}.a"), lib / f"lib{n}.a")
+        else:
+            print(f"  link kit: lib{n}.so not found")
+    for ld in Path("/lib").glob("ld-linux*.so*"):
+        shutil.copyfile(ld.resolve(), lib / ld.name)
+    for ld in Path("/lib64").glob("ld-linux*.so*"):
+        shutil.copyfile(ld.resolve(), lib / ld.name)
+    size = sum(f.stat().st_size for f in lib.iterdir()) // (1024 * 1024)
+    print(f"  link kit: {len(list(lib.iterdir()))} files, {size} MB")
 
 
 def build(renderer: str, upstream: bool = False):
@@ -243,7 +306,9 @@ incremental = false
         shutil.copy2(f, out / "native" / Path(f).name)
     if renderer == "libprocessing":
         bundle_glfw(out / "native")
-    prune_unlinked(out, engine, env)
+    link_args = prune_unlinked(out, engine, env)
+    if sys.platform.startswith("linux") and link_args:
+        link_kit(out / "linkkit", link_args)
     meta = {
         "rustc": version,
         "rustc_full": rustc,

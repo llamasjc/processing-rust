@@ -15,9 +15,46 @@ final class CrossTarget {
   final String linker;
   /** how to get the linker, shown in the dialog when it's missing */
   final String install;
+  /** the package manager command that installs it, or null (osxcross: a guide) */
+  final java.util.List<String> installCmd;
 
   private CrossTarget(String triple, String linker, String install) {
     this.triple = triple; this.linker = linker; this.install = install;
+    java.util.List<String> c = null;
+    if (install.startsWith("pacman ")) c = new java.util.ArrayList<>(java.util.List.of("pkexec", "pacman", "-S", "--noconfirm", "--needed"));
+    else if (install.startsWith("apt install ")) c = new java.util.ArrayList<>(java.util.List.of("pkexec", "apt-get", "install", "-y"));
+    else if (install.startsWith("dnf install ")) c = new java.util.ArrayList<>(java.util.List.of("pkexec", "dnf", "install", "-y"));
+    else if (install.startsWith("brew install ")) c = new java.util.ArrayList<>(java.util.List.of("brew", "install"));
+    if (c != null) c.add(install.substring(install.lastIndexOf(' ') + 1));
+    this.installCmd = c;
+  }
+
+  static final String OSXCROSS_GUIDE = "https://github.com/tpoechtrager/osxcross#installation";
+
+  /**
+   * Installs the linker (asks for the password through pkexec), or opens the
+   * osxcross guide. Returns true if it's there afterwards. Off the Swing thread.
+   */
+  boolean install(java.util.function.Consumer<String> status) {
+    if (installCmd == null) {
+      try { java.awt.Desktop.getDesktop().browse(java.net.URI.create(OSXCROSS_GUIDE)); } catch (Exception ignored) {}
+      status.accept("osxcross isn't a package: follow the guide that just opened"
+        + (new File("/usr/bin/pacman").exists() ? " (on Arch it's in the AUR: yay -S osxcross-git)" : "")
+        + ", then open Export Application again.");
+      return false;
+    }
+    status.accept("Installing " + install + " (asks for your password)...");
+    try {
+      Process p = new ProcessBuilder(installCmd).redirectErrorStream(true).start();
+      p.getInputStream().transferTo(System.out);
+      p.waitFor();
+    } catch (Exception e) {
+      status.accept("Couldn't install it: " + e.getMessage());
+      return false;
+    }
+    boolean ok = linkerInstalled();
+    status.accept(ok ? linker + " is installed." : "It didn't install. In a terminal: sudo " + install);
+    return ok;
   }
 
   private static boolean linux() { return System.getProperty("os.name", "").toLowerCase().contains("linux"); }
@@ -65,14 +102,28 @@ final class CrossTarget {
     }
   }
 
-  /** Why t can't be exported from here with this renderer, or null if it can. */
-  static String why(ExportDialog.Target t, boolean libprocessing) {
+  /**
+   * Why t can't be exported from here with this renderer, or null if it can.
+   * Other platforms link against the precompiled engine that comes in the
+   * release zip (and, for Linux, the system libraries packed with it).
+   */
+  static String why(ExportDialog.Target t, boolean libprocessing, File modeFolder) {
     if (t == ExportDialog.Target.here()) return null;
-    if (libprocessing) return "libprocessing: export on that platform";
     CrossTarget c = to(t);
     if (c == null) return "export on that platform";
+    File cache = new File(modeFolder, "cache/" + t.rust + "/" + (libprocessing ? "libprocessing" : "cpu"));
+    boolean engine = new File(cache, "cache.json").isFile();
+    if (libprocessing && !engine) return "no " + t.label + " libprocessing engine in this copy";
+    if (engine && t.name().startsWith("LINUX") && !new File(cache, "linkkit/usr/lib").isDirectory())
+      return "this copy's " + t.label + " engine is too old to link here";
     if (!c.linkerInstalled()) return "needs " + c.install;
     return null;
+  }
+
+  /** The dialog's Install button, for a platform whose only missing piece is the linker. */
+  static boolean installable(ExportDialog.Target t, File modeFolder, boolean libprocessing) {
+    String w = why(t, libprocessing, modeFolder);
+    return w != null && w.startsWith("needs ");
   }
 
   /** Adds Rust's standard library for the target (once, quick). */

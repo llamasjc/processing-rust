@@ -513,7 +513,16 @@ public class RustEditor extends Editor {
     ExportDialog.Choice choice = ExportDialog.show(this, sketch.getFolder(),
       new String[] { Renderer.SOFTWARE, Renderer.LIBPROCESSING },
       Renderer.libprocessing() ? Renderer.LIBPROCESSING : Renderer.SOFTWARE,
-      (t, r) -> CrossTarget.why(t, Renderer.LIBPROCESSING.equals(r)));
+      (t, r) -> CrossTarget.why(t, Renderer.LIBPROCESSING.equals(r), getRustMode().getFolder()),
+      new ExportDialog.Installer() {
+        public boolean can(ExportDialog.Target t, String r) {
+          return CrossTarget.installable(t, getRustMode().getFolder(), Renderer.LIBPROCESSING.equals(r));
+        }
+        public void install(ExportDialog.Target t) {
+          CrossTarget c = CrossTarget.to(t);
+          if (c != null) c.install(m -> statusNotice(m));
+        }
+      });
     if (choice == null) return;
     boolean lp = Renderer.LIBPROCESSING.equals(choice.renderer);
     statusNotice("Exporting " + sketch.getName() + " (an optimized build, this can take a while)...");
@@ -532,7 +541,9 @@ public class RustEditor extends Editor {
           if (binary == null || !binary.isFile()) { statusError("Export failed: the build didn't produce a program"); return; }
           File dest = AppExport.write(choice.outDir, sketch.getName(), new File(sketch.getFolder(), "data"),
             target, binary, new String[0], lp ? "libprocessing" : null,
-            lp ? AppExport.glfwLibs(RustBuild.glfwDir(getRustMode().getFolder())) : null);
+            lp ? AppExport.glfwLibs(target == ExportDialog.Target.here()
+                   ? RustBuild.glfwDir(getRustMode().getFolder())
+                   : new File(getRustMode().getFolder(), "cache/" + target.rust + "/libprocessing/native")) : null);
           made.add(dest.getName());
           if (choice.appImage && (target == ExportDialog.Target.LINUX_X64 || target == ExportDialog.Target.LINUX_ARM64)) {
             String safe = sketch.getName().replaceAll("[^A-Za-z0-9_.-]", "_");
