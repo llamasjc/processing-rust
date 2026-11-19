@@ -506,23 +506,45 @@ public class RustEditor extends Editor {
     if (sketch.isModified()) {
       try { sketch.save(); } catch (Exception ex) { statusError("Couldn't save: " + ex.getMessage()); return; }
     }
+    // Rust sketches are compiled for the computer they're exported on, so
+    // the other platforms are shown but off (like Java mode without a JDK)
+    ExportDialog.Target here = ExportDialog.Target.here();
+    ExportDialog.Choice choice = ExportDialog.show(this, sketch.getFolder(),
+      new String[] { Renderer.SOFTWARE, Renderer.LIBPROCESSING },
+      Renderer.libprocessing() ? Renderer.LIBPROCESSING : Renderer.SOFTWARE,
+      (t, r) -> t == here ? null : "export from that platform");
+    if (choice == null) return;
+    boolean lp = Renderer.LIBPROCESSING.equals(choice.renderer);
     statusNotice("Exporting " + sketch.getName() + " (an optimized build, this can take a while)...");
-    boolean lp = Renderer.libprocessing();
     Thread t = new Thread(() -> {
+      // the build reads the renderer from the toolbar setting: use the
+      // dialog's for this export, then put the toolbar's back
+      boolean toolbarLp = Renderer.libprocessing();
+      Renderer.set(lp ? Renderer.LIBPROCESSING : Renderer.SOFTWARE);
+      AppExport.icon = choice.icon;
       try {
         File binary = new RustBuild(sketch, getRustMode(), true).build();
         if (binary == null || !binary.isFile()) { statusError("Export failed: the build didn't produce a program"); return; }
-        String fallback = (System.getProperty("os.name", "").toLowerCase().contains("win") ? "windows" : "linux") + "-" + System.getProperty("os.arch", "");
         File dest = AppExport.write(sketch.getFolder(), sketch.getName(), new File(sketch.getFolder(), "data"),
-          AppExport.variant(fallback), binary, new String[0], lp ? "libprocessing" : null,
+          here, binary, new String[0], lp ? "libprocessing" : null,
           lp ? AppExport.glfwLibs(RustBuild.glfwDir(getRustMode().getFolder())) : null);
-        statusNotice("Exported to " + sketch.getName() + "/" + dest.getName() + "/");
+        String made = dest.getName();
+        if (choice.appImage && (here == ExportDialog.Target.LINUX_X64 || here == ExportDialog.Target.LINUX_ARM64)) {
+          String safe = sketch.getName().replaceAll("[^A-Za-z0-9_.-]", "_");
+          File img = AppImage.make(getRustMode().getFolder(), dest, sketch.getName(), safe,
+            here == ExportDialog.Target.LINUX_X64 ? "x86_64" : "aarch64", choice.icon, this::statusNotice);
+          made += ", " + img.getName();
+        }
+        statusNotice("Exported to " + sketch.getName() + "/: " + made);
         AppExport.show(dest);
       } catch (CargoException e) {
         statusError(e.getMessage() != null ? e.getMessage() : "the build failed");
       } catch (Throwable e) {
         LOG.log(Level.WARNING, "export failed", e);
         statusError("Export failed: " + (e.getMessage() != null ? e.getMessage() : e.toString()));
+      } finally {
+        AppExport.icon = null;
+        Renderer.set(toolbarLp ? Renderer.LIBPROCESSING : Renderer.SOFTWARE);
       }
     }, "rustmode-export");
     t.setDaemon(true);

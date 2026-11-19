@@ -72,6 +72,19 @@ final class AppExport {
    */
   static File write(File sketchFolder, String sketchName, File dataFolder, String variant,
                     File program, String[] args, String renderer, File[] libs) throws IOException {
+    return write(sketchFolder, sketchName, dataFolder, variant, windows(), mac(), program, args, renderer, libs);
+  }
+
+  /** For another platform: its folder name and launcher, whatever this computer is. */
+  static File write(File sketchFolder, String sketchName, File dataFolder, ExportDialog.Target target,
+                    File program, String[] args, String renderer, File[] libs) throws IOException {
+    return write(sketchFolder, sketchName, dataFolder, target.folder, target.windows(), target.mac(),
+                 program, args, renderer, libs);
+  }
+
+  private static File write(File sketchFolder, String sketchName, File dataFolder, String variant,
+                            boolean forWindows, boolean forMac,
+                            File program, String[] args, String renderer, File[] libs) throws IOException {
     File dest = new File(sketchFolder, variant);
     deleteTree(dest.toPath());
     File lib = new File(dest, "lib");
@@ -87,7 +100,8 @@ final class AppExport {
     if (dataFolder != null && dataFolder.isDirectory()) copyTree(dataFolder.toPath(), new File(dest, "data").toPath());
 
     String safe = sketchName.replaceAll("[^A-Za-z0-9_.-]", "_");
-    if (windows()) {
+    if (forWindows) iconFiles(dest, sketchName, safe, true);
+    if (forWindows) {
       StringBuilder b = new StringBuilder("@echo off\r\ncd /d \"%~dp0\"\r\n");
       if (renderer != null) b.append("set PROCESSING_RENDERER=").append(renderer).append("\r\n");
       // hour(), minute()... in local time, as when run from the IDE
@@ -118,13 +132,38 @@ final class AppExport {
       File launcher = new File(dest, safe);
       Files.writeString(launcher.toPath(), b.toString(), StandardCharsets.UTF_8);
       launcher.setExecutable(true, false);
-      if (mac()) macApp(dest, sketchName, safe, prog);
+      if (forMac) macApp(dest, sketchName, safe, prog);
+      else iconFiles(dest, sketchName, safe, false);
     }
     return dest;
   }
 
   static boolean mac() {
     return System.getProperty("os.name", "").toLowerCase().contains("mac");
+  }
+
+  /** The PNG picked in the Export Application dialog for the exports being made, or null. */
+  static volatile File icon;
+
+  /** Windows and Linux: the icon next to the launcher (.ico; .png plus a .desktop file). */
+  private static void iconFiles(File dest, String sketchName, String safe, boolean forWindows) {
+    File png = icon;
+    if (png == null || !png.isFile()) return;
+    try {
+      java.awt.image.BufferedImage img = AppIcons.read(png);
+      if (forWindows) {
+        AppIcons.writeIco(img, new File(dest, safe + ".ico"));
+      } else {
+        AppIcons.writePng(img, 256, new File(dest, safe + ".png"));
+        File desktop = new File(dest, safe + ".desktop");
+        Files.writeString(desktop.toPath(), "[Desktop Entry]\nType=Application\nName=" + sketchName
+          + "\nExec=sh -c 'cd \"$(dirname \"%k\")\" && ./" + safe + "'\nIcon=" + new File(dest, safe + ".png").getAbsolutePath()
+          + "\nCategories=Graphics;\nTerminal=false\n", StandardCharsets.UTF_8);
+        desktop.setExecutable(true, false);
+      }
+    } catch (IOException e) {
+      System.err.println("icon: " + e.getMessage());
+    }
   }
 
   /**
@@ -161,10 +200,15 @@ final class AppExport {
       + "<key>CFBundleIdentifier</key><string>org.processing.sketch." + id + "</string>\n"
       + "<key>CFBundlePackageType</key><string>APPL</string>\n"
       + "<key>CFBundleShortVersionString</key><string>1.0</string>\n"
+      + (icon != null && icon.isFile() ? "<key>CFBundleIconFile</key><string>" + safe + ".icns</string>\n" : "")
       + "<key>NSHighResolutionCapable</key><true/>\n"
       + "<key>NSCameraUsageDescription</key><string>The sketch uses the camera.</string>\n"
       + "<key>NSMicrophoneUsageDescription</key><string>The sketch uses the microphone.</string>\n"
       + "</dict></plist>\n", StandardCharsets.UTF_8);
+    if (icon != null && icon.isFile()) {
+      try { AppIcons.writeIcns(AppIcons.read(icon), new File(res, safe + ".icns")); }
+      catch (IOException e) { System.err.println("icon: " + e.getMessage()); }
+    }
     // sign the libraries and the program first, then the bundle
     File[] libs = new File(res, "lib").listFiles();
     if (libs != null) for (File l : libs) sign(l);
