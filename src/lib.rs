@@ -4119,11 +4119,17 @@ mod glfw {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WASM stub (no-op; replace with wasm-bindgen + canvas 2D later)
+// WebAssembly (the web editor, wrust): the CPU renderer draws into the same
+// pixel buffer as on the desktop; the page hands in input, calls pr_frame()
+// for every frame it wants, and copies the buffer onto a canvas. Built for
+// wasm32-wasip1 so std's clock, files and printing work through the page's
+// small WASI layer.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "wasm")]
 mod wasm {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
     pub enum Event {
         Draw,
         MousePressed, MouseReleased, MouseMoved, MouseDragged,
@@ -4152,19 +4158,78 @@ mod wasm {
         pub fn focused(&self)       -> bool         { self.focused }
     }
 
-    pub struct Runner { title: String }
+    type Callback = Box<dyn FnMut(Event, &FrameContext)>;
+    // The browser runs one sketch on one thread: plain statics are enough.
+    static mut CB: Option<Callback> = None;
+    static mut CTX: FrameContext = FrameContext {
+        mouse_x: 0.0, mouse_y: 0.0, width: 100, height: 100, frame_count: 0, mouse_pressed: false,
+        key: None, key_code: 0, key_pressed: false, millis: 0, focused: true,
+    };
+    static LOOPING: AtomicBool = AtomicBool::new(true);
+    static REDRAW: AtomicBool = AtomicBool::new(false);
+    static EXITED: AtomicBool = AtomicBool::new(false);
+    static FPS: AtomicU32 = AtomicU32::new(0x4270_0000); // 60.0
+
+    pub struct Runner { _title: String }
     impl Runner {
-        pub fn new() -> Self { Self { title: String::from("sketch") } }
-        pub fn title(mut self, t: &str) -> Self { self.title = t.to_owned(); self }
-        pub fn start<F>(self, _cb: F) where F: FnMut(Event, &FrameContext) + 'static {}
+        pub fn new() -> Self { Self { _title: String::from("sketch") } }
+        pub fn title(mut self, t: &str) -> Self { self._title = t.to_owned(); self }
+        /// Keeps the callback; the page drives it from here on.
+        pub fn start<F>(self, cb: F) where F: FnMut(Event, &FrameContext) + 'static {
+            unsafe { *std::ptr::addr_of_mut!(CB) = Some(Box::new(cb)); }
+        }
     }
 
-    pub fn set_size(_w: u32, _h: u32) {}
-    pub fn set_frame_rate(_fps: f32) {}
-    pub fn set_looping(_on: bool) {}
-    pub fn request_redraw() {}
-    pub fn exit_sketch() {}
+    pub fn set_size(w: u32, h: u32) { crate::resize_canvas(w, h); }
+    pub fn set_frame_rate(fps: f32) { if fps > 0.0 { FPS.store(fps.to_bits(), Ordering::Relaxed); } }
+    pub fn set_looping(on: bool) { LOOPING.store(on, Ordering::Relaxed); }
+    pub fn request_redraw() { REDRAW.store(true, Ordering::Relaxed); }
+    pub fn exit_sketch() { EXITED.store(true, Ordering::Relaxed); LOOPING.store(false, Ordering::Relaxed); }
     pub fn set_cursor_visible(_v: bool) {}
+
+    fn fire(e: Event) {
+        unsafe {
+            let ctx = &*std::ptr::addr_of!(CTX);
+            if let Some(cb) = (*std::ptr::addr_of_mut!(CB)).as_mut() { cb(e, ctx); }
+        }
+    }
+    fn ctx() -> &'static mut FrameContext { unsafe { &mut *std::ptr::addr_of_mut!(CTX) } }
+
+    /// The mouse, the clock and focus, before a frame or an event.
+    #[no_mangle] pub extern "C" fn pr_input(mx: f32, my: f32, pressed: i32, millis: f64, focused: i32) {
+        let c = ctx();
+        c.mouse_x = mx; c.mouse_y = my; c.mouse_pressed = pressed != 0;
+        c.millis = millis.max(0.0) as u64; c.focused = focused != 0;
+    }
+    /// The key: its code (Processing's keyCode), its character (0 for none) and whether it's held.
+    #[no_mangle] pub extern "C" fn pr_key(code: u32, ch: u32, pressed: i32) {
+        let c = ctx();
+        c.key_code = code;
+        c.key = if ch == 0 { None } else { char::from_u32(ch) };
+        c.key_pressed = pressed != 0;
+    }
+    #[no_mangle] pub extern "C" fn pr_frame() {
+        let c = ctx();
+        c.frame_count += 1;
+        c.width = crate::CANVAS_W.load(Ordering::Relaxed);
+        c.height = crate::CANVAS_H.load(Ordering::Relaxed);
+        fire(Event::Draw);
+    }
+    /// 1 pressed, 2 released, 3 moved, 4 dragged, 5 wheel, 6 key pressed, 7 key released, 8 key typed
+    #[no_mangle] pub extern "C" fn pr_event(kind: i32, amount: f32) {
+        fire(match kind {
+            1 => Event::MousePressed, 2 => Event::MouseReleased, 3 => Event::MouseMoved, 4 => Event::MouseDragged,
+            5 => Event::MouseWheel(amount), 6 => Event::KeyPressed, 7 => Event::KeyReleased, _ => Event::KeyTyped,
+        });
+    }
+    /// The canvas, 0xRRGGBB per pixel, row by row (read it right after a frame).
+    #[no_mangle] pub extern "C" fn pr_pixels() -> *const u32 { crate::pixel_buf().lock().as_ptr() }
+    #[no_mangle] pub extern "C" fn pr_width() -> u32 { crate::CANVAS_W.load(Ordering::Relaxed) }
+    #[no_mangle] pub extern "C" fn pr_height() -> u32 { crate::CANVAS_H.load(Ordering::Relaxed) }
+    #[no_mangle] pub extern "C" fn pr_looping() -> i32 { LOOPING.load(Ordering::Relaxed) as i32 }
+    #[no_mangle] pub extern "C" fn pr_take_redraw() -> i32 { REDRAW.swap(false, Ordering::Relaxed) as i32 }
+    #[no_mangle] pub extern "C" fn pr_frame_rate() -> f32 { f32::from_bits(FPS.load(Ordering::Relaxed)) }
+    #[no_mangle] pub extern "C" fn pr_exited() -> i32 { EXITED.load(Ordering::Relaxed) as i32 }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

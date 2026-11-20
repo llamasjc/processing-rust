@@ -7,8 +7,7 @@ description = "Processing-style API for RustMode sketches"
 [dependencies]
 # Low-overhead RwLock / Mutex for the global sketch state cells.
 parking_lot = "0.12"
-# Software pixel-buffer windowing for native sketches (not used under --features wasm)
-minifb = "0.27"
+# The window (minifb) is further down, for every target but the browser.
 # PNG decoding for loadImage()
 png = "0.17"
 # GIF decoding for loadImage() (the first frame)
@@ -35,6 +34,10 @@ glfw              = { version = "0.60", default-features = false, optional = tru
 # feature on, glfw-rs hands out Wayland window handles even on X11, and the
 # first GLFW call on them fails with "Wayland: Platform not initialized".
 processing_glfw   = { git = "https://github.com/processing/libprocessing", rev = "aaa0215fabda64ce072ec3da3d524e884bf10e20", optional = true, features = ["x11"] }
+
+# Software pixel-buffer windowing for native sketches (not in the browser build)
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+minifb = "0.27"
 
 [features]
 default = []
