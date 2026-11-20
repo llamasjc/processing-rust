@@ -4821,16 +4821,16 @@ fn system_utc_offset() -> i64 {
 }
 #[cfg(unix)]
 fn system_utc_offset() -> i64 {
-    // localtime_r's tm_gmtoff: glibc, musl and macOS all have it right after
-    // the nine ints of struct tm
+    // localtime_r's tm_gmtoff: glibc, musl, macOS and emscripten all have it
+    // right after the nine ints of struct tm. time_t is 64-bit on emscripten.
+    #[cfg(target_os = "emscripten")] type TimeT = i64;
+    #[cfg(not(target_os = "emscripten"))] type TimeT = std::os::raw::c_long;
     #[repr(C)]
     struct Tm { ints: [i32; 9], gmtoff: std::os::raw::c_long, zone: *const std::os::raw::c_char }
-    extern "C" {
-        fn time(t: *mut std::os::raw::c_long) -> std::os::raw::c_long;
-        fn localtime_r(t: *const std::os::raw::c_long, tm: *mut Tm) -> *mut Tm;
-    }
+    extern "C" { fn localtime_r(t: *const TimeT, tm: *mut Tm) -> *mut Tm; }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as TimeT).unwrap_or(0);
     unsafe {
-        let now = time(std::ptr::null_mut());
         let mut tm: Tm = std::mem::zeroed();
         if localtime_r(&now, &mut tm).is_null() { 0 } else { tm.gmtoff as i64 }
     }
