@@ -13,11 +13,19 @@ pub fn sketch_file(name: &str) -> PathBuf {
     let p = PathBuf::from(name);
     if p.is_absolute() { p } else { sketch_dir().join(p) }
 }
+/// The sketch's data folder: data/ in the sketch folder, or PROCESSING_DATA_DIR
+/// when that is set (a one-file export unpacks its data/ somewhere else).
+pub fn data_dir() -> PathBuf {
+    match std::env::var_os("PROCESSING_DATA_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => sketch_dir().join("data"),
+    }
+}
 /// dataPath(name): a file in the sketch's data folder.
 pub fn data_path(name: &str) -> String { data_file(name).to_string_lossy().into_owned() }
 pub fn data_file(name: &str) -> PathBuf {
     let p = PathBuf::from(name);
-    if p.is_absolute() { p } else { sketch_dir().join("data").join(p) }
+    if p.is_absolute() { p } else { data_dir().join(p) }
 }
 /// savePath(name): sketch_path_of(name), with its folders made if missing.
 pub fn save_path(name: &str) -> String {

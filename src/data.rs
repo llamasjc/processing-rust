@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 fn find(path: &str) -> PathBuf {
     let p = Path::new(path);
     if p.is_file() || p.is_absolute() { return p.to_path_buf(); }
-    let d = Path::new("data").join(path);
+    let d = crate::paths::data_dir().join(path);
     if d.is_file() { d } else { p.to_path_buf() }
 }
 

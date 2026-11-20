@@ -105,7 +105,7 @@ impl Movie {
     /// Opens a video file (looked for as given, then in data/). Shows its
     /// first frame once read; call play() or loop_() to start it.
     pub fn new(path: &str) -> Movie {
-        let file = if std::path::Path::new(path).is_file() { path.to_string() } else { format!("data/{path}") };
+        let file = if std::path::Path::new(path).is_file() { path.to_string() } else { crate::paths::data_dir().join(path).to_string_lossy().into_owned() };
         let link = Arc::new(Link { s: Mutex::new(Shared { speed: 1.0, ..Default::default() }), wake: Condvar::new() });
         let Some((w, h, fps, duration)) = probe(&file) else {
             eprintln!("Movie(\"{path}\"): couldn't open it as a video");

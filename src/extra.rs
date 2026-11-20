@@ -371,7 +371,7 @@ impl Reader {
     pub fn close(&mut self) { self.lines = None; }
 }
 pub fn create_reader(path: &str) -> Reader {
-    let file = if std::path::Path::new(path).is_file() { path.to_string() } else { format!("data/{path}") };
+    let file = if std::path::Path::new(path).is_file() { path.to_string() } else { crate::paths::data_dir().join(path).to_string_lossy().into_owned() };
     match std::fs::File::open(&file) {
         Ok(f) => Reader { lines: Some(std::io::BufReader::new(f).lines()) },
         Err(e) => { eprintln!("createReader(\"{path}\"): {e}"); Reader { lines: None } }
@@ -383,7 +383,7 @@ pub fn create_output(path: &str) -> Option<std::fs::File> {
     std::fs::File::create(path).map_err(|e| eprintln!("createOutput(\"{path}\"): {e}")).ok()
 }
 pub fn create_input(path: &str) -> Option<std::fs::File> {
-    let file = if std::path::Path::new(path).is_file() { path.to_string() } else { format!("data/{path}") };
+    let file = if std::path::Path::new(path).is_file() { path.to_string() } else { crate::paths::data_dir().join(path).to_string_lossy().into_owned() };
     std::fs::File::open(&file).map_err(|e| eprintln!("createInput(\"{path}\"): {e}")).ok()
 }
 #[inline] pub fn createWriter(path: &str) -> PrintWriter { create_writer(path) }

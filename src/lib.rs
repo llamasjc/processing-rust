@@ -1791,7 +1791,7 @@ mod render {
     fn find_font(name: &str) -> Option<std::path::PathBuf> {
         let direct = std::path::Path::new(name);
         if direct.is_file() { return Some(direct.to_path_buf()); }
-        let in_data = std::path::Path::new("data").join(name);
+        let in_data = crate::paths::data_dir().join(name);
         if in_data.is_file() { return Some(in_data); }
         // Not a file: ask the system for an installed font with that name
         // (fontconfig: Linux, and macOS when it is installed).
@@ -2704,7 +2704,7 @@ mod render {
     pub fn load_shape(path: &str) -> u64 {
         let load = || -> Result<SvgShape, String> {
             let file = std::path::Path::new(path);
-            let file = if file.is_file() { file.to_path_buf() } else { std::path::Path::new("data").join(path) };
+            let file = if file.is_file() { file.to_path_buf() } else { crate::paths::data_dir().join(path) };
             let len = std::fs::metadata(&file).map_err(|e| e.to_string())?.len();
             if len > MAX_SVG_BYTES { return Err("file is too large".into()); }
             let text = String::from_utf8_lossy(&std::fs::read(&file).map_err(|e| e.to_string())?).into_owned();
@@ -4754,7 +4754,23 @@ fn system_utc_offset() -> i64 {
     let bias = tz.bias + if rc == 2 { tz.daylight_bias } else if rc == 1 { tz.standard_bias } else { 0 };
     -(bias as i64) * 60
 }
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn system_utc_offset() -> i64 {
+    // localtime_r's tm_gmtoff: glibc, musl and macOS all have it right after
+    // the nine ints of struct tm
+    #[repr(C)]
+    struct Tm { ints: [i32; 9], gmtoff: std::os::raw::c_long, zone: *const std::os::raw::c_char }
+    extern "C" {
+        fn time(t: *mut std::os::raw::c_long) -> std::os::raw::c_long;
+        fn localtime_r(t: *const std::os::raw::c_long, tm: *mut Tm) -> *mut Tm;
+    }
+    unsafe {
+        let now = time(std::ptr::null_mut());
+        let mut tm: Tm = std::mem::zeroed();
+        if localtime_r(&now, &mut tm).is_null() { 0 } else { tm.gmtoff as i64 }
+    }
+}
+#[cfg(not(any(windows, unix)))]
 fn system_utc_offset() -> i64 { 0 }
 
 /// Exported programs on Windows are started directly, so the settings a
@@ -5128,7 +5144,7 @@ pub fn save_stream(target: &str, source: &str) -> bool {
         return std::process::Command::new("curl").args(["-fsSL", "-o", target, source])
             .status().map(|s| s.success()).unwrap_or(false);
     }
-    let from = if std::path::Path::new(source).is_file() { source.to_string() } else { format!("data/{source}") };
+    let from = if std::path::Path::new(source).is_file() { source.to_string() } else { crate::paths::data_dir().join(source).to_string_lossy().into_owned() };
     std::fs::copy(from, target).is_ok()
 }
 

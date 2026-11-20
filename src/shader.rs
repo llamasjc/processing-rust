@@ -102,7 +102,7 @@ impl PShader {
 /// load_shader("frag.glsl"): a filter shader (looked for as given, then in
 /// data/). On a mistake it says where and gives back a shader that does nothing.
 pub fn load_shader(path: &str) -> PShader {
-    let file = if std::path::Path::new(path).is_file() { path.to_string() } else { format!("data/{path}") };
+    let file = if std::path::Path::new(path).is_file() { path.to_string() } else { crate::paths::data_dir().join(path).to_string_lossy().into_owned() };
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => t,
         Err(e) => { eprintln!("loadShader(\"{path}\"): {e}"); return PShader::default(); }
@@ -116,7 +116,7 @@ pub fn load_shader(path: &str) -> PShader {
 pub fn load_shader_vf(frag: &str, vert: &str) -> PShader {
     let s = load_shader(frag);
     if s.id == 0 { return s; }
-    let file = if std::path::Path::new(vert).is_file() { vert.to_string() } else { format!("data/{vert}") };
+    let file = if std::path::Path::new(vert).is_file() { vert.to_string() } else { crate::paths::data_dir().join(vert).to_string_lossy().into_owned() };
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => t,
         Err(e) => { eprintln!("loadShader(\"{vert}\"): {e}"); return s; }
